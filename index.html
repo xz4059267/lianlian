@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>恋恋错题本</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark">恋</span>
+          <div>
+            <h1>恋恋错题本</h1>
+            <p>把错题讲出来，才是真的会</p>
+          </div>
+        </div>
+        <nav class="nav-tabs" aria-label="页面导航">
+          <button class="nav-btn active" data-view="uploadView">
+            <span class="nav-icon" data-icon="upload"></span>
+            上传
+          </button>
+          <button class="nav-btn" data-view="teachView">
+            <span class="nav-icon" data-icon="board"></span>
+            讲解
+          </button>
+          <button class="nav-btn" data-view="notebookView">
+            <span class="nav-icon" data-icon="book"></span>
+            错题本
+            <span class="badge" id="notebookCount">0</span>
+          </button>
+        </nav>
+      </header>
+
+      <main>
+        <section class="view active" id="uploadView" aria-labelledby="uploadTitle">
+          <div class="workspace-grid">
+            <section class="upload-panel" aria-labelledby="uploadTitle">
+              <div class="section-heading">
+                <h2 id="uploadTitle">上传错题</h2>
+                <p id="uploadState">等待上传</p>
+              </div>
+
+              <label class="drop-zone" id="dropZone">
+                <input id="imageInput" type="file" accept="image/*" />
+                <span class="drop-icon" data-icon="image"></span>
+                <strong>选择或拖入错题图片</strong>
+                <span>支持一页或一组初中数学错题</span>
+              </label>
+
+              <div class="image-preview hidden" id="previewPanel">
+                <div class="preview-toolbar">
+                  <button class="text-btn" id="replaceImageBtn">
+                    <span data-icon="refresh"></span>
+                    重新上传
+                  </button>
+                  <button class="text-btn danger" id="clearImageBtn">
+                    <span data-icon="trash"></span>
+                    清空
+                  </button>
+                </div>
+                <div class="preview-stage" id="manualStage">
+                  <img id="sourcePreview" alt="已上传的错题图片预览" />
+                  <div class="selection-rect hidden" id="selectionRect">
+                    <div class="selection-actions" aria-label="框选确认">
+                      <button class="selection-action confirm" id="confirmSelectionBtn" type="button" title="确认框选" aria-label="确认框选">
+                        <span data-icon="check"></span>
+                      </button>
+                      <button class="selection-action cancel" id="cancelSelectionBtn" type="button" title="取消框选" aria-label="取消框选">
+                        <span data-icon="x"></span>
+                      </button>
+                    </div>
+                    <span class="selection-handle nw" data-handle="nw"></span>
+                    <span class="selection-handle n" data-handle="n"></span>
+                    <span class="selection-handle ne" data-handle="ne"></span>
+                    <span class="selection-handle e" data-handle="e"></span>
+                    <span class="selection-handle se" data-handle="se"></span>
+                    <span class="selection-handle s" data-handle="s"></span>
+                    <span class="selection-handle sw" data-handle="sw"></span>
+                    <span class="selection-handle w" data-handle="w"></span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="tips-row">
+                <span>拍清楚题目</span>
+                <span>避开反光</span>
+                <span>阴影少一点</span>
+              </div>
+            </section>
+
+            <section class="seg-panel" aria-labelledby="segmentTitle">
+              <div class="section-heading">
+                <h2 id="segmentTitle">题目生成</h2>
+                <p id="segmentState">上传后可生成题目</p>
+              </div>
+
+              <div class="mode-switch" role="group" aria-label="题目生成方式">
+                <button class="mode-btn active" id="autoSegmentBtn">
+                  <span data-icon="spark"></span>
+                  AI 自动分割
+                </button>
+                <button class="mode-btn" id="manualModeBtn">
+                  <span data-icon="crop"></span>
+                  手动框选
+                </button>
+              </div>
+
+              <div class="manual-actions hidden" id="manualActions">
+                <button class="text-btn" id="cancelManualBtn">
+                  <span data-icon="x"></span>
+                  取消框选
+                </button>
+                <span>在左侧图片上拖出题目区域</span>
+              </div>
+
+              <div class="processing hidden" id="processingBox">
+                <div class="loader"></div>
+                <span>正在整理题目区域</span>
+              </div>
+
+              <div class="question-list" id="questionList" aria-live="polite"></div>
+
+              <div class="start-row">
+                <div>
+                  <strong id="selectedSummary">未选择题目</strong>
+                  <span id="selectedHint">可多选，按选择顺序讲解</span>
+                </div>
+                <button class="primary-btn" id="startLectureBtn" disabled>
+                  <span data-icon="play"></span>
+                  开始讲解
+                </button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="teachView" aria-labelledby="teachTitle">
+          <div class="classroom">
+            <div class="classroom-header">
+              <div>
+                <h2 id="teachTitle">教室讲解</h2>
+                <p id="lectureProgress">还没有选择题目</p>
+              </div>
+              <div class="lecture-actions">
+                <button class="text-btn" id="backToUploadBtn">
+                  <span data-icon="arrow-left"></span>
+                  返回上传
+                </button>
+                <button class="primary-btn" id="finishQuestionBtn" disabled>
+                  <span data-icon="check"></span>
+                  我讲完了
+                </button>
+              </div>
+            </div>
+
+            <div class="classroom-body">
+              <section class="board-zone" aria-label="黑板">
+                <div class="board-toolbar" role="toolbar" aria-label="黑板工具">
+                  <button class="tool-btn active" id="penTool" title="画笔" aria-label="画笔">
+                    <span data-icon="pen"></span>
+                  </button>
+                  <button class="tool-btn" id="eraserTool" title="黑板擦" aria-label="黑板擦">
+                    <span data-icon="eraser"></span>
+                  </button>
+                  <button class="tool-btn" id="moveImageTool" title="移动题图" aria-label="移动题图">
+                    <span data-icon="hand"></span>
+                  </button>
+                  <span class="tool-separator"></span>
+                  <button class="tool-btn" id="undoBtn" title="撤销" aria-label="撤销">
+                    <span data-icon="undo"></span>
+                  </button>
+                  <button class="tool-btn" id="clearBoardBtn" title="清空当前页" aria-label="清空当前页">
+                    <span data-icon="trash"></span>
+                  </button>
+                  <span class="tool-separator"></span>
+                  <button class="tool-btn" id="prevPageBtn" title="上一页" aria-label="上一页">
+                    <span data-icon="chevron-left"></span>
+                  </button>
+                  <span class="page-indicator" id="boardPageLabel">第 1 页</span>
+                  <button class="tool-btn" id="nextPageBtn" title="下一页" aria-label="下一页">
+                    <span data-icon="chevron-right"></span>
+                  </button>
+                  <span class="tool-separator"></span>
+                  <div class="color-swatches" aria-label="笔迹颜色">
+                    <button class="swatch active" style="--swatch:#f8f2d8" data-color="#f8f2d8" title="粉笔白"></button>
+                    <button class="swatch" style="--swatch:#f2c14e" data-color="#f2c14e" title="重点黄"></button>
+                    <button class="swatch" style="--swatch:#8ed1c6" data-color="#8ed1c6" title="清浅蓝"></button>
+                    <button class="swatch" style="--swatch:#ff8a7a" data-color="#ff8a7a" title="提醒红"></button>
+                  </div>
+                  <label class="size-control">
+                    <span data-icon="gauge"></span>
+                    <input id="brushSize" type="range" min="2" max="18" value="5" />
+                  </label>
+                </div>
+
+                <div class="blackboard" id="blackboard">
+                  <div class="board-image-layer hidden" id="boardImageLayer">
+                    <img class="board-question" id="boardQuestionImage" alt="当前讲解题目" />
+                  </div>
+                  <canvas id="boardCanvas"></canvas>
+                  <div class="recognition-pill hidden" id="recognitionPill">板书识别中</div>
+                </div>
+              </section>
+
+              <aside class="guide-panel" aria-label="讲解互动">
+                <div class="avatar-row">
+                  <article class="avatar-card" id="studentAvatar">
+                    <img src="assets/student-avatar.svg" alt="学生头像" />
+                    <div>
+                      <strong>我</strong>
+                      <span id="studentState">准备讲题</span>
+                    </div>
+                  </article>
+                  <article class="avatar-card listening" id="lianAvatar">
+                    <img src="assets/lian-avatar.svg" alt="恋恋头像" />
+                    <div>
+                      <strong>恋恋</strong>
+                      <span id="lianState">在听你讲</span>
+                    </div>
+                  </article>
+                </div>
+
+                <div class="speech-bubble" id="lianBubble">
+                  我会先听你说思路。需要提示时，我只问关键问题，不直接给答案。
+                </div>
+
+                <div class="voice-controls">
+                  <button class="primary-btn" id="micBtn">
+                    <span data-icon="mic"></span>
+                    开始收听
+                  </button>
+                  <button class="tool-btn" id="muteBtn" title="静音模式" aria-label="静音模式">
+                    <span data-icon="volume"></span>
+                  </button>
+                </div>
+
+                <label class="transcript-box">
+                  <span>讲解文本</span>
+                  <textarea id="transcriptInput" rows="5" placeholder="可以说，也可以在这里输入你的讲解"></textarea>
+                </label>
+                <button class="text-btn full" id="sendTranscriptBtn">
+                  <span data-icon="send"></span>
+                  发送给恋恋
+                </button>
+
+                <div class="event-log" id="eventLog" aria-live="polite"></div>
+              </aside>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="completeView" aria-labelledby="completeTitle">
+          <div class="complete-layout">
+            <div class="complete-panel">
+              <span class="complete-mark">完成</span>
+              <h2 id="completeTitle">这次讲解完成了</h2>
+              <p id="completeSummary">已经保存到错题本。</p>
+              <div class="complete-actions">
+                <button class="primary-btn" id="openNotebookBtn">
+                  <span data-icon="book"></span>
+                  查看错题本
+                </button>
+                <button class="text-btn" id="newUploadBtn">
+                  <span data-icon="upload"></span>
+                  继续上传
+                </button>
+              </div>
+            </div>
+            <div class="review-strip" id="completionReview"></div>
+          </div>
+        </section>
+
+        <section class="view" id="notebookView" aria-labelledby="notebookTitle">
+          <div class="notebook-layout">
+            <section class="notebook-list-panel">
+              <div class="section-heading">
+                <h2 id="notebookTitle">错题本</h2>
+                <p id="reviewReminder">暂无复习提醒</p>
+              </div>
+              <div class="notebook-list" id="notebookList"></div>
+            </section>
+            <section class="notebook-detail" id="notebookDetail" aria-live="polite">
+              <div class="empty-detail">
+                <span data-icon="book"></span>
+                <strong>选择一道错题查看记录</strong>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <template id="questionCardTemplate">
+      <article class="question-card">
+        <button class="select-area" type="button">
+          <img alt="题目缩略图" />
+          <span class="question-order"></span>
+        </button>
+        <div class="question-meta">
+          <strong></strong>
+          <span></span>
+        </div>
+        <div class="question-actions">
+          <button class="mini-btn move-up" title="前移" aria-label="前移">
+            <span data-icon="chevron-left"></span>
+          </button>
+          <button class="mini-btn move-down" title="后移" aria-label="后移">
+            <span data-icon="chevron-right"></span>
+          </button>
+          <button class="mini-btn remove-question" title="删除" aria-label="删除">
+            <span data-icon="trash"></span>
+          </button>
+        </div>
+      </article>
+    </template>
+
+    <script src="app.js"></script>
+  </body>
+</html>
