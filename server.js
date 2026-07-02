@@ -1,6 +1,9 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
+const crypto = require("crypto");
+const { execFile, spawn } = require("child_process");
 
 const ROOT = __dirname;
 loadEnvFile(path.join(ROOT, ".env"));
@@ -11,24 +14,25 @@ const SEGMENT_MODEL = process.env.SEGMENT_MODEL || "gpt-5.4-mini";
 const GUIDE_MODEL = process.env.GUIDE_MODEL || "gpt-5.5";
 const GUIDE_FALLBACK_MODEL = process.env.GUIDE_FALLBACK_MODEL || "gpt-5.4-mini";
 const HANDWRITING_MODEL = process.env.HANDWRITING_MODEL || "gpt-5.4-mini";
+const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
+const PADDLE_OCR_SCRIPT = path.join(ROOT, "tools", "paddle_ocr.py");
+const OCR_MAX_SIDE = Number(process.env.OCR_MAX_SIDE || 1800);
+const OCR_CACHE_LIMIT = Number(process.env.OCR_CACHE_LIMIT || 32);
+const ocrCache = new Map();
+let paddleOcrService = null;
+let paddleOcrRequestId = 0;
 
-const SEGMENTER_PROMPT =
+const OCR_GROUPING_PROMPT =
   [
-    "你是一名试卷版面分析助手。你的任务不是直接裁剪图片，而是先识别题目结构，再确定裁剪边界。只返回 JSON，坐标必须使用原图像素坐标。",
-    "必须严格按两个阶段执行：第一阶段先完整阅读整张试卷，识别所有题目的边界；第二阶段再根据已确认的边界为每一道题返回一个题块。",
-    "第一阶段重点识别：每道题的题号、题干范围、图片/图形/表格属于哪一道题、选项/答题区域属于哪一道题、子问题（①②③、（1）（2））是否属于同一道题。",
-    "第一阶段不要裁剪，不要根据局部 OCR 文本框或图片边界直接定框；必须先得到题目1开始位置到结束位置、题目2开始位置到结束位置，直到题目N。",
-    "固定处理顺序：Step 1 阅读整页试卷；Step 2 识别所有题号；Step 3 确定每道题开始和结束位置；Step 4 确认图片、题干、选项分别属于哪一道题；Step 5 检查跨区域或跨栏题目；Step 6 完成所有题目边界确认；Step 7 最后再返回裁剪框。",
-    "每个题块必须包含该题全部内容：题号、完整题干、图片/图形/表格、选项、答题区域、属于同一道题的子问题。",
-    "坐标规则非常重要：每道题必须返回自己独立的矩形边界；不同题目的 x,y,w,h 不得相同，不得都返回整页；除跨栏同题外，不同题块不应大面积重叠。",
-    "纵向排列的题目中，上一题的 bottom 必须在下一题题号开始位置之前或附近结束；下一题的内容不得进入上一题框。",
-    "横向双栏或多栏试卷中，先判断栏结构，再确定每道题属于哪一栏；同一栏内按从上到下切分，不同栏题目不得合并。",
-    "完整性优先于裁剪紧凑度。边界不确定时宁可多保留少量留白，但不允许截断题目，不允许拆分一道题，不允许将下一题内容裁入当前题，也不允许将当前题内容裁入下一题。",
-    "禁止行为：图片和题干分离；图片属于上一题而题干属于下一题；选项被拆开；子问题被拆开；一道题拆成多个题块；多道题合并成一个题块；根据 OCR 文本框或局部图片边界直接裁剪。",
-    "如果看到 1.、2.、3.、4.、第5题、第6题等主题号，通常每个主题号对应一个独立 question；只有（1）（2）或①②③明显属于同一主题时才合并。",
-    "problemText 必须概括这一道题的实际题干内容，problemType 和 mainKnowledgePoint 必须来自数学内容，禁止写“题目边界分割”“图像识别”“OCR”等任务名。",
-    "mainKnowledgePoint/knowledgePoints 只能给 1 个最主要知识点，不要列多个，不要用顿号或逗号串联。",
-    "如果无法在整页层面确认所有题目边界，请返回 questions=[]，并在 note 中说明需要手动框选；不要用整页大框冒充单题结果。"
+    "你是一名试卷题目结构分析助手。你不会看原图，也不能直接输出像素裁剪框。",
+    "输入是一组 OCR 文字块，每个 block 已有 index、text、x、y、w、h。你的任务只负责判断哪些 block 属于同一道题。",
+    "必须返回每道题包含的 blockIndexes，而不是 x,y,w,h。裁剪框会由程序根据 block 坐标合并生成。",
+    "主题号如 1.、2.、3.、第5题、第6题通常代表不同大题；（1）（2）（3）、①②③ 通常属于同一道大题，不要拆成独立题目。",
+    "图形、表格、选项、手写解答、答题区域对应的 OCR block 应归入所属题目。",
+    "如果边界不确定，允许把相邻内容合并进较大的题块，不要返回空。",
+    "type 只能是：计算题、选择题、填空题、解答题、未知。",
+    "knowledge 只写 1 个最主要数学知识点，禁止写 OCR、图像识别、题目分割等任务名。",
+    "输出必须严格遵守 JSON schema。"
   ].join("\n");
 
 const LIAN_GUIDE_PROMPT = [
@@ -41,7 +45,7 @@ const LIAN_GUIDE_PROMPT = [
   "C 状态下可以讲知识点和步骤，但每次只讲一个逻辑节点或一个小步骤；每步后必须让学生确认、复述或写回黑板。",
   "学生在互动讲解中插话提问时，先回答疑问，再用“我们回到刚才这一步”恢复主线。",
   "普通沉默超过 2 分钟时，第一次只关怀询问卡在哪一步；不要直接完整讲题。只有询问后继续沉默或学生确认不会，才分步讲解。",
-  "学生讲得顺时，优先不说；需要回应时只说“很好”“很棒”“继续”这类极短鼓励。",
+  "学生讲得顺时，优先不说；需要回应时必须贴着学生内容做理解确认，不使用固定鼓励词。",
   "如果前端传入 lectureUnlocked=false，你只能输出 encourage 或 light 级别内容，不能输出 formula/worked_step/summary。",
   "如果前端传入 lectureUnlocked=true，你仍然不能一次性倒完整答案；只给一小步，并把话交还给学生。",
   "不要直接说“你错了”，要转成检查提醒或启发式问题。",
@@ -50,18 +54,33 @@ const LIAN_GUIDE_PROMPT = [
 
 const LIAN_STYLE_RULES = [
   "你是引导者，不是代答者。",
-  "正常讲解时尽量不说；需要鼓励时只给 2 到 6 个字。",
+  "正常讲解时默认不说；不要用固定鼓励词刷存在感。",
   "未解锁讲解时，不能主动输出最终答案、中间完整算式或完整解题步骤。",
   "主动求助、连续 3 次答错、错后 1 分钟无输入、或关怀询问后仍沉默，才允许分步讲解。",
   "互动讲解时，每次只讲一个小步骤，并要求学生复述或写回黑板。",
-  "每次提示后都要把讲解权交还给学生。"
+  "每次提示后都要把讲解权交还给学生。",
+  "回应必须贴着学生刚才的内容，先做理解确认，再给一个小追问。"
 ];
+
+const COMPANION_DIALOGUE_POLICY = [
+  "你不是一个不停回应的 AI。你更像坐在学生旁边陪伴学习的人。",
+  "你的首要任务不是一直说话，而是判断现在是否应该说话。",
+  "默认行为是 Listening：学生思考或连续表达时保持安静，shouldSpeak=false，speech 留空。",
+  "不要因为识别到一句完整的话就立即回复；只有学生明显完成一段思路、停顿等待反馈、提出问题、明显卡住，或思路明显错误且继续推导会偏离时，才回应。",
+  "如果 eventType=thought_complete，只表示学生停顿了 2 到 3 秒；你仍要先判断这是否真是一段完整思路。若只是半句话、过渡句、还在铺垫，shouldSpeak=false。",
+  "回应时先用一句话证明你听懂了学生刚才的思路，再给一个很小的追问或检查点。",
+  "不要频繁使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。不要为了回应而回应。",
+  "不要泛泛评价学生本人；要针对内容反馈，例如“你是在把未知量表示出来”“你已经开始找数量关系了”。",
+  "学生讲错时不要说“不对”或“你错了”，改成一起检查：例如“我们一起检查一下这里，面积通常和哪两个量有关？”",
+  "每次回应尽量不超过两句话。"
+].join("\n");
 
 const HANDWRITING_PROMPT = [
   "你是初中数学黑板板书的异步辅助识别器。",
   "你会同时看到当前题目图片和学生黑板板书截图。",
   "任务是识别学生写下的关键公式、数字、等式、结论，并判断它与题目条件是否基本合理。",
   "不要做逐笔批改，不要因为字迹潦草就判错；只在数学关系、关键数字、符号或结论明显不合理时标记 hasPossibleIssue=true。",
+  "如果学生只是还没写完、只写出一部分比例/方程、缺少后续项，不能判为错误：hasPossibleIssue=false，guidance 置空或只说明继续观察。",
   "如果发现问题，guidance 要转成恋恋可以说出口的温和检查提醒，不要直接说“你错了”。",
   "guidance 应指出需要检查的位置或关系，并给一个很小的下一步，例如“圆周角/圆心角”“360 度乘几分之几”“等号后面的数”。",
   "输出必须严格遵守 JSON schema。"
@@ -78,8 +97,8 @@ const mimeTypes = {
   ".webp": "image/webp"
 };
 
-const segmentSchema = {
-  name: "question_segmentation",
+const segmentGroupingSchema = {
+  name: "question_block_grouping",
   strict: true,
   schema: {
     type: "object",
@@ -87,39 +106,34 @@ const segmentSchema = {
     properties: {
       questions: {
         type: "array",
-        description: "Detected independent math question regions in original image pixel coordinates.",
+        description: "Question groups built from OCR text block indexes.",
         items: {
           type: "object",
           additionalProperties: false,
           properties: {
-            x: { type: "number", description: "Left pixel of the question box." },
-            y: { type: "number", description: "Top pixel of the question box." },
-            w: { type: "number", description: "Width of the question box." },
-            h: { type: "number", description: "Height of the question box." },
-            questionNumber: { type: "string", description: "Visible question number or label, such as 1, 2, 第5题. Empty if unclear." },
-            confidence: { type: "number", description: "0 to 1 detection confidence." },
-            problemText: { type: "string", description: "Brief OCR-style summary of the problem." },
-            problemType: { type: "string", description: "Math problem type, such as equation, geometry, ratio." },
-            mainKnowledgePoint: {
+            number: {
               type: "string",
-              description: "The single most important math knowledge point for this exact question. Never use task names like segmentation or OCR."
+              description: "Visible main question number, such as 24, 第5题. Empty if unclear."
             },
-            knowledgePoints: {
+            blockIndexes: {
               type: "array",
-              description: "Exactly one main knowledge point for this single question. Do not include multiple points.",
-              items: { type: "string" }
-            }
+              description: "Indexes of OCR blocks belonging to this question.",
+              items: { type: "number" }
+            },
+            title: { type: "string", description: "Brief summary of the problem stem." },
+            type: {
+              type: "string",
+              enum: ["计算题", "选择题", "填空题", "解答题", "未知"],
+              description: "Question type."
+            },
+            knowledge: { type: "string", description: "One main math knowledge point." }
           },
-          required: ["x", "y", "w", "h", "questionNumber", "confidence", "problemText", "problemType", "mainKnowledgePoint", "knowledgePoints"]
+          required: ["number", "blockIndexes", "title", "type", "knowledge"]
         }
-      },
-      fallbackToWholePage: {
-        type: "boolean",
-        description: "True when reliable segmentation is not possible and the whole page should be used."
       },
       note: { type: "string", description: "Short diagnostic note for the UI or logs." }
     },
-    required: ["questions", "fallbackToWholePage", "note"]
+    required: ["questions", "note"]
   }
 };
 
@@ -279,6 +293,326 @@ function readJsonBody(req, limit = 24 * 1024 * 1024) {
   });
 }
 
+function decodeDataImage(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return null;
+  const extByMime = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp"
+  };
+  return {
+    buffer: Buffer.from(match[2], "base64"),
+    ext: extByMime[match[1].toLowerCase()] || ".png"
+  };
+}
+
+function runCommand(file, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: 30000, maxBuffer: 20 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
+      if (error) {
+        error.stderr = stderr;
+        reject(error);
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+}
+
+function normalizeOcrBlocks(blocks) {
+  if (!Array.isArray(blocks)) return [];
+  return blocks
+    .map((block) => {
+      const text = String(block?.text || "").replace(/\s+/g, " ").trim();
+      const x = Number(block?.x);
+      const y = Number(block?.y);
+      const w = Number(block?.w);
+      const h = Number(block?.h);
+      if (!text || ![x, y, w, h].every(Number.isFinite) || w <= 2 || h <= 2) return null;
+      return {
+        text,
+        x: Math.max(0, Math.round(x)),
+        y: Math.max(0, Math.round(y)),
+        w: Math.round(w),
+        h: Math.round(h)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+function cloneOcrBlocks(blocks) {
+  return blocks.map((block) => ({ ...block }));
+}
+
+function getOcrCacheKey(image) {
+  return crypto
+    .createHash("sha256")
+    .update(image.buffer)
+    .update(`|maxSide:${OCR_MAX_SIDE}|ocr:v2`)
+    .digest("hex");
+}
+
+function getCachedOcrBlocks(key) {
+  const cached = ocrCache.get(key);
+  if (!cached) return null;
+  ocrCache.delete(key);
+  ocrCache.set(key, cached);
+  return cloneOcrBlocks(cached);
+}
+
+function setCachedOcrBlocks(key, blocks) {
+  ocrCache.set(key, cloneOcrBlocks(blocks));
+  while (ocrCache.size > OCR_CACHE_LIMIT) {
+    const oldestKey = ocrCache.keys().next().value;
+    ocrCache.delete(oldestKey);
+  }
+}
+
+function parseJsonOutput(stdout) {
+  const text = String(stdout || "").trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    const starts = [...text.matchAll(/\{/g)].map((match) => match.index);
+    for (const start of starts) {
+      try {
+        return JSON.parse(text.slice(start));
+      } catch {
+        // Keep scanning in case a library printed a line before the JSON payload.
+      }
+    }
+    return null;
+  }
+}
+
+function rejectPendingOcrRequests(service, error) {
+  for (const request of service.pending.values()) {
+    clearTimeout(request.timer);
+    request.reject(error);
+  }
+  service.pending.clear();
+}
+
+function getPaddleOcrService() {
+  if (!fs.existsSync(OCR_PYTHON) || !fs.existsSync(PADDLE_OCR_SCRIPT)) return null;
+  if (paddleOcrService && !paddleOcrService.exited) return paddleOcrService;
+
+  const child = spawn(OCR_PYTHON, [PADDLE_OCR_SCRIPT, "--server"], {
+    cwd: ROOT,
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: "utf-8",
+      OCR_MAX_SIDE: String(OCR_MAX_SIDE)
+    }
+  });
+
+  const service = {
+    child,
+    buffer: "",
+    pending: new Map(),
+    exited: false
+  };
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    service.buffer += chunk;
+    const lines = service.buffer.split(/\r?\n/);
+    service.buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        console.warn("[segment] PaddleOCR service returned non-JSON output:", line.slice(0, 300));
+        continue;
+      }
+
+      const request = service.pending.get(message.id);
+      if (!request) continue;
+      clearTimeout(request.timer);
+      service.pending.delete(message.id);
+      if (message.error) {
+        request.reject(new Error(message.error));
+      } else {
+        request.resolve(message);
+      }
+    }
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    const text = chunk.trim();
+    if (text) console.warn(`[paddle-ocr] ${text.slice(0, 1200)}`);
+  });
+
+  child.on("error", (error) => {
+    service.exited = true;
+    rejectPendingOcrRequests(service, error);
+    if (paddleOcrService === service) paddleOcrService = null;
+  });
+
+  child.on("exit", (code, signal) => {
+    service.exited = true;
+    rejectPendingOcrRequests(service, new Error(`PaddleOCR service exited: code=${code}, signal=${signal}`));
+    if (paddleOcrService === service) paddleOcrService = null;
+  });
+
+  paddleOcrService = service;
+  console.log(`[segment] PaddleOCR service started, maxSide=${OCR_MAX_SIDE}`);
+  return service;
+}
+
+function requestPaddleOcr(imagePath) {
+  const service = getPaddleOcrService();
+  if (!service) return Promise.resolve(null);
+
+  return new Promise((resolve, reject) => {
+    const id = ++paddleOcrRequestId;
+    const timer = setTimeout(() => {
+      service.pending.delete(id);
+      reject(new Error("PaddleOCR service timed out"));
+    }, 180000);
+
+    service.pending.set(id, { resolve, reject, timer });
+    const payload = JSON.stringify({ id, imagePath, maxSide: OCR_MAX_SIDE }) + "\n";
+    service.child.stdin.write(payload, "utf8", (error) => {
+      if (!error) return;
+      clearTimeout(timer);
+      service.pending.delete(id);
+      reject(error);
+    });
+  });
+}
+
+async function extractPaddleTextBlocks(imagePath) {
+  const data = await requestPaddleOcr(imagePath);
+  if (!data) return { blocks: [], skipped: true };
+  return {
+    blocks: normalizeOcrBlocks(data.blocks),
+    resized: Boolean(data.resized),
+    originalSize: data.originalSize,
+    ocrSize: data.ocrSize,
+    elapsedMs: data.elapsedMs
+  };
+}
+
+async function extractTextBlocks(imageDataUrl) {
+  const image = decodeDataImage(imageDataUrl);
+  if (!image) return [];
+  const cacheKey = getOcrCacheKey(image);
+  const cachedBlocks = getCachedOcrBlocks(cacheKey);
+  if (cachedBlocks) {
+    console.log(`[segment] OCR cache hit: ${cachedBlocks.length} blocks`);
+    return cachedBlocks;
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "lian-ocr-"));
+  const imagePath = path.join(tempDir, `source${image.ext}`);
+  fs.writeFileSync(imagePath, image.buffer);
+  let paddleBlocks = null;
+
+  try {
+    const paddleResult = await extractPaddleTextBlocks(imagePath);
+    paddleBlocks = paddleResult.blocks;
+    if (paddleBlocks.length) {
+      const resizeNote = paddleResult.resized ? `, resized to ${paddleResult.ocrSize?.width}x${paddleResult.ocrSize?.height}` : "";
+      console.log(`[segment] PaddleOCR block count: ${paddleBlocks.length}${resizeNote}, elapsed=${paddleResult.elapsedMs || 0}ms`);
+      setCachedOcrBlocks(cacheKey, paddleBlocks);
+      return cloneOcrBlocks(paddleBlocks);
+    }
+  } catch (error) {
+    console.warn("[segment] PaddleOCR failed, trying Tesseract fallback:", error.message || error);
+  }
+
+  try {
+    const tsv = await runCommand("tesseract", [imagePath, "stdout", "-l", "chi_sim+eng", "--psm", "6", "tsv"]);
+    const tesseractBlocks = parseTesseractTsv(tsv);
+    if (tesseractBlocks.length) {
+      console.log(`[segment] Tesseract OCR block count: ${tesseractBlocks.length}`);
+    }
+    setCachedOcrBlocks(cacheKey, tesseractBlocks);
+    return tesseractBlocks;
+  } catch (error) {
+    console.warn("[segment] OCR unavailable or failed. TODO: connect service OCR if local OCR is unavailable.", error.message || error);
+    if (paddleBlocks) {
+      setCachedOcrBlocks(cacheKey, paddleBlocks);
+      return cloneOcrBlocks(paddleBlocks);
+    }
+    return [];
+  } finally {
+    fs.rm(tempDir, { recursive: true, force: true }, () => {});
+  }
+}
+
+function parseTesseractTsv(tsv) {
+  const rows = String(tsv || "").trim().split(/\r?\n/);
+  if (rows.length < 2) return [];
+  const headers = rows[0].split("\t");
+  const indexOf = (name) => headers.indexOf(name);
+  const col = {
+    level: indexOf("level"),
+    page: indexOf("page_num"),
+    block: indexOf("block_num"),
+    par: indexOf("par_num"),
+    line: indexOf("line_num"),
+    left: indexOf("left"),
+    top: indexOf("top"),
+    width: indexOf("width"),
+    height: indexOf("height"),
+    conf: indexOf("conf"),
+    text: indexOf("text")
+  };
+
+  const lineMap = new Map();
+  for (const row of rows.slice(1)) {
+    const cells = row.split("\t");
+    const text = String(cells[col.text] || "").trim();
+    const conf = Number(cells[col.conf]);
+    if (!text || Number.isFinite(conf) && conf < 25) continue;
+
+    const left = Number(cells[col.left]);
+    const top = Number(cells[col.top]);
+    const width = Number(cells[col.width]);
+    const height = Number(cells[col.height]);
+    if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) continue;
+
+    const key = [cells[col.page], cells[col.block], cells[col.par], cells[col.line]].join(":");
+    const existing = lineMap.get(key);
+    if (!existing) {
+      lineMap.set(key, {
+        text,
+        x: left,
+        y: top,
+        right: left + width,
+        bottom: top + height
+      });
+    } else {
+      existing.text = `${existing.text} ${text}`.trim();
+      existing.x = Math.min(existing.x, left);
+      existing.y = Math.min(existing.y, top);
+      existing.right = Math.max(existing.right, left + width);
+      existing.bottom = Math.max(existing.bottom, top + height);
+    }
+  }
+
+  return [...lineMap.values()]
+    .map((block) => ({
+      text: block.text.replace(/\s+/g, " ").trim(),
+      x: Math.round(block.x),
+      y: Math.round(block.y),
+      w: Math.round(block.right - block.x),
+      h: Math.round(block.bottom - block.y)
+    }))
+    .filter((block) => block.text && block.w > 2 && block.h > 2)
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
 function extractResponseText(data) {
   if (data.output_text) return data.output_text;
   const parts = [];
@@ -374,6 +708,94 @@ async function callOpenAIJsonWithFallback(options, fallbackModel) {
   }
 }
 
+function sanitizeKnowledge(value) {
+  const text = String(value || "").trim();
+  if (!text || /OCR|图像|图片|识别|分割|裁剪|边界|检测/i.test(text)) return "";
+  return text.split(/[、,，;；/|]+/).map((item) => item.trim()).filter(Boolean)[0] || "";
+}
+
+function normalizeQuestionType(value) {
+  const text = String(value || "").trim();
+  return ["计算题", "选择题", "填空题", "解答题", "未知"].includes(text) ? text : "未知";
+}
+
+function buildWholePageQuestion(width, height, reason = "OCR 未识别到文字块") {
+  return {
+    x: 0,
+    y: 0,
+    w: width,
+    h: height,
+    number: "",
+    questionNumber: "",
+    title: reason,
+    problemText: reason,
+    type: "未知",
+    problemType: "未知",
+    knowledge: "",
+    mainKnowledgePoint: "",
+    knowledgePoints: [],
+    confidence: 0.2
+  };
+}
+
+function normalizeBlockIndexes(indexes, blockCount) {
+  if (!Array.isArray(indexes)) return [];
+  const seen = new Set();
+  const valid = [];
+  for (const index of indexes) {
+    const number = Number(index);
+    if (!Number.isInteger(number) || number < 0 || number >= blockCount || seen.has(number)) continue;
+    seen.add(number);
+    valid.push(number);
+  }
+  return valid;
+}
+
+function buildQuestionBoxesFromGroups(groups, blocks, width, height) {
+  const questions = [];
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const indexes = normalizeBlockIndexes(group.blockIndexes, blocks.length);
+    if (!indexes.length) continue;
+
+    const selectedBlocks = indexes.map((index) => blocks[index]).filter(Boolean);
+    if (!selectedBlocks.length) continue;
+
+    const left = Math.min(...selectedBlocks.map((block) => block.x));
+    const top = Math.min(...selectedBlocks.map((block) => block.y));
+    const right = Math.max(...selectedBlocks.map((block) => block.x + block.w));
+    const bottom = Math.max(...selectedBlocks.map((block) => block.y + block.h));
+    const x = Math.max(0, Math.floor(left - 20));
+    const y = Math.max(0, Math.floor(top - 20));
+    const paddedRight = Math.min(width, Math.ceil(right + 30));
+    const paddedBottom = Math.min(height, Math.ceil(bottom + 30));
+    const title = String(group.title || selectedBlocks.map((block) => block.text).join(" ").slice(0, 80) || "题目").trim();
+    const knowledge = sanitizeKnowledge(group.knowledge);
+    const number = String(group.number || "").trim();
+    const type = normalizeQuestionType(group.type);
+
+    if (paddedRight <= x || paddedBottom <= y) continue;
+
+    questions.push({
+      x,
+      y,
+      w: paddedRight - x,
+      h: paddedBottom - y,
+      number,
+      questionNumber: number,
+      title,
+      problemText: title,
+      type,
+      problemType: type,
+      knowledge,
+      mainKnowledgePoint: knowledge,
+      knowledgePoints: knowledge ? [knowledge] : [],
+      confidence: 0.86
+    });
+  }
+
+  return questions.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
 async function handleSegment(req, res) {
   const body = await readJsonBody(req);
   if (!body.image || !body.width || !body.height) {
@@ -381,28 +803,62 @@ async function handleSegment(req, res) {
     return;
   }
 
-  const strictRetryText =
-    body.mode === "strict_structure"
-      ? "上一轮结果疑似将多道题合并，或把题目结构误当成图像/OCR任务。本轮必须重新阅读整页，先确认所有主题号和题目边界，再统一返回单题边界。"
-      : "";
+  const width = Number(body.width);
+  const height = Number(body.height);
+  const textBlocks = await extractTextBlocks(body.image);
+  console.log(`[segment] OCR block count: ${textBlocks.length}`);
 
-  const result = await callOpenAIJson({
+  if (!textBlocks.length) {
+    const questions = [buildWholePageQuestion(width, height, "OCR 未识别到文字块，返回整页题块")];
+    console.log("[segment] LLM grouping skipped: no OCR blocks");
+    console.log(`[segment] final box count: ${questions.length}`);
+    sendJson(res, 200, {
+      questions,
+      fallbackToWholePage: true,
+      note: "OCR 未识别到文字块；TODO: 接入 PaddleOCR 或其他 OCR 服务后可细分题目。",
+      model: SEGMENT_MODEL,
+      ocrBlockCount: 0
+    });
+    return;
+  }
+
+  let grouping = { questions: [], note: "" };
+  try {
+    grouping = await callOpenAIJson({
+      model: SEGMENT_MODEL,
+      schema: segmentGroupingSchema,
+      instructions: OCR_GROUPING_PROMPT,
+      content: [
+        {
+          type: "input_text",
+          text: JSON.stringify({
+            imageSize: { width, height },
+            blocks: textBlocks.map((block, index) => ({ index, ...block })),
+            outputContract:
+              "只返回每道题包含的 blockIndexes、number、title、type、knowledge。不要返回 x/y/w/h。"
+          })
+        }
+      ],
+      maxOutputTokens: 3000
+    });
+  } catch (error) {
+    console.warn("[segment] LLM grouping failed, fallback to whole page:", error.message || error);
+  }
+
+  console.log(`[segment] LLM grouping result: ${JSON.stringify(grouping.questions || []).slice(0, 1200)}`);
+  let questions = buildQuestionBoxesFromGroups(grouping.questions, textBlocks, width, height);
+  if (!questions.length) {
+    questions = [buildWholePageQuestion(width, height, "LLM 未返回有效题目分组，返回整页题块")];
+  }
+  console.log(`[segment] final box count: ${questions.length}`);
+
+  sendJson(res, 200, {
+    questions,
+    fallbackToWholePage: questions.length === 1 && questions[0].x === 0 && questions[0].y === 0 && questions[0].w === width && questions[0].h === height,
+    note: grouping.note || "OCR blocks grouped by LLM; boxes generated by server.",
     model: SEGMENT_MODEL,
-    schema: segmentSchema,
-    instructions: SEGMENTER_PROMPT,
-    content: [
-      {
-        type: "input_text",
-        text:
-          strictRetryText +
-          `原图尺寸：${body.width}x${body.height}。请先完成整页试卷版面分析，识别所有主题号和所有题目开始/结束位置，确认图形、选项、答题区域和子问题归属后，再统一返回每道题的 x,y,w,h、题号、置信度、题型、题干摘要和 1 个最主要知识点。` +
-          "如果返回多道题，它们的坐标必须是互不相同的单题边界，禁止每道题都返回整页坐标。纵向相邻题目必须用题号开始位置切开，上一题不能包含下一题。若无法可靠确认所有题目边界，请返回 questions=[] 并提示手动框选。"
-      },
-      { type: "input_image", image_url: body.image, detail: "high" }
-    ]
+    ocrBlockCount: textBlocks.length
   });
-
-  sendJson(res, 200, { ...result, model: SEGMENT_MODEL });
 }
 
 async function handleGuide(req, res) {
@@ -422,8 +878,9 @@ async function handleGuide(req, res) {
     next_step: "学生在互动讲解中要求听下一小步。",
     jump: "学生可能直接跳到结果，缺少列式或理由。",
     check: "学生提到算错、符号、单位或需要检查。",
+    thought_complete: "学生停顿了 2 到 3 秒，可能完成了一段思路；请先判断是否真的需要回应。",
     normal: "学生正在正常讲解。"
-  }[body.eventType || "normal"];
+  }[body.eventType || "normal"] || "学生正在讲题。";
 
   const guideState = body.guideState || "heuristic_guidance";
   const lectureUnlocked = Boolean(body.lectureUnlocked);
@@ -431,7 +888,7 @@ async function handleGuide(req, res) {
   const guideCall = await callOpenAIJsonWithFallback({
     model: GUIDE_MODEL,
     schema: guideSchema,
-    instructions: LIAN_GUIDE_PROMPT,
+    instructions: [LIAN_GUIDE_PROMPT, COMPANION_DIALOGUE_POLICY].join("\n\n"),
     content: [
       {
         type: "input_text",
@@ -446,6 +903,10 @@ async function handleGuide(req, res) {
           wrongAttemptCount: body.wrongAttemptCount || 0,
           interactiveStepCount: body.interactiveStepCount || 0,
           awaitingSilenceFollowup: Boolean(body.awaitingSilenceFollowup),
+          dialogueMode: body.dialogueMode || "standard",
+          thoughtSegments: body.thoughtSegments || 0,
+          hasConclusion: Boolean(body.hasConclusion),
+          hasMathStep: Boolean(body.hasMathStep),
           transcript: body.transcript || "",
           latestStudentSpeech: body.latestStudentSpeech || "",
           knownProblemText: body.problemText || "",
@@ -455,7 +916,9 @@ async function handleGuide(req, res) {
             "lectureUnlocked=false 时 speech 不得包含最终答案、中间完整算式或完整解题步骤。",
             "lectureUnlocked=true 时只讲一个小步骤，不得一次性讲完整题。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
-            "如果只是普通 2 分钟沉默且 awaitingSilenceFollowup=false，只做关怀询问，不给公式。"
+            "如果只是普通 2 分钟沉默且 awaitingSilenceFollowup=false，只做关怀询问，不给公式。",
+            "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
+            "禁止使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。"
           ],
           styleRules: LIAN_STYLE_RULES
         })

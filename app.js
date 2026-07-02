@@ -121,6 +121,9 @@ const GUIDE_STATE_LABELS = {
 const SILENCE_CARE_MS = 120000;
 const SILENCE_AFTER_CARE_MS = 60000;
 const ERROR_SILENCE_MS = 60000;
+const BOARD_RECOGNITION_DELAY_MS = 6500;
+const THOUGHT_PAUSE_MS = 2600;
+const THOUGHT_REVIEW_COOLDOWN_MS = 18000;
 const ACTIVE_HELP_PATTERN = /为什么|不懂|怎么来|怎么来的|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下/;
 
 const state = {
@@ -167,6 +170,12 @@ const state = {
   lastBoardWriteAt: 0,
   lastUserInputAt: 0,
   lastEncourageAt: 0,
+  lastThoughtReviewAt: 0,
+  pendingThoughtText: "",
+  pendingThoughtSegments: 0,
+  pendingThoughtHasConclusion: false,
+  pendingThoughtHasMathStep: false,
+  pendingThoughtTimer: null,
   normalSpeechCount: 0,
   stuckCount: 0,
   wrongAttemptCount: 0,
@@ -429,11 +438,11 @@ async function runAutoSegment() {
   try {
     const result = await requestAISegmentation("initial");
     segments = normalizeSegmentResult(result);
-    if (needsStrictWholePageRetry(segments)) {
+    if (!result?.fallbackToWholePage && needsStrictWholePageRetry(segments)) {
       setStatus(dom.segmentState, "正在重新分析整页题目结构");
       const strictResult = await requestAISegmentation("strict_structure");
       const strictSegments = normalizeSegmentResult(strictResult);
-      if (strictSegments.length && !needsStrictWholePageRetry(strictSegments)) {
+      if (strictResult?.fallbackToWholePage || strictSegments.length && !needsStrictWholePageRetry(strictSegments)) {
         segments = strictSegments;
       } else {
         segments = [];
@@ -499,14 +508,16 @@ function normalizeSegmentResult(result, sourceSize = state.source) {
     .map((item) => {
       const box = clampSegmentBox(item, sourceSize.width, sourceSize.height);
       if (!box) return null;
-      const knowledge = normalizeMainKnowledgePoint(item.mainKnowledgePoint || item.knowledgePoints, item.problemText || item.problemType || "");
+      const title = String(item.problemText || item.title || "").trim();
+      const type = item.problemType || item.type || "";
+      const knowledge = normalizeMainKnowledgePoint(item.mainKnowledgePoint || item.knowledge || item.knowledgePoints, `${title} ${type}`);
       if (isSuspiciousWholePageSegment(box, item, knowledge, visibleQuestionCount, sourceSize)) return null;
       return {
         box,
         meta: {
-          questionNumber: String(item.questionNumber || "").trim(),
-          problemText: String(item.problemText || "").trim(),
-          problemType: sanitizeMathLabel(item.problemType || ""),
+          questionNumber: String(item.questionNumber || item.number || "").trim(),
+          problemText: title,
+          problemType: sanitizeMathLabel(type),
           knowledgePoints: knowledge.points,
           confidence: Number(item.confidence) || 0
         }
@@ -1388,7 +1399,7 @@ dom.canvas.addEventListener("pointermove", (event) => {
     dom.studentState.textContent = "继续讲题";
     saveCurrentPage();
     markUserInput("board");
-    scheduleHandwritingRecognition("停笔 1 秒后");
+    scheduleHandwritingRecognition("停笔 6 秒后");
   });
 });
 
@@ -1490,7 +1501,7 @@ function scheduleHandwritingRecognition(reason) {
     showPausedHandwritingNotice();
     return;
   }
-  state.recognitionTimer = setTimeout(() => runHandwritingRecognition(reason), 1050);
+  state.recognitionTimer = setTimeout(() => runHandwritingRecognition(reason), BOARD_RECOGNITION_DELAY_MS);
 }
 
 function showPausedHandwritingNotice() {
@@ -1620,8 +1631,29 @@ async function createCurrentBoardSnapshot() {
   return composeBoardSnapshot(pages[0] || getBoardImageForGuide(), question.image, getSnapshotImageState(question.id));
 }
 
+function isIncompleteHandwritingIssue(result) {
+  const text = [
+    result.issueType,
+    result.issueSummary,
+    result.expectedNextStep,
+    result.guidance,
+    result.detectedWriting
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return /不完整|没写完|未写完|还没|未完成|缺少|缺项|没有看到|只写出|继续写|补全|补上|放进/.test(text);
+}
+
 function maybeSpeakHandwritingGuidance(result) {
   const now = Date.now();
+  if (isIncompleteHandwritingIssue(result)) {
+    state.lastHandwritingIssueKey = `incomplete:${result.issueSummary || result.detectedWriting || ""}`;
+    state.lastHandwritingGuideAt = now;
+    dom.recognitionPill.textContent = "等你写完";
+    addLog("板书识别", "这一步像是还没写完整，我先不语音打断。");
+    return false;
+  }
+
   const issue = registerPossibleIssue(result);
   if (issue.escalated) return true;
   if (issue.duplicate) return false;
@@ -1729,7 +1761,7 @@ function getSpeechRecognition() {
       return;
     }
 
-    lianSpeak("语音识别暂时不稳定。我还在听，你也可以继续讲。");
+    lianSilentNotice("语音识别暂时不稳定。我还在听，你也可以继续讲。");
   };
 
   recognition.onend = () => {
@@ -1863,6 +1895,7 @@ function handleStudentSpeech(text) {
   addLog("我", text);
 
   if (/下一步|继续讲|再讲一步|往下讲/.test(normalized) && state.guideState === GUIDE_STATES.INTERACTIVE) {
+    clearPendingThought();
     state.interactiveStepCount += 1;
     requestSmartGuide("next_step", text, {
       force: true,
@@ -1872,13 +1905,15 @@ function handleStudentSpeech(text) {
   }
 
   if (/听懂了|懂了|明白了|会了/.test(normalized) && state.guideState === GUIDE_STATES.INTERACTIVE && !ACTIVE_HELP_PATTERN.test(normalized)) {
+    clearPendingThought();
     setGuideState(GUIDE_STATES.HEURISTIC);
     clearIssueTracking();
-    lianSpeak("好，那你用自己的话把这一步接着讲一下。");
+    lianSpeak("你已经接住这一步了。那你用自己的话把它接着讲下去。");
     return;
   }
 
   if (ACTIVE_HELP_PATTERN.test(normalized)) {
+    clearPendingThought();
     state.stuckCount += 1;
     clearSilenceFollowup();
     setGuideState(GUIDE_STATES.INTERACTIVE);
@@ -1899,6 +1934,7 @@ function handleStudentSpeech(text) {
     scheduleHandwritingRecognition("关键讲解语音");
     if (/^(答案|结果|所以)?(是|为|等于)?[0-9a-zA-Z一二三四五六七八九十]+$/.test(normalized)) {
       setGuideState(GUIDE_STATES.MICRO_HINT);
+      clearPendingThought();
       requestSmartGuide("jump", text, {
         cooldown: 28000,
         guideState: GUIDE_STATES.MICRO_HINT,
@@ -1906,17 +1942,18 @@ function handleStudentSpeech(text) {
       });
       return;
     }
-    maybeEncourage();
+    scheduleThoughtPauseReview(text, { hasConclusion: true });
     return;
   }
 
   if (/这一步|然后|接着|化简|代入|方程/.test(normalized)) {
     scheduleHandwritingRecognition("关键讲解语音");
-    maybeEncourage();
+    scheduleThoughtPauseReview(text, { hasMathStep: true });
     return;
   }
 
   if (/错|不对|算错|符号|单位/.test(normalized)) {
+    clearPendingThought();
     setGuideState(GUIDE_STATES.MICRO_HINT);
     requestSmartGuide("check", text, {
       cooldown: 18000,
@@ -1928,7 +1965,97 @@ function handleStudentSpeech(text) {
 
   dom.lianState.textContent = "安静听你讲";
   dom.lianAvatar.classList.add("listening");
-  maybeEncourage();
+  scheduleThoughtPauseReview(text);
+}
+
+function scheduleThoughtPauseReview(text, flags = {}) {
+  clearTimeout(state.pendingThoughtTimer);
+  const clipped = String(text || "").trim();
+  if (!clipped) return;
+
+  state.pendingThoughtText = [state.pendingThoughtText, clipped].filter(Boolean).join("\n").slice(-900);
+  state.pendingThoughtSegments += 1;
+  state.pendingThoughtHasConclusion = Boolean(state.pendingThoughtHasConclusion || flags.hasConclusion);
+  state.pendingThoughtHasMathStep = Boolean(state.pendingThoughtHasMathStep || flags.hasMathStep);
+  dom.lianState.textContent = "安静听你讲";
+  dom.lianAvatar.classList.add("listening");
+
+  state.pendingThoughtTimer = setTimeout(handleThoughtPause, THOUGHT_PAUSE_MS);
+}
+
+function clearPendingThought() {
+  clearTimeout(state.pendingThoughtTimer);
+  state.pendingThoughtTimer = null;
+  state.pendingThoughtText = "";
+  state.pendingThoughtSegments = 0;
+  state.pendingThoughtHasConclusion = false;
+  state.pendingThoughtHasMathStep = false;
+}
+
+function handleThoughtPause() {
+  const now = Date.now();
+  if (now - state.lastSpeechAt < THOUGHT_PAUSE_MS - 200) {
+    state.pendingThoughtTimer = setTimeout(handleThoughtPause, THOUGHT_PAUSE_MS);
+    return;
+  }
+
+  const text = state.pendingThoughtText.trim();
+  const segmentCount = state.pendingThoughtSegments;
+  const hasConclusion = state.pendingThoughtHasConclusion;
+  const hasMathStep = state.pendingThoughtHasMathStep;
+  clearPendingThought();
+  if (!text || !shouldReviewThoughtPause(text, { segmentCount, hasConclusion, hasMathStep })) {
+    dom.lianState.textContent = guideIdleText();
+    return;
+  }
+
+  state.lastThoughtReviewAt = now;
+  requestSmartGuide("thought_complete", text, {
+    cooldown: THOUGHT_REVIEW_COOLDOWN_MS,
+    guideState: GUIDE_STATES.HEURISTIC,
+    thoughtSegments: segmentCount,
+    hasConclusion,
+    hasMathStep,
+    fallbackText: buildThoughtPauseFallback(text, { hasConclusion })
+  });
+}
+
+function shouldReviewThoughtPause(text, meta = {}) {
+  const normalized = text.replace(/\s/g, "");
+  const now = Date.now();
+  if (ACTIVE_HELP_PATTERN.test(normalized)) return false;
+  if (now - state.lastGuideAt < THOUGHT_REVIEW_COOLDOWN_MS) return false;
+  if (now - state.lastThoughtReviewAt < THOUGHT_REVIEW_COOLDOWN_MS) return false;
+  if (normalized.length < 18 && meta.segmentCount < 2 && !meta.hasConclusion) return false;
+  return Boolean(
+    meta.hasConclusion ||
+      meta.hasMathStep ||
+      meta.segmentCount >= 2 ||
+      /所以|因此|这样|这里|关系|方程|等式|比例|设|未知数|代入|化简|算出|得到/.test(normalized)
+  );
+}
+
+function buildThoughtPauseFallback(text, meta = {}) {
+  const normalized = text.replace(/\s/g, "");
+  if (/设|未知数|x|y/.test(normalized)) {
+    return "你是在先把未知量表示出来。那接下来准备用哪个条件列等式？";
+  }
+  if (/方程|等式|列式/.test(normalized)) {
+    return "你已经开始把条件转成等式了。下一步先检查等号两边表示的是不是同一个量。";
+  }
+  if (/比例|比值|成比例/.test(normalized)) {
+    return "你是在找两个量之间的比例关系。下一步说说对应关系怎么配。";
+  }
+  if (/勾股|直角|斜边/.test(normalized)) {
+    return "你抓到直角三角形这个结构了。下一步准备把哪两条边代进关系式？";
+  }
+  if (/面积|周长|体积/.test(normalized)) {
+    return "你是在把图形里的量对应到公式里。下一步先说清楚每个量代表哪一段。";
+  }
+  if (meta.hasConclusion || /答案|结果|所以|得到|算出/.test(normalized)) {
+    return "你已经走到结论了。回头补一句，这个结果是根据哪个关系得到的？";
+  }
+  return "我听到你是在整理题里的数量关系。你先接着说下一步打算怎么处理。";
 }
 
 async function requestSmartGuide(eventType, latestStudentSpeech = "", options = {}) {
@@ -1943,7 +2070,6 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   const fallbackText = options.fallbackText || buildFallbackGuide(eventType, question);
   const requestId = ++state.activeGuideRequestId;
   setGuideState(targetGuideState);
-  state.lastGuideAt = now;
   dom.lianState.textContent = targetGuideState === GUIDE_STATES.INTERACTIVE ? "准备分步讲解" : "在想提示";
   if (isSilenceGuide) state.silenceGuidePending = true;
 
@@ -1993,7 +2119,11 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       stuckCount: state.stuckCount,
       wrongAttemptCount: state.wrongAttemptCount,
       interactiveStepCount: state.interactiveStepCount,
-      awaitingSilenceFollowup: state.awaitingSilenceFollowup
+      awaitingSilenceFollowup: state.awaitingSilenceFollowup,
+      dialogueMode: options.dialogueMode || (eventType === "thought_complete" ? "companion_listening" : "standard"),
+      thoughtSegments: options.thoughtSegments || 0,
+      hasConclusion: Boolean(options.hasConclusion),
+      hasMathStep: Boolean(options.hasMathStep)
     })
   });
   const result = await response.json().catch(() => ({}));
@@ -2047,17 +2177,7 @@ function buildFallbackGuide(eventType, question) {
 }
 
 function maybeEncourage() {
-  const now = Date.now();
-  state.normalSpeechCount += 1;
-  const enoughSpeech = state.normalSpeechCount >= 3;
-  const enoughQuietTime = now - state.lastGuideAt > 22000 && now - state.lastEncourageAt > 22000;
-  if (!enoughSpeech || !enoughQuietTime) return false;
-
-  const words = ["很好", "很棒，继续", "嗯，思路顺的"];
-  state.normalSpeechCount = 0;
-  state.lastEncourageAt = now;
-  lianSpeak(words[Math.floor(Math.random() * words.length)]);
-  return true;
+  return false;
 }
 
 function maybeGuide(text, reason = "guide", cooldown = 15000) {
@@ -2129,6 +2249,14 @@ function lianSpeak(text) {
   } else {
     setTimeout(finishSpeaking, Math.min(2200, 850 + text.length * 34));
   }
+}
+
+function lianSilentNotice(text) {
+  dom.lianBubble.textContent = text;
+  dom.lianState.textContent = guideIdleText();
+  dom.lianAvatar.classList.remove("speaking");
+  dom.lianAvatar.classList.add("listening");
+  addLog("提示", text);
 }
 
 dom.finishQuestionBtn.addEventListener("click", async () => {
