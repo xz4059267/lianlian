@@ -9,11 +9,12 @@ const ROOT = __dirname;
 loadEnvFile(path.join(ROOT, ".env"));
 
 const PORT = Number(process.env.PORT || 4173);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const SEGMENT_MODEL = process.env.SEGMENT_MODEL || "gpt-5.4-mini";
-const GUIDE_MODEL = process.env.GUIDE_MODEL || "gpt-5.5";
-const GUIDE_FALLBACK_MODEL = process.env.GUIDE_FALLBACK_MODEL || "gpt-5.4-mini";
-const HANDWRITING_MODEL = process.env.HANDWRITING_MODEL || "gpt-5.4-mini";
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.deepseek_api_key || "";
+const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/+$/, "");
+const SEGMENT_MODEL = process.env.DEEPSEEK_SEGMENT_MODEL || "deepseek-v4-flash";
+const GUIDE_MODEL = process.env.DEEPSEEK_GUIDE_MODEL || "deepseek-v4-pro";
+const GUIDE_FALLBACK_MODEL = process.env.DEEPSEEK_GUIDE_FALLBACK_MODEL || "deepseek-v4-flash";
+const HANDWRITING_MODEL = process.env.DEEPSEEK_HANDWRITING_MODEL || "deepseek-v4-flash";
 const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
 const PADDLE_OCR_SCRIPT = path.join(ROOT, "tools", "paddle_ocr.py");
 const OCR_MAX_SIDE = Number(process.env.OCR_MAX_SIDE || 1800);
@@ -78,10 +79,19 @@ const COMPANION_DIALOGUE_POLICY = [
 const HANDWRITING_PROMPT = [
   "你是初中数学黑板板书的异步辅助识别器。",
   "你会同时看到当前题目图片和学生黑板板书截图。",
-  "任务是识别学生写下的关键公式、数字、等式、结论，并判断它与题目条件是否基本合理。",
+  "任务是识别学生写下的关键公式、数字、等式、结论，并结合题目条件进行一次数学核算。",
+  "先读题目条件和学生板书，再计算或验算学生写出的关系式、推导和结论是否成立；不要只做 OCR 转写。",
+  "你会看到多个 OCR 来源：题目图片、纯板书截图、包含题目区域的板书截图。它们互相补充，若纯板书 OCR 漏字，可参考合成截图；若合成截图混入题目印刷内容，以纯板书和题意为准。",
+  "例如板书写出 2/3 = x/6 且结论 x=4 时，需要实际验算比例关系是否能推出这个结果。",
+  "如果板书写出 2/3 = x/6 但最后结论写成 x=-2，必须判为 calculationStatus=\"wrong\"，因为由 2/3 = x/6 应推出 x=4。",
+  "如果能看出学生写了等式、比例式或 x/y 的结论，就要尽量判断 correct 或 wrong；只有关键数字/符号确实看不出时，才返回 unclear。",
+  "必须优先以“纯板书 OCR 结果”判断学生写了什么；题目图片和包含题目区域的截图只用于理解题目，不能把题目原图里的答案、红叉、批改痕迹或印刷文字当成学生板书。",
+  "判断 correct 必须同时满足：学生写出的关键关系式成立，且学生最后写出的结论/答案也与关系式和题意一致。只要最后结论错，就必须 hasPossibleIssue=true。",
   "不要做逐笔批改，不要因为字迹潦草就判错；只在数学关系、关键数字、符号或结论明显不合理时标记 hasPossibleIssue=true。",
+  "如果核算正确，calculationStatus=\"correct\"，hasPossibleIssue=false，并在 positiveFeedback 写一句贴着内容的短鼓励，避免固定说“很好/很棒”。",
+  "如果核算错误，calculationStatus=\"wrong\"，hasPossibleIssue=true，guidance 要转成恋恋可以说出口的温和检查提醒，不要直接说“你错了”。",
   "如果学生只是还没写完、只写出一部分比例/方程、缺少后续项，不能判为错误：hasPossibleIssue=false，guidance 置空或只说明继续观察。",
-  "如果发现问题，guidance 要转成恋恋可以说出口的温和检查提醒，不要直接说“你错了”。",
+  "如果看不清或无法核算，calculationStatus=\"unclear\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
   "guidance 应指出需要检查的位置或关系，并给一个很小的下一步，例如“圆周角/圆心角”“360 度乘几分之几”“等号后面的数”。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");
@@ -203,6 +213,15 @@ const handwritingSchema = {
         type: "boolean",
         description: "Whether the handwriting appears related to the current problem."
       },
+      calculationStatus: {
+        type: "string",
+        enum: ["not_relevant", "incomplete", "unclear", "correct", "wrong"],
+        description: "Result of checking the student's visible math against the problem."
+      },
+      calculationCheck: {
+        type: "string",
+        description: "Short private explanation of the verification or calculation performed."
+      },
       hasPossibleIssue: {
         type: "boolean",
         description: "True only when a likely mathematical issue is visible."
@@ -224,6 +243,10 @@ const handwritingSchema = {
         type: "string",
         description: "Warm Chinese guidance Lian can speak. Avoid saying the student is wrong directly."
       },
+      positiveFeedback: {
+        type: "string",
+        description: "Short Chinese feedback Lian can speak when calculationStatus is correct. Keep empty otherwise."
+      },
       confidence: {
         type: "number",
         description: "0 to 1 confidence in this analysis."
@@ -233,11 +256,14 @@ const handwritingSchema = {
       "detectedWriting",
       "mathExpression",
       "isRelevant",
+      "calculationStatus",
+      "calculationCheck",
       "hasPossibleIssue",
       "issueType",
       "issueSummary",
       "expectedNextStep",
       "guidance",
+      "positiveFeedback",
       "confidence"
     ]
   }
@@ -613,51 +639,122 @@ function parseTesseractTsv(tsv) {
     .sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
-function extractResponseText(data) {
-  if (data.output_text) return data.output_text;
-  const parts = [];
-  for (const item of data.output || []) {
-    for (const content of item.content || []) {
-      if ((content.type === "output_text" || content.type === "text") && content.text) {
-        parts.push(content.text);
-      }
-    }
-  }
-  return parts.join("\n");
+function extractDeepSeekText(data) {
+  return String(data?.choices?.[0]?.message?.content || "").trim();
 }
 
-async function callOpenAIJson({ model, content, schema, instructions, maxOutputTokens = 1800 }) {
-  if (!OPENAI_API_KEY) {
-    const error = new Error("OPENAI_API_KEY 未配置");
+function parseModelJson(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) {
+      try {
+        return JSON.parse(fenced[1].trim());
+      } catch {
+        // Fall through to object slicing.
+      }
+    }
+    const first = raw.indexOf("{");
+    const last = raw.lastIndexOf("}");
+    if (first >= 0 && last > first) {
+      try {
+        return JSON.parse(raw.slice(first, last + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function formatOcrBlocksForPrompt(blocks, limit = 180) {
+  const visibleBlocks = blocks.slice(0, limit).map((block, index) => ({
+    index,
+    text: block.text,
+    x: block.x,
+    y: block.y,
+    w: block.w,
+    h: block.h
+  }));
+  const suffix = blocks.length > limit ? `\n...另有 ${blocks.length - limit} 个 OCR 块已省略` : "";
+  return `${JSON.stringify(visibleBlocks, null, 2)}${suffix}`;
+}
+
+async function buildDeepSeekUserText(content) {
+  const parts = [];
+  let imageIndex = 0;
+  for (const item of Array.isArray(content) ? content : []) {
+    if (item?.type === "input_text") {
+      parts.push(String(item.text || ""));
+      continue;
+    }
+    if (item?.type === "input_image") {
+      imageIndex += 1;
+      const label = item.label || (imageIndex === 1 ? "题目图片" : imageIndex === 2 ? "板书截图" : `图片${imageIndex}`);
+      let blocks = [];
+      try {
+        blocks = await extractTextBlocks(item.image_url);
+      } catch (error) {
+        console.warn(`[deepseek] ${label} OCR failed:`, error.message || error);
+      }
+      const blockLimit = Number.isFinite(Number(item.blockLimit)) ? Number(item.blockLimit) : 180;
+      parts.push(
+        [
+          `[${label} OCR 结果]`,
+          blocks.length
+            ? formatOcrBlocksForPrompt(blocks, blockLimit)
+            : "OCR 未识别到文字。DeepSeek 当前只能基于 OCR 文本判断，不能直接读取图片像素。"
+        ].join("\n")
+      );
+    }
+  }
+  return parts.filter(Boolean).join("\n\n");
+}
+
+async function callDeepSeekJson({ model, content, schema, instructions, maxOutputTokens = 1800 }) {
+  if (!DEEPSEEK_API_KEY) {
+    const error = new Error("DEEPSEEK_API_KEY 未配置");
     error.statusCode = 503;
+    error.code = "missing_api_key";
     throw error;
   }
 
+  const userText = await buildDeepSeekUserText(content);
+  const schemaText = JSON.stringify(schema.schema, null, 2);
+
   let response;
   try {
-    response = await fetch("https://api.openai.com/v1/responses", {
+    response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`
       },
       body: JSON.stringify({
         model,
-        instructions,
-        input: [{ role: "user", content }],
-        max_output_tokens: maxOutputTokens,
-        text: {
-          format: {
-            type: "json_schema",
-            name: schema.name,
-            strict: schema.strict,
-            schema: schema.schema
-          }
-        }
+        messages: [
+          {
+            role: "system",
+            content: [
+              instructions,
+              "你必须只输出一个合法 JSON 对象，不要输出 Markdown，不要输出解释。",
+              `JSON schema 名称：${schema.name}`,
+              "JSON schema：",
+              schemaText
+            ].join("\n\n")
+          },
+          { role: "user", content: userText }
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: maxOutputTokens,
+        stream: false
       })
     });
   } catch {
-    const error = new Error("OpenAI API 网络连接失败");
+    const error = new Error("DeepSeek API 网络连接失败");
     error.statusCode = 502;
     error.code = "network_error";
     throw error;
@@ -665,21 +762,20 @@ async function callOpenAIJson({ model, content, schema, instructions, maxOutputT
 
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(data.error?.message || `OpenAI API 请求失败：${response.status}`);
+    const error = new Error(data.error?.message || `DeepSeek API 请求失败：${response.status}`);
     error.statusCode = response.status;
-    error.code = data.error?.code || data.error?.type || "openai_error";
+    error.code = data.error?.code || data.error?.type || "deepseek_error";
     throw error;
   }
 
-  const text = extractResponseText(data);
-  try {
-    return JSON.parse(text);
-  } catch {
-    const error = new Error("模型没有返回可解析的结构化结果");
+  const parsed = parseModelJson(extractDeepSeekText(data));
+  if (!parsed) {
+    const error = new Error("DeepSeek 没有返回可解析的结构化结果");
     error.statusCode = 502;
     error.code = "invalid_model_output";
     throw error;
   }
+  return parsed;
 }
 
 function shouldUseFallbackModel(error) {
@@ -692,16 +788,16 @@ function shouldUseFallbackModel(error) {
   );
 }
 
-async function callOpenAIJsonWithFallback(options, fallbackModel) {
+async function callDeepSeekJsonWithFallback(options, fallbackModel) {
   try {
     return {
-      result: await callOpenAIJson(options),
+      result: await callDeepSeekJson(options),
       model: options.model
     };
   } catch (error) {
     if (!fallbackModel || fallbackModel === options.model || !shouldUseFallbackModel(error)) throw error;
     return {
-      result: await callOpenAIJson({ ...options, model: fallbackModel }),
+      result: await callDeepSeekJson({ ...options, model: fallbackModel }),
       model: fallbackModel,
       fallbackFrom: options.model
     };
@@ -824,7 +920,7 @@ async function handleSegment(req, res) {
 
   let grouping = { questions: [], note: "" };
   try {
-    grouping = await callOpenAIJson({
+    grouping = await callDeepSeekJson({
       model: SEGMENT_MODEL,
       schema: segmentGroupingSchema,
       instructions: OCR_GROUPING_PROMPT,
@@ -885,7 +981,7 @@ async function handleGuide(req, res) {
   const guideState = body.guideState || "heuristic_guidance";
   const lectureUnlocked = Boolean(body.lectureUnlocked);
 
-  const guideCall = await callOpenAIJsonWithFallback({
+  const guideCall = await callDeepSeekJsonWithFallback({
     model: GUIDE_MODEL,
     schema: guideSchema,
     instructions: [LIAN_GUIDE_PROMPT, COMPANION_DIALOGUE_POLICY].join("\n\n"),
@@ -938,12 +1034,14 @@ async function handleGuide(req, res) {
 
 async function handleHandwriting(req, res) {
   const body = await readJsonBody(req);
-  if (!body.questionImage || !body.boardImage) {
-    sendJson(res, 400, { error: "缺少 questionImage 或 boardImage" });
+  if (!body.questionImage || !(body.boardOnlyImage || body.boardImage)) {
+    sendJson(res, 400, { error: "缺少 questionImage 或 boardOnlyImage" });
     return;
   }
 
-  const result = await callOpenAIJson({
+  const boardForOcr = body.boardOnlyImage || body.boardImage;
+
+  const result = await callDeepSeekJson({
     model: HANDWRITING_MODEL,
     schema: handwritingSchema,
     instructions: HANDWRITING_PROMPT,
@@ -956,13 +1054,14 @@ async function handleHandwriting(req, res) {
           knownProblemText: body.problemText || "",
           knownKnowledgePoints: body.knowledgePoints || [],
           instruction:
-            "请比较题目图片和学生板书截图。若板书中关键公式、运算或结论明显不符合题意，给出温和检查提醒；若只是字迹不清或还没写完，不要轻易判错。"
+            "请同时参考题目图片 OCR、纯板书 OCR、包含题目区域的板书截图 OCR。纯板书 OCR 用来判断学生真正写了什么；题目图片和包含题目区域的截图用于理解题意、确认题目条件和板书所在位置。不要把题目原图里的印刷答案、红叉、批改痕迹当成学生板书。然后根据题目条件实际计算/验算。若关键公式和最后结论都正确，返回 calculationStatus=correct；若公式对但最后结论算错，也必须返回 calculationStatus=wrong；若明显不符合题意，给温和检查提醒；若只是字迹不清或还没写完，不要轻易判错。"
         })
       },
-      { type: "input_image", image_url: body.questionImage, detail: "high" },
-      { type: "input_image", image_url: body.boardImage, detail: "high" }
+      { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high", blockLimit: 80 },
+      { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high", blockLimit: 80 },
+      ...(body.boardImage ? [{ type: "input_image", label: "包含题目区域的板书截图", image_url: body.boardImage, detail: "high", blockLimit: 120 }] : [])
     ],
-    maxOutputTokens: 1200
+    maxOutputTokens: 1000
   });
 
   sendJson(res, 200, { ...result, model: HANDWRITING_MODEL });
@@ -1007,6 +1106,6 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`恋恋错题本服务已启动：http://127.0.0.1:${PORT}`);
   console.log(
-    `题目分割模型：${SEGMENT_MODEL}；讲解引导模型：${GUIDE_MODEL}；讲解兜底模型：${GUIDE_FALLBACK_MODEL}；板书识别模型：${HANDWRITING_MODEL}`
+    `DeepSeek API：${DEEPSEEK_BASE_URL}；题目分割模型：${SEGMENT_MODEL}；讲解引导模型：${GUIDE_MODEL}；讲解兜底模型：${GUIDE_FALLBACK_MODEL}；板书识别模型：${HANDWRITING_MODEL}`
   );
 });

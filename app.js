@@ -157,7 +157,14 @@ const state = {
   lastHandwritingPauseNoticeAt: 0,
   lastHandwritingGuideAt: 0,
   lastHandwritingIssueKey: "",
+  lastHandwritingSuccessAt: 0,
+  lastHandwritingSuccessKey: "",
+  lastHandwritingUnclearAt: 0,
+  lastHandwritingUnclearKey: "",
   speechRecognition: null,
+  speechDraftText: "",
+  speechDraftBase: "",
+  speechNoResultTimer: null,
   isListening: false,
   isMuted: false,
   micPermissionGranted: false,
@@ -1098,6 +1105,9 @@ function initCurrentQuestion() {
   dom.boardQuestionImage.src = question.image;
   applyBoardImageState();
   dom.transcriptInput.value = "";
+  state.speechDraftText = "";
+  state.speechDraftBase = "";
+  stopSpeechNoResultTimer();
   dom.eventLog.innerHTML = "";
   dom.studentState.textContent = "准备讲题";
   setGuideState(GUIDE_STATES.HEURISTIC);
@@ -1510,7 +1520,7 @@ function showPausedHandwritingNotice() {
   dom.recognitionPill.classList.remove("hidden");
   setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1400);
   if (now - state.lastHandwritingPauseNoticeAt > 30000) {
-    addLog("板书识别", `${dom.recognitionPill.textContent}，暂时不再自动重试。`);
+    addLog("提示", `${dom.recognitionPill.textContent}，暂时不再自动重试。`);
     state.lastHandwritingPauseNoticeAt = now;
   }
 }
@@ -1521,14 +1531,14 @@ function explainHandwritingError(error) {
   if (code === "insufficient_quota" || /quota|billing|额度不足|配额/.test(message)) {
     return {
       pill: "识别额度不足",
-      log: "OpenAI 账户额度不足，板书识别已暂停。换成有额度的 API key 后再刷新页面即可继续。",
+      log: "DeepSeek API 余额不足，板书识别已暂停。换成有额度的 API key 后再刷新页面即可继续。",
       pauseMs: 10 * 60 * 1000
     };
   }
   if (code === "invalid_api_key" || /api key|authentication|认证|鉴权/i.test(message)) {
     return {
       pill: "识别授权失败",
-      log: "API key 无法通过认证，请检查 .env 里的 OPENAI_API_KEY。",
+      log: "API key 无法通过认证，请检查 .env 里的 DEEPSEEK_API_KEY 或 deepseek_api_key。",
       pauseMs: 10 * 60 * 1000
     };
   }
@@ -1565,21 +1575,29 @@ async function runHandwritingRecognition(reason) {
   saveCurrentPage();
   dom.recognitionPill.textContent = "板书识别中";
   dom.recognitionPill.classList.remove("hidden");
-  addLog("板书", `${reason}触发了一次异步识别`);
 
   try {
-    const result = await requestHandwritingAnalysis(question, reason);
+    const result = normalizeHandwritingResult(await requestHandwritingAnalysis(question, reason));
     if (requestId !== state.handwritingRequestId) return;
     state.latestHandwritingResult = result;
     state.handwritingResults[question.id] = result;
 
-    if (result.hasPossibleIssue && result.confidence >= 0.45) {
-      dom.recognitionPill.textContent = "发现需检查";
-      addLog("板书识别", result.issueSummary || result.detectedWriting || "发现可能需要检查的步骤");
+    if (isIncompleteHandwritingIssue(result)) {
+      dom.recognitionPill.textContent = "等你写完";
       maybeSpeakHandwritingGuidance(result);
+    } else if (isHandwritingCalculationWrong(result)) {
+      dom.recognitionPill.textContent = "发现需检查";
+      maybeSpeakHandwritingGuidance(result);
+    } else if (isHandwritingCalculationCorrect(result)) {
+      dom.recognitionPill.textContent = "板书看过了";
+      clearIssueTracking();
+      if (state.guideState === GUIDE_STATES.MICRO_HINT) setGuideState(GUIDE_STATES.HEURISTIC);
+      maybeSpeakHandwritingSuccess(result);
+    } else if (shouldAskForHandwritingConfirmation(result)) {
+      dom.recognitionPill.textContent = "需要确认";
+      maybeSpeakHandwritingUnclear(result);
     } else {
       dom.recognitionPill.textContent = result.isRelevant ? "板书看过了" : "板书较少";
-      if (result.detectedWriting) addLog("板书识别", `看到了：${result.detectedWriting}`);
       if (result.isRelevant) {
         clearIssueTracking();
         if (state.guideState === GUIDE_STATES.MICRO_HINT) setGuideState(GUIDE_STATES.HEURISTIC);
@@ -1589,7 +1607,7 @@ async function runHandwritingRecognition(reason) {
     console.warn("Handwriting recognition fallback:", error);
     const info = explainHandwritingError(error);
     dom.recognitionPill.textContent = info.pill;
-    addLog("板书识别", info.log);
+    addLog("提示", info.log);
     state.lastHandwritingServiceError = info.pill;
     if (info.pauseMs) state.handwritingDisabledUntil = Date.now() + info.pauseMs;
   } finally {
@@ -1599,11 +1617,13 @@ async function runHandwritingRecognition(reason) {
 
 async function requestHandwritingAnalysis(question, reason) {
   const boardImage = await createCurrentBoardSnapshot();
+  const boardOnlyImage = await createCurrentBoardOnlySnapshot();
   const response = await fetch("/api/handwriting", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       questionImage: question.image,
+      boardOnlyImage,
       boardImage,
       reason,
       transcript: dom.transcriptInput.value.trim(),
@@ -1631,8 +1651,57 @@ async function createCurrentBoardSnapshot() {
   return composeBoardSnapshot(pages[0] || getBoardImageForGuide(), question.image, getSnapshotImageState(question.id));
 }
 
+async function createCurrentBoardOnlySnapshot() {
+  const question = currentPageQuestion();
+  if (!question) return getBoardImageForGuide();
+  saveCurrentPage();
+  const pages = pagesForQuestion(question.id);
+  return composeStrokeOcrSnapshot(pages[0] || getBoardImageForGuide());
+}
+
+async function composeStrokeOcrSnapshot(strokesDataUrl) {
+  if (!strokesDataUrl) return "";
+  const strokes = await loadImage(strokesDataUrl);
+  const maxWidth = 1280;
+  const scale = Math.min(1, maxWidth / strokes.naturalWidth);
+  const width = Math.max(1, Math.round(strokes.naturalWidth * scale));
+  const height = Math.max(1, Math.round(strokes.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ocrCtx = canvas.getContext("2d");
+  ocrCtx.fillStyle = "#ffffff";
+  ocrCtx.fillRect(0, 0, width, height);
+
+  const tempCanvas = document.createElement("canvas");
+  tempCanvas.width = width;
+  tempCanvas.height = height;
+  const tempCtx = tempCanvas.getContext("2d");
+  tempCtx.clearRect(0, 0, width, height);
+  tempCtx.drawImage(strokes, 0, 0, width, height);
+  const imageData = tempCtx.getImageData(0, 0, width, height);
+  const data = imageData.data;
+  for (let index = 0; index < data.length; index += 4) {
+    const alpha = data[index + 3];
+    if (alpha > 12) {
+      data[index] = 18;
+      data[index + 1] = 26;
+      data[index + 2] = 24;
+      data[index + 3] = 255;
+    } else {
+      data[index] = 255;
+      data[index + 1] = 255;
+      data[index + 2] = 255;
+      data[index + 3] = 255;
+    }
+  }
+  ocrCtx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
+}
+
 function isIncompleteHandwritingIssue(result) {
   const text = [
+    result.calculationStatus,
     result.issueType,
     result.issueSummary,
     result.expectedNextStep,
@@ -1641,7 +1710,190 @@ function isIncompleteHandwritingIssue(result) {
   ]
     .filter(Boolean)
     .join(" ");
-  return /不完整|没写完|未写完|还没|未完成|缺少|缺项|没有看到|只写出|继续写|补全|补上|放进/.test(text);
+  return /incomplete|不完整|没写完|未写完|还没|未完成|缺少|缺项|没有看到|只写出|继续写|补全|补上|放进/.test(text);
+}
+
+function extractVariableAssignments(text) {
+  const assignments = new Map();
+  const source = String(text || "")
+    .replace(/[＝]/g, "=")
+    .replace(/[−－]/g, "-");
+  const pattern = /([a-zA-Z])\s*=\s*(-?\d+(?:\.\d+)?(?:\s*\/\s*-?\d+(?:\.\d+)?)?)/g;
+  let match;
+  while ((match = pattern.exec(source))) {
+    const variable = match[1].toLowerCase();
+    const value = match[2].replace(/\s+/g, "");
+    if (!assignments.has(variable)) assignments.set(variable, new Set());
+    assignments.get(variable).add(value);
+  }
+  return assignments;
+}
+
+function hasAssignmentConflict(result) {
+  const studentAssignments = extractVariableAssignments([result.detectedWriting, result.mathExpression].filter(Boolean).join(" "));
+  const checkAssignments = extractVariableAssignments(
+    [
+      result.calculationCheck,
+      result.issueSummary,
+      result.expectedNextStep,
+      result.guidance,
+      result.positiveFeedback
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+
+  for (const [variable, studentValues] of studentAssignments.entries()) {
+    const checkedValues = checkAssignments.get(variable);
+    if (!checkedValues?.size) continue;
+    const hasSameValue = [...studentValues].some((value) => checkedValues.has(value));
+    if (!hasSameValue) return true;
+  }
+  return false;
+}
+
+function hasContradictoryCorrectSignal(result) {
+  const text = [
+    result.detectedWriting,
+    result.mathExpression,
+    result.calculationCheck,
+    result.issueSummary,
+    result.expectedNextStep,
+    result.guidance,
+    result.positiveFeedback
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return /不成立|算错|结论错|答案错|应为|应该是|应得到|应推出|不是|错误|检查/.test(text);
+}
+
+function normalizeHandwritingResult(result) {
+  if (!result) return result;
+  const confidence = Number(result.confidence);
+  const normalized = {
+    ...result,
+    confidence: Number.isFinite(confidence) ? confidence : 0
+  };
+
+  if (normalized.calculationStatus === "wrong") {
+    return {
+      ...normalized,
+      hasPossibleIssue: true,
+      issueType: normalized.issueType && normalized.issueType !== "none" ? normalized.issueType : "wrong_number",
+      issueSummary: normalized.issueSummary || "板书中的计算或结论需要检查。",
+      expectedNextStep: normalized.expectedNextStep || "回到前面的关系式，重新核对等号后的结果。",
+      guidance: normalized.guidance || "我们一起检查一下最后这个结果，按前面的关系式再算一遍。",
+      positiveFeedback: "",
+      confidence: Math.max(normalized.confidence, 0.65)
+    };
+  }
+
+  if (normalized.calculationStatus !== "correct") return normalized;
+  if (!hasAssignmentConflict(normalized) && !hasContradictoryCorrectSignal(normalized)) {
+    return {
+      ...normalized,
+      hasPossibleIssue: false,
+      issueType: "none",
+      issueSummary: "",
+      expectedNextStep: normalized.expectedNextStep || "",
+      guidance: "",
+      confidence: Math.max(normalized.confidence, 0.55)
+    };
+  }
+
+  return {
+    ...normalized,
+    calculationStatus: "wrong",
+    hasPossibleIssue: true,
+    issueType: normalized.issueType && normalized.issueType !== "none" ? normalized.issueType : "wrong_number",
+    issueSummary: normalized.issueSummary || "板书中的结论和前面的比例式不一致。",
+    expectedNextStep: normalized.expectedNextStep || "按比例式交叉相乘，重新算等号后的 x 值。",
+    guidance: normalized.guidance || "我们一起检查一下最后这个 x 值，按前面的比例式交叉相乘再算一遍。",
+    positiveFeedback: "",
+    confidence: Math.max(normalized.confidence, 0.72)
+  };
+}
+
+function isHandwritingCalculationWrong(result) {
+  return result?.calculationStatus === "wrong" || (result?.hasPossibleIssue && result.confidence >= 0.45);
+}
+
+function isHandwritingCalculationCorrect(result) {
+  return (
+    result?.calculationStatus === "correct" &&
+    result.confidence >= 0.5 &&
+    !hasAssignmentConflict(result) &&
+    !hasContradictoryCorrectSignal(result)
+  );
+}
+
+function maybeSpeakHandwritingSuccess(result) {
+  if (!isHandwritingCalculationCorrect(result)) return false;
+  if (isIncompleteHandwritingIssue(result)) return false;
+
+  const now = Date.now();
+  const successKey = `${result.mathExpression || ""}:${result.calculationCheck || result.detectedWriting || ""}`
+    .replace(/\s+/g, "")
+    .slice(0, 120);
+  if (successKey && successKey === state.lastHandwritingSuccessKey && now - state.lastHandwritingSuccessAt < 45000) return false;
+
+  state.lastHandwritingSuccessKey = successKey;
+  state.lastHandwritingSuccessAt = now;
+  const feedback =
+    result.positiveFeedback ||
+    (result.mathExpression ? `这一步能算通，${result.mathExpression} 先保留下来。` : "这一步关系能对上，先保留下来。");
+  lianSpeak(feedback);
+  return true;
+}
+
+function shouldAskForHandwritingConfirmation(result) {
+  if (!result) return false;
+  if (isIncompleteHandwritingIssue(result)) return false;
+  if (isHandwritingCalculationWrong(result) || isHandwritingCalculationCorrect(result)) return false;
+
+  const hasRecentBoardWriting = Date.now() - (state.lastBoardWriteAt || 0) < 90000;
+  const hasRecognizedContent = [
+    result.detectedWriting,
+    result.mathExpression,
+    result.calculationCheck,
+    result.issueSummary,
+    result.expectedNextStep
+  ].some((value) => String(value || "").trim());
+  const looksMathRelated = /x|y|=|＝|\/|分之|比例|方程|角|度|面积|周长|半径|直径|\d/.test(
+    [result.detectedWriting, result.mathExpression, result.calculationCheck].filter(Boolean).join(" ")
+  );
+
+  return Boolean(result.isRelevant || hasRecognizedContent || looksMathRelated || hasRecentBoardWriting);
+}
+
+function maybeSpeakHandwritingUnclear(result) {
+  if (!shouldAskForHandwritingConfirmation(result)) return false;
+
+  const now = Date.now();
+  const unclearKey = [
+    result.calculationStatus,
+    result.detectedWriting,
+    result.mathExpression,
+    result.calculationCheck
+  ]
+    .filter(Boolean)
+    .join(":")
+    .replace(/\s+/g, "")
+    .slice(0, 100) || "recent-board";
+
+  if (unclearKey === state.lastHandwritingUnclearKey && now - state.lastHandwritingUnclearAt < 45000) return false;
+
+  state.lastHandwritingUnclearKey = unclearKey;
+  state.lastHandwritingUnclearAt = now;
+
+  const hasFormulaHint = /x|y|=|＝|\/|分之|比例|方程|\d/.test(
+    [result.detectedWriting, result.mathExpression].filter(Boolean).join(" ")
+  );
+  const speech = hasFormulaHint
+    ? "我看到了你在写关系式，但最后一步我没完全看清。你把最后一行读给我听，我来帮你核一下。"
+    : "我这次没完全看清板书。你把刚写的等式或最后结果读给我听，我接着帮你判断。";
+  lianSpeak(speech);
+  return true;
 }
 
 function maybeSpeakHandwritingGuidance(result) {
@@ -1650,18 +1902,12 @@ function maybeSpeakHandwritingGuidance(result) {
     state.lastHandwritingIssueKey = `incomplete:${result.issueSummary || result.detectedWriting || ""}`;
     state.lastHandwritingGuideAt = now;
     dom.recognitionPill.textContent = "等你写完";
-    addLog("板书识别", "这一步像是还没写完整，我先不语音打断。");
     return false;
   }
 
   const issue = registerPossibleIssue(result);
   if (issue.escalated) return true;
   if (issue.duplicate) return false;
-  if (now - state.lastGuideAt < 6000) {
-    state.lastHandwritingIssueKey = issue.issueKey;
-    state.lastHandwritingGuideAt = now;
-    return false;
-  }
 
   state.lastHandwritingIssueKey = issue.issueKey;
   state.lastHandwritingGuideAt = now;
@@ -1710,8 +1956,23 @@ function getSpeechRecognition() {
     dom.micBtn.innerHTML = `${iconMap.mic}停止收听`;
     dom.studentAvatar.classList.remove("speaking");
     dom.studentState.textContent = "正在收听";
+    startSpeechNoResultTimer();
     if (!wasListening || !state.lastSpeechAt) state.lastSpeechAt = Date.now();
     resetSilenceTimer(false);
+  };
+
+  recognition.onaudiostart = () => {
+    dom.studentState.textContent = "正在收听";
+    startSpeechNoResultTimer();
+  };
+
+  recognition.onsoundstart = () => {
+    dom.studentState.textContent = "听到声音";
+  };
+
+  recognition.onspeechstart = () => {
+    dom.studentAvatar.classList.add("speaking");
+    dom.studentState.textContent = "正在讲题";
   };
 
   recognition.onresult = (event) => {
@@ -1722,12 +1983,16 @@ function getSpeechRecognition() {
       if (event.results[index].isFinal) finalText += text;
       else interimText += text;
     }
+    if (interimText || finalText) {
+      stopSpeechNoResultTimer();
+    }
     if (interimText) {
       dom.studentAvatar.classList.add("speaking");
       dom.studentState.textContent = "正在讲题";
+      showSpeechDraft(interimText);
     }
     if (finalText) {
-      appendTranscript(finalText);
+      commitSpeechText(finalText);
       handleStudentSpeech(finalText);
       resetSilenceTimer();
     }
@@ -1765,6 +2030,13 @@ function getSpeechRecognition() {
   };
 
   recognition.onend = () => {
+    stopSpeechNoResultTimer();
+    const draft = clearSpeechDraft();
+    if (draft) {
+      appendTranscript(draft);
+      handleStudentSpeech(draft);
+      resetSilenceTimer();
+    }
     dom.studentAvatar.classList.remove("speaking");
     if (state.isListening) {
       dom.studentState.textContent = "正在收听";
@@ -1818,6 +2090,12 @@ async function toggleListening() {
   }
 
   if (state.isListening) {
+    stopSpeechNoResultTimer();
+    const draft = clearSpeechDraft();
+    if (draft) {
+      appendTranscript(draft);
+      handleStudentSpeech(draft);
+    }
     state.isListening = false;
     state.silenceGuidePending = false;
     clearSilenceFollowup();
@@ -1835,8 +2113,61 @@ async function toggleListening() {
 }
 
 function appendTranscript(text) {
+  const cleaned = cleanSpeechText(text);
+  if (!cleaned) return;
   const prefix = dom.transcriptInput.value.trim() ? "\n" : "";
-  dom.transcriptInput.value += `${prefix}${text}`;
+  dom.transcriptInput.value += `${prefix}${cleaned}`;
+  dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
+}
+
+function showSpeechDraft(text) {
+  const draft = cleanSpeechText(text);
+  if (!draft) return;
+  if (!state.speechDraftText) state.speechDraftBase = dom.transcriptInput.value;
+  state.speechDraftText = draft;
+  const base = state.speechDraftBase || "";
+  const prefix = base.trim() ? "\n" : "";
+  dom.transcriptInput.value = `${base}${prefix}${draft}`;
+  dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
+}
+
+function clearSpeechDraft() {
+  if (!state.speechDraftText) return "";
+  const draft = state.speechDraftText;
+  dom.transcriptInput.value = state.speechDraftBase || "";
+  state.speechDraftText = "";
+  state.speechDraftBase = "";
+  return draft;
+}
+
+function commitSpeechText(text) {
+  clearSpeechDraft();
+  const finalText = cleanSpeechText(text);
+  if (!finalText) return;
+  appendTranscript(finalText);
+}
+
+function cleanSpeechText(text) {
+  return String(text || "")
+    .replace(/[，,。！？!?；;：:]/g, " ")
+    .replace(/^(呃+|额+|嗯+|啊+|哦+|唔+|呐+|那个|这个|就是|然后呢|对吧|是不是)+/g, "")
+    .replace(/(^|\s)(呃+|额+|嗯+|啊+|哦+|唔+|呐+|那个|这个|就是|然后呢|对吧|是不是)(?=\s|$)/g, " ")
+    .replace(/[呃额嗯唔]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function startSpeechNoResultTimer() {
+  stopSpeechNoResultTimer();
+  state.speechNoResultTimer = setTimeout(() => {
+    if (!state.isListening || state.speechDraftText) return;
+    dom.studentState.textContent = "还没有转成文字";
+  }, 4500);
+}
+
+function stopSpeechNoResultTimer() {
+  clearTimeout(state.speechNoResultTimer);
+  state.speechNoResultTimer = null;
 }
 
 function resetSilenceTimer(updateSpeechAt = true) {
@@ -2475,9 +2806,6 @@ function renderNotebookDetail(record) {
   const strokeImages = getRecordStrokeImages(record);
   const firstStroke = strokeImages[0] || "";
   const lectureText = getRecordLectureText(record);
-  const handwritingNote = record.handwritingResult?.hasPossibleIssue
-    ? `<p>板书提醒：${escapeHTML(record.handwritingResult.guidance || record.handwritingResult.issueSummary)}</p>`
-    : "";
   const lectureTextBlock = lectureText
     ? `<p>讲解文字：${escapeHTML(lectureText)}</p>`
     : "<p>讲解文字：这次没有保存文字讲解。</p>";
@@ -2495,7 +2823,6 @@ function renderNotebookDetail(record) {
           <div class="detail-meta">轻量保存 · ${formatDate(record.createdAt)}</div>
         </div>
         ${lectureTextBlock}
-        ${handwritingNote}
         <p>复习提醒：${formatDate(record.reviewAt)} · ${escapeHTML(record.status)}</p>
       </div>
     </div>
