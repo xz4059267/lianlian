@@ -15,6 +15,29 @@ const SEGMENT_MODEL = process.env.DEEPSEEK_SEGMENT_MODEL || "deepseek-v4-flash";
 const GUIDE_MODEL = process.env.DEEPSEEK_GUIDE_MODEL || "deepseek-v4-pro";
 const GUIDE_FALLBACK_MODEL = process.env.DEEPSEEK_GUIDE_FALLBACK_MODEL || "deepseek-v4-flash";
 const HANDWRITING_MODEL = process.env.DEEPSEEK_HANDWRITING_MODEL || "deepseek-v4-flash";
+const QWEN_API_KEY =
+  process.env.QWEN_API_KEY ||
+  process.env.Qwen_api_key ||
+  process.env.qwen_api_key ||
+  process.env.DASHSCOPE_API_KEY ||
+  process.env.dashscope_api_key ||
+  "";
+const QWEN_BASE_URL = (
+  process.env.QWEN_BASE_URL ||
+  process.env.DASHSCOPE_BASE_URL ||
+  "https://dashscope.aliyuncs.com/compatible-mode/v1"
+).replace(/\/+$/, "");
+const QWEN_VL_MODEL =
+  process.env.QWEN_VL_MODEL ||
+  process.env.Qwen_vl_model ||
+  process.env.qwen_vl_model ||
+  process.env.QWEN_MODEL ||
+  process.env.Qwen_model ||
+  process.env.qwen_model ||
+  process.env.DASHSCOPE_MODEL ||
+  "qwen-vl-max-latest";
+const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
+const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
 const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
 const PADDLE_OCR_SCRIPT = path.join(ROOT, "tools", "paddle_ocr.py");
 const OCR_MAX_SIDE = Number(process.env.OCR_MAX_SIDE || 1800);
@@ -80,12 +103,12 @@ const HANDWRITING_PROMPT = [
   "你是初中数学黑板板书的异步辅助识别器。",
   "你会同时看到当前题目图片和学生黑板板书截图。",
   "任务是识别学生写下的关键公式、数字、等式、结论，并结合题目条件进行一次数学核算。",
-  "先读题目条件和学生板书，再计算或验算学生写出的关系式、推导和结论是否成立；不要只做 OCR 转写。",
-  "你会看到多个 OCR 来源：题目图片、纯板书截图、包含题目区域的板书截图。它们互相补充，若纯板书 OCR 漏字，可参考合成截图；若合成截图混入题目印刷内容，以纯板书和题意为准。",
+  "先读题目条件和学生板书，再计算或验算学生写出的关系式、推导和结论是否成立；不要只做文字转写。",
+  "你会看到多个图片来源：题目图片、纯板书截图、包含题目区域的板书截图。它们互相补充，若纯板书截图有字迹遮挡，可参考合成截图；若合成截图混入题目印刷内容，以纯板书和题意为准。",
   "例如板书写出 2/3 = x/6 且结论 x=4 时，需要实际验算比例关系是否能推出这个结果。",
   "如果板书写出 2/3 = x/6 但最后结论写成 x=-2，必须判为 calculationStatus=\"wrong\"，因为由 2/3 = x/6 应推出 x=4。",
   "如果能看出学生写了等式、比例式或 x/y 的结论，就要尽量判断 correct 或 wrong；只有关键数字/符号确实看不出时，才返回 unclear。",
-  "必须优先以“纯板书 OCR 结果”判断学生写了什么；题目图片和包含题目区域的截图只用于理解题目，不能把题目原图里的答案、红叉、批改痕迹或印刷文字当成学生板书。",
+  "必须优先以纯板书截图判断学生写了什么；题目图片和包含题目区域的截图只用于理解题目，不能把题目原图里的答案、红叉、批改痕迹或印刷文字当成学生板书。",
   "判断 correct 必须同时满足：学生写出的关键关系式成立，且学生最后写出的结论/答案也与关系式和题意一致。只要最后结论错，就必须 hasPossibleIssue=true。",
   "不要做逐笔批改，不要因为字迹潦草就判错；只在数学关系、关键数字、符号或结论明显不合理时标记 hasPossibleIssue=true。",
   "如果核算正确，calculationStatus=\"correct\"，hasPossibleIssue=false，并在 positiveFeedback 写一句贴着内容的短鼓励，避免固定说“很好/很棒”。",
@@ -804,6 +827,119 @@ async function callDeepSeekJsonWithFallback(options, fallbackModel) {
   }
 }
 
+function buildQwenContent(content) {
+  const parts = [];
+  for (const item of Array.isArray(content) ? content : []) {
+    if (item?.type === "input_text") {
+      const text = String(item.text || "").trim();
+      if (text) parts.push({ type: "text", text });
+      continue;
+    }
+    if (item?.type === "input_image" && item.image_url) {
+      if (item.label) parts.push({ type: "text", text: `[${item.label}]` });
+      parts.push({
+        type: "image_url",
+        image_url: {
+          url: item.image_url
+        }
+      });
+    }
+  }
+  return parts;
+}
+
+function isQwenJsonFormatUnsupported(error) {
+  const code = String(error?.code || "");
+  const message = String(error?.message || "");
+  return /response_format|json_object|not support|unsupported|不支持/i.test(`${code} ${message}`);
+}
+
+async function requestQwenChatCompletion(payload, useJsonFormat = true) {
+  let response;
+  try {
+    response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${QWEN_API_KEY}`
+      },
+      body: JSON.stringify({
+        ...payload,
+        ...(useJsonFormat ? { response_format: { type: "json_object" } } : {})
+      })
+    });
+  } catch {
+    const error = new Error("Qwen 多模态 API 网络连接失败");
+    error.statusCode = 502;
+    error.code = "network_error";
+    throw error;
+  }
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const rawMessage = data.error?.message || `Qwen 多模态 API 请求失败：${response.status}`;
+    const rawCode = data.error?.code || data.error?.type || "qwen_error";
+    const friendlyMessage =
+      rawCode === "access_denied"
+        ? "Qwen API 访问被拒绝，请确认 .env 里的 Qwen_api_key 是阿里云百炼 API Key，并已开通对应多模态模型权限。"
+        : rawMessage;
+    const error = new Error(friendlyMessage);
+    error.statusCode = response.status;
+    error.code = rawCode;
+    throw error;
+  }
+  return data;
+}
+
+async function callQwenMultimodalJson({ model, content, schema, instructions, maxOutputTokens = 1200 }) {
+  if (!QWEN_API_KEY) {
+    const error = new Error("Qwen API key 未配置");
+    error.statusCode = 503;
+    error.code = "missing_qwen_api_key";
+    throw error;
+  }
+
+  const schemaText = JSON.stringify(schema.schema, null, 2);
+  const payload = {
+    model,
+    messages: [
+      {
+        role: "system",
+        content: [
+          instructions,
+          "你必须只输出一个合法 JSON 对象，不要输出 Markdown，不要输出解释。",
+          `JSON schema 名称：${schema.name}`,
+          "JSON schema：",
+          schemaText
+        ].join("\n\n")
+      },
+      {
+        role: "user",
+        content: buildQwenContent(content)
+      }
+    ],
+    max_tokens: maxOutputTokens,
+    stream: false
+  };
+
+  let data;
+  try {
+    data = await requestQwenChatCompletion(payload, true);
+  } catch (error) {
+    if (!isQwenJsonFormatUnsupported(error)) throw error;
+    data = await requestQwenChatCompletion(payload, false);
+  }
+
+  const parsed = parseModelJson(extractDeepSeekText(data));
+  if (!parsed) {
+    const error = new Error("Qwen 多模态模型没有返回可解析的结构化结果");
+    error.statusCode = 502;
+    error.code = "invalid_model_output";
+    throw error;
+  }
+  return parsed;
+}
+
 function sanitizeKnowledge(value) {
   const text = String(value || "").trim();
   if (!text || /OCR|图像|图片|识别|分割|裁剪|边界|检测/i.test(text)) return "";
@@ -981,8 +1117,8 @@ async function handleGuide(req, res) {
   const guideState = body.guideState || "heuristic_guidance";
   const lectureUnlocked = Boolean(body.lectureUnlocked);
 
-  const guideCall = await callDeepSeekJsonWithFallback({
-    model: GUIDE_MODEL,
+  const guideResult = await callQwenMultimodalJson({
+    model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
     instructions: [LIAN_GUIDE_PROMPT, COMPANION_DIALOGUE_POLICY].join("\n\n"),
     content: [
@@ -1019,16 +1155,17 @@ async function handleGuide(req, res) {
           styleRules: LIAN_STYLE_RULES
         })
       },
-      { type: "input_image", image_url: body.questionImage, detail: "high" },
-      ...(body.boardImage ? [{ type: "input_image", image_url: body.boardImage, detail: "high" }] : [])
+      { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high" },
+      ...(body.boardImage ? [{ type: "input_image", label: "当前黑板截图", image_url: body.boardImage, detail: "high" }] : [])
     ],
     maxOutputTokens: 1200
-  }, GUIDE_FALLBACK_MODEL);
+  });
 
   sendJson(res, 200, {
-    ...guideCall.result,
-    model: guideCall.model,
-    fallbackFrom: guideCall.fallbackFrom || ""
+    ...guideResult,
+    model: QWEN_GUIDE_MODEL,
+    provider: "qwen-multimodal",
+    fallbackFrom: ""
   });
 }
 
@@ -1041,8 +1178,8 @@ async function handleHandwriting(req, res) {
 
   const boardForOcr = body.boardOnlyImage || body.boardImage;
 
-  const result = await callDeepSeekJson({
-    model: HANDWRITING_MODEL,
+  const result = await callQwenMultimodalJson({
+    model: QWEN_HANDWRITING_MODEL,
     schema: handwritingSchema,
     instructions: HANDWRITING_PROMPT,
     content: [
@@ -1054,17 +1191,17 @@ async function handleHandwriting(req, res) {
           knownProblemText: body.problemText || "",
           knownKnowledgePoints: body.knowledgePoints || [],
           instruction:
-            "请同时参考题目图片 OCR、纯板书 OCR、包含题目区域的板书截图 OCR。纯板书 OCR 用来判断学生真正写了什么；题目图片和包含题目区域的截图用于理解题意、确认题目条件和板书所在位置。不要把题目原图里的印刷答案、红叉、批改痕迹当成学生板书。然后根据题目条件实际计算/验算。若关键公式和最后结论都正确，返回 calculationStatus=correct；若公式对但最后结论算错，也必须返回 calculationStatus=wrong；若明显不符合题意，给温和检查提醒；若只是字迹不清或还没写完，不要轻易判错。"
+            "请直接观察题目图片、纯板书截图、包含题目区域的板书截图。纯板书截图用来判断学生真正写了什么；题目图片和包含题目区域的截图用于理解题意、确认题目条件和板书所在位置。不要把题目原图里的印刷答案、红叉、批改痕迹当成学生板书。然后根据题目条件实际计算/验算。若关键公式和最后结论都正确，返回 calculationStatus=correct；若公式对但最后结论算错，也必须返回 calculationStatus=wrong；若明显不符合题意，给温和检查提醒；若只是字迹不清或还没写完，不要轻易判错。"
         })
       },
-      { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high", blockLimit: 80 },
-      { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high", blockLimit: 80 },
-      ...(body.boardImage ? [{ type: "input_image", label: "包含题目区域的板书截图", image_url: body.boardImage, detail: "high", blockLimit: 120 }] : [])
+      { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high" },
+      { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" },
+      ...(body.boardImage ? [{ type: "input_image", label: "包含题目区域的板书截图", image_url: body.boardImage, detail: "high" }] : [])
     ],
     maxOutputTokens: 1000
   });
 
-  sendJson(res, 200, { ...result, model: HANDWRITING_MODEL });
+  sendJson(res, 200, { ...result, model: QWEN_HANDWRITING_MODEL, provider: "qwen-multimodal" });
 }
 
 function serveStatic(req, res) {
@@ -1106,6 +1243,9 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`恋恋错题本服务已启动：http://127.0.0.1:${PORT}`);
   console.log(
-    `DeepSeek API：${DEEPSEEK_BASE_URL}；题目分割模型：${SEGMENT_MODEL}；讲解引导模型：${GUIDE_MODEL}；讲解兜底模型：${GUIDE_FALLBACK_MODEL}；板书识别模型：${HANDWRITING_MODEL}`
+    `DeepSeek API：${DEEPSEEK_BASE_URL}；题目分割模型：${SEGMENT_MODEL}`
+  );
+  console.log(
+    `Qwen 多模态 API：${QWEN_BASE_URL}；讲解引导模型：${QWEN_GUIDE_MODEL}；板书识别模型：${QWEN_HANDWRITING_MODEL}`
   );
 });

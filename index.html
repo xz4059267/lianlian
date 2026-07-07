@@ -17,7 +17,7 @@
           </div>
         </div>
         <nav class="nav-tabs" aria-label="页面导航">
-          <button class="nav-btn active" data-view="uploadView">
+          <button class="nav-btn" data-view="uploadView">
             <span class="nav-icon" data-icon="upload"></span>
             上传
           </button>
@@ -34,7 +34,36 @@
       </header>
 
       <main>
-        <section class="view active" id="uploadView" aria-labelledby="uploadTitle">
+        <section class="view active" id="welcomeView" aria-labelledby="welcomeTitle">
+          <div class="welcome-layout">
+            <section class="welcome-main">
+              <div class="welcome-copy">
+                <span class="welcome-kicker">恋恋错题本</span>
+                <h2 id="welcomeTitle">今天从一道错题开始</h2>
+                <p>拍下题目，讲出思路，恋恋陪你把卡住的地方理顺。</p>
+                <div class="welcome-actions">
+                  <button class="primary-btn large" id="enterUploadBtn">
+                    <span data-icon="upload"></span>
+                    进入拍照上传
+                  </button>
+                  <button class="text-btn" id="welcomeNotebookBtn">
+                    <span data-icon="book"></span>
+                    看错题本
+                  </button>
+                </div>
+              </div>
+              <div class="welcome-companion" aria-hidden="true">
+                <img src="assets/lian-avatar.svg" alt="" />
+                <div>
+                  <strong>恋恋</strong>
+                  <span>我会先听你讲，再慢慢提示。</span>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="uploadView" aria-labelledby="uploadTitle">
           <div class="workspace-grid">
             <section class="upload-panel" aria-labelledby="uploadTitle">
               <div class="section-heading">

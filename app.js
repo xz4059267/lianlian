@@ -36,6 +36,7 @@ function injectIcons(root = document) {
 injectIcons();
 
 const views = {
+  welcomeView: $("#welcomeView"),
   uploadView: $("#uploadView"),
   teachView: $("#teachView"),
   completeView: $("#completeView"),
@@ -44,6 +45,8 @@ const views = {
 
 const dom = {
   navBtns: $$(".nav-btn"),
+  enterUploadBtn: $("#enterUploadBtn"),
+  welcomeNotebookBtn: $("#welcomeNotebookBtn"),
   notebookCount: $("#notebookCount"),
   dropZone: $("#dropZone"),
   imageInput: $("#imageInput"),
@@ -206,6 +209,9 @@ function showView(viewId) {
 dom.navBtns.forEach((button) => {
   button.addEventListener("click", () => showView(button.dataset.view));
 });
+
+dom.enterUploadBtn.addEventListener("click", () => showView("uploadView"));
+dom.welcomeNotebookBtn.addEventListener("click", () => showView("notebookView"));
 
 function setStatus(target, text) {
   target.textContent = text;
