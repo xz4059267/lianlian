@@ -91,6 +91,7 @@
                 </div>
                 <div class="preview-stage" id="manualStage">
                   <img id="sourcePreview" alt="已上传的错题图片预览" />
+                  <canvas class="segment-debug-canvas hidden" id="segmentDebugCanvas" aria-hidden="true"></canvas>
                   <div class="selection-rect hidden" id="selectionRect">
                     <div class="selection-actions" aria-label="框选确认">
                       <button class="selection-action confirm" id="confirmSelectionBtn" type="button" title="确认框选" aria-label="确认框选">
@@ -200,7 +201,7 @@
                   <button class="tool-btn" id="undoBtn" title="撤销" aria-label="撤销">
                     <span data-icon="undo"></span>
                   </button>
-                  <button class="tool-btn" id="clearBoardBtn" title="清空当前页" aria-label="清空当前页">
+                  <button class="tool-btn" id="clearBoardBtn" title="清空黑板笔迹" aria-label="清空黑板笔迹">
                     <span data-icon="trash"></span>
                   </button>
                   <span class="tool-separator"></span>
@@ -226,7 +227,7 @@
 
                 <div class="blackboard" id="blackboard">
                   <div class="board-image-layer hidden" id="boardImageLayer">
-                    <img class="board-question" id="boardQuestionImage" alt="当前讲解题目" />
+                    <img class="board-question" id="boardQuestionImage" alt="当前讲解题目" draggable="false" />
                   </div>
                   <canvas id="boardCanvas"></canvas>
                   <div class="recognition-pill hidden" id="recognitionPill">板书识别中</div>
@@ -329,7 +330,6 @@
         </button>
         <div class="question-meta">
           <strong></strong>
-          <span></span>
         </div>
         <div class="question-actions">
           <button class="mini-btn move-up" title="前移" aria-label="前移">
@@ -345,6 +345,6 @@
       </article>
     </template>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=20260719-27"></script>
   </body>
 </html>

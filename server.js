@@ -35,14 +35,18 @@ const QWEN_VL_MODEL =
   process.env.Qwen_model ||
   process.env.qwen_model ||
   process.env.DASHSCOPE_MODEL ||
-  "qwen-vl-max-latest";
+  "qwen3.5-omni-plus-2026-03-15";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
 const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
 const PADDLE_OCR_SCRIPT = path.join(ROOT, "tools", "paddle_ocr.py");
 const OCR_MAX_SIDE = Number(process.env.OCR_MAX_SIDE || 1800);
 const OCR_CACHE_LIMIT = Number(process.env.OCR_CACHE_LIMIT || 32);
+const SEGMENT_CACHE_LIMIT = Number(process.env.SEGMENT_CACHE_LIMIT || 32);
+const SEGMENT_FAST_MODE = !["0", "false", "off"].includes(String(process.env.SEGMENT_FAST_MODE || "1").toLowerCase());
+const SEGMENT_LLM_TIMEOUT_MS = Number(process.env.SEGMENT_LLM_TIMEOUT_MS || 15000);
 const ocrCache = new Map();
+const segmentCache = new Map();
 let paddleOcrService = null;
 let paddleOcrRequestId = 0;
 
@@ -73,6 +77,8 @@ const LIAN_GUIDE_PROMPT = [
   "如果前端传入 lectureUnlocked=false，你只能输出 encourage 或 light 级别内容，不能输出 formula/worked_step/summary。",
   "如果前端传入 lectureUnlocked=true，你仍然不能一次性倒完整答案；只给一小步，并把话交还给学生。",
   "不要直接说“你错了”，要转成检查提醒或启发式问题。",
+  "必须以当前传入的题目图片和当前黑板截图为准；不要沿用上一道题的变量、答案、比例式或知识点。",
+  "如果当前题目图片和黑板里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
   "输出必须严格遵守 JSON schema；speech 用中文口语，通常不超过 60 个汉字。"
 ].join("\n");
 
@@ -93,10 +99,19 @@ const COMPANION_DIALOGUE_POLICY = [
   "不要因为识别到一句完整的话就立即回复；只有学生明显完成一段思路、停顿等待反馈、提出问题、明显卡住，或思路明显错误且继续推导会偏离时，才回应。",
   "如果 eventType=thought_complete，只表示学生停顿了 2 到 3 秒；你仍要先判断这是否真是一段完整思路。若只是半句话、过渡句、还在铺垫，shouldSpeak=false。",
   "回应时先用一句话证明你听懂了学生刚才的思路，再给一个很小的追问或检查点。",
+  "若当前题与上一题不同，先重置理解，只讨论当前题目图片、当前板书和本轮学生讲解。",
   "不要频繁使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。不要为了回应而回应。",
   "不要泛泛评价学生本人；要针对内容反馈，例如“你是在把未知量表示出来”“你已经开始找数量关系了”。",
   "学生讲错时不要说“不对”或“你错了”，改成一起检查：例如“我们一起检查一下这里，面积通常和哪两个量有关？”",
   "每次回应尽量不超过两句话。"
+].join("\n");
+
+const LECTURE_COMPLETION_RULES = [
+  "额外判断当前题是否已经讲解完成，并通过 lectureComplete 返回。默认必须为 false。",
+  "只有当学生已经说明当前题的关键条件/推理，并明确说出最终结果、答案或选项时，lectureComplete 才能为 true。",
+  "如果学生只完成了一个小问、只报出中间结果、只说了一个式子，或还在等待你追问，lectureComplete 必须为 false。",
+  "lectureComplete=true 时，speech 只能做一次简短收束，不要再提出下一步、让学生复述、要求继续推导或重复已经说过的选项。",
+  "如果 studentFinalAnswerEvidence=true，说明学生已经说过最终选项/答案；不要再次询问同一个答案。"
 ].join("\n");
 
 const HANDWRITING_PROMPT = [
@@ -170,6 +185,76 @@ const segmentGroupingSchema = {
   }
 };
 
+const visionQuestionStructureSchema = {
+  name: "worksheet_question_structure",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      questions: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            questionNumber: { type: "string" },
+            stemBoxes: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  x: { type: "number" }, y: { type: "number" }, w: { type: "number" }, h: { type: "number" }
+                },
+                required: ["x", "y", "w", "h"]
+              }
+            },
+            optionBoxes: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  x: { type: "number" }, y: { type: "number" }, w: { type: "number" }, h: { type: "number" }
+                },
+                required: ["x", "y", "w", "h"]
+              }
+            },
+            otherBoxes: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  x: { type: "number" }, y: { type: "number" }, w: { type: "number" }, h: { type: "number" }
+                },
+                required: ["x", "y", "w", "h"]
+              }
+            },
+            summary: { type: "string" },
+            type: { type: "string", enum: ["选择题", "填空题", "计算题", "解答题", "未知"] }
+          },
+          required: ["questionNumber", "stemBoxes", "optionBoxes", "otherBoxes", "summary", "type"]
+        }
+      }
+    },
+    required: ["questions"]
+  }
+};
+
+const VISION_QUESTION_STRUCTURE_PROMPT = [
+  "你是试卷版面结构分析助手。你的任务不是寻找每一行文字，而是识别完整题目。",
+  "一个题目可能包含题号、跨行题干、图片、公式、表格、答题区域以及分散排列的选项。",
+  "题干和选项即使存在较大空白，也必须归为同一道题；不要将同一道题拆成多个结果。",
+  "每道题必须尽量包含从题号开始，到下一题题号之前的全部内容。选择题必须包含所有可见选项。",
+  "不要重复返回相同题目。questionNumber 看不清时返回空字符串，不能猜测。",
+  "每道题分别返回 stemBoxes、optionBoxes、otherBoxes；一道题允许包含多个不连续子区域，程序会统一合并。",
+  "图片、图形、表格、公式和答题区域放入 otherBoxes。A/B/C/D 选项放入 optionBoxes。",
+  "所有 x、y、w、h 必须按原图宽高归一化到 0 到 1。",
+  "只输出严格 JSON，不要输出解释文字。"
+].join("\n");
+
 const guideSchema = {
   name: "lian_guidance",
   strict: true,
@@ -211,9 +296,13 @@ const guideSchema = {
       studentAction: {
         type: "string",
         description: "One short action for the student, such as say why, check a symbol, repeat this step, or write it on the board."
+      },
+      lectureComplete: {
+        type: "boolean",
+        description: "Whether the current question's explanation is complete and should be locked from further automatic guidance."
       }
     },
-    required: ["shouldSpeak", "speech", "guideState", "knowledgePoints", "hintLevel", "formulaOrStep", "askStudentToRepeat", "studentAction"]
+    required: ["shouldSpeak", "speech", "guideState", "knowledgePoints", "hintLevel", "formulaOrStep", "askStudentToRepeat", "studentAction", "lectureComplete"]
   }
 };
 
@@ -420,6 +509,39 @@ function setCachedOcrBlocks(key, blocks) {
   }
 }
 
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function getSegmentCacheKey(imageDataUrl, width, height, mode) {
+  return crypto
+    .createHash("sha256")
+    .update(String(imageDataUrl || ""))
+    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|segment:v26`)
+    .digest("hex");
+}
+
+function getCachedSegmentResult(key) {
+  const cached = segmentCache.get(key);
+  if (!cached) return null;
+  segmentCache.delete(key);
+  segmentCache.set(key, cached);
+  return cloneJson(cached);
+}
+
+function setCachedSegmentResult(key, payload) {
+  segmentCache.set(key, cloneJson(payload));
+  while (segmentCache.size > SEGMENT_CACHE_LIMIT) {
+    const oldestKey = segmentCache.keys().next().value;
+    segmentCache.delete(oldestKey);
+  }
+}
+
+function sendSegmentResult(res, cacheKey, payload) {
+  setCachedSegmentResult(cacheKey, payload);
+  sendJson(res, 200, payload);
+}
+
 function parseJsonOutput(stdout) {
   const text = String(stdout || "").trim();
   if (!text) return null;
@@ -464,7 +586,9 @@ function getPaddleOcrService() {
     child,
     buffer: "",
     pending: new Map(),
-    exited: false
+    exited: false,
+    ready: false,
+    startedAt: Date.now()
   };
 
   child.stdout.setEncoding("utf8");
@@ -482,6 +606,11 @@ function getPaddleOcrService() {
         continue;
       }
 
+      if (message?.ready === true) {
+        service.ready = true;
+        console.log(`[segment] PaddleOCR service ready, startup=${Date.now() - service.startedAt}ms`);
+        continue;
+      }
       const request = service.pending.get(message.id);
       if (!request) continue;
       clearTimeout(request.timer);
@@ -737,7 +866,7 @@ async function buildDeepSeekUserText(content) {
   return parts.filter(Boolean).join("\n\n");
 }
 
-async function callDeepSeekJson({ model, content, schema, instructions, maxOutputTokens = 1800 }) {
+async function callDeepSeekJson({ model, content, schema, instructions, maxOutputTokens = 1800, timeoutMs = 0 }) {
   if (!DEEPSEEK_API_KEY) {
     const error = new Error("DEEPSEEK_API_KEY 未配置");
     error.statusCode = 503;
@@ -749,9 +878,12 @@ async function callDeepSeekJson({ model, content, schema, instructions, maxOutpu
   const schemaText = JSON.stringify(schema.schema, null, 2);
 
   let response;
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
       method: "POST",
+      signal: controller?.signal,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${DEEPSEEK_API_KEY}`
@@ -776,11 +908,14 @@ async function callDeepSeekJson({ model, content, schema, instructions, maxOutpu
         stream: false
       })
     });
-  } catch {
-    const error = new Error("DeepSeek API 网络连接失败");
+  } catch (fetchError) {
+    const timedOut = fetchError?.name === "AbortError";
+    const error = new Error(timedOut ? "DeepSeek API request timed out" : "DeepSeek API 网络连接失败");
     error.statusCode = 502;
-    error.code = "network_error";
+    error.code = timedOut ? "timeout" : "network_error";
     throw error;
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 
   const data = await response.json().catch(() => ({}));
@@ -882,7 +1017,9 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true) {
     const friendlyMessage =
       rawCode === "access_denied"
         ? "Qwen API 访问被拒绝，请确认 .env 里的 Qwen_api_key 是阿里云百炼 API Key，并已开通对应多模态模型权限。"
-        : rawMessage;
+        : rawCode === "invalid_api_key" || /api key|authentication|认证|鉴权/i.test(rawMessage)
+          ? "Qwen API key 无法通过认证，请检查 .env 里的 Qwen_api_key、QWEN_API_KEY 或 DASHSCOPE_API_KEY。"
+          : rawMessage;
     const error = new Error(friendlyMessage);
     error.statusCode = response.status;
     error.code = rawCode;
@@ -985,6 +1122,8 @@ function normalizeBlockIndexes(indexes, blockCount) {
 
 function buildQuestionBoxesFromGroups(groups, blocks, width, height) {
   const questions = [];
+  const textLeft = Array.isArray(blocks) && blocks.length ? Math.min(...blocks.map((block) => block.x)) : 0;
+  const textRight = Array.isArray(blocks) && blocks.length ? Math.max(...blocks.map((block) => block.x + block.w)) : width;
   for (const group of Array.isArray(groups) ? groups : []) {
     const indexes = normalizeBlockIndexes(group.blockIndexes, blocks.length);
     if (!indexes.length) continue;
@@ -992,13 +1131,13 @@ function buildQuestionBoxesFromGroups(groups, blocks, width, height) {
     const selectedBlocks = indexes.map((index) => blocks[index]).filter(Boolean);
     if (!selectedBlocks.length) continue;
 
-    const left = Math.min(...selectedBlocks.map((block) => block.x));
+    const left = textLeft;
     const top = Math.min(...selectedBlocks.map((block) => block.y));
-    const right = Math.max(...selectedBlocks.map((block) => block.x + block.w));
+    const right = textRight;
     const bottom = Math.max(...selectedBlocks.map((block) => block.y + block.h));
-    const x = Math.max(0, Math.floor(left - 20));
+    const x = Math.max(0, Math.floor(left - 24));
     const y = Math.max(0, Math.floor(top - 20));
-    const paddedRight = Math.min(width, Math.ceil(right + 30));
+    const paddedRight = Math.min(width, Math.ceil(right + 36));
     const paddedBottom = Math.min(height, Math.ceil(bottom + 30));
     const title = String(group.title || selectedBlocks.map((block) => block.text).join(" ").slice(0, 80) || "题目").trim();
     const knowledge = sanitizeKnowledge(group.knowledge);
@@ -1025,7 +1164,2826 @@ function buildQuestionBoxesFromGroups(groups, blocks, width, height) {
     });
   }
 
+  return expandQuestionBoxesToVerticalBands(
+    questions.sort((a, b) => a.y - b.y || a.x - b.x),
+    blocks,
+    width,
+    height
+  );
+}
+
+function expandQuestionBoxesToVerticalBands(questions, blocks, width, height) {
+  if (!Array.isArray(questions) || !questions.length || !Array.isArray(blocks) || !blocks.length) return questions || [];
+  const maxBlockBottom = Math.max(...blocks.map((block) => block.y + block.h));
+  const minBandHeight = Math.max(84, height * 0.075);
+  const sorted = questions
+    .map((question) => ({ ...question }))
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+
+  for (let index = 0; index < sorted.length; index += 1) {
+    const current = sorted[index];
+    const next = sorted[index + 1];
+    const top = Math.max(0, current.y);
+    const contentBottom = Math.max(current.y + current.h, top + minBandHeight);
+    const bottom = next
+      ? Math.max(contentBottom, next.y - 8)
+      : Math.min(height, Math.max(contentBottom, maxBlockBottom + 34));
+    current.x = 0;
+    current.w = width;
+    current.y = top;
+    current.h = Math.max(1, Math.min(height, bottom) - top);
+  }
+
+  return sorted;
+}
+
+function mergeDuplicateQuestionBoxes(questions, width, height) {
+  const merged = [];
+  const numbered = new Map();
+
+  for (const question of Array.isArray(questions) ? questions : []) {
+    const number = String(question.questionNumber || question.number || "").trim();
+    if (!number) {
+      merged.push({ ...question, x: 0, w: width });
+      continue;
+    }
+    const existing = numbered.get(number);
+    if (!existing) {
+      const copy = { ...question, x: 0, w: width };
+      numbered.set(number, copy);
+      merged.push(copy);
+      continue;
+    }
+
+    const top = Math.min(existing.y, question.y);
+    const bottom = Math.max(existing.y + existing.h, question.y + question.h);
+    existing.y = Math.max(0, top);
+    existing.h = Math.min(height, bottom) - existing.y;
+    if (String(question.problemText || question.title || "").length > String(existing.problemText || existing.title || "").length) {
+      existing.title = question.title;
+      existing.problemText = question.problemText;
+      existing.knowledge = question.knowledge;
+      existing.mainKnowledgePoint = question.mainKnowledgePoint;
+      existing.knowledgePoints = question.knowledgePoints;
+    }
+  }
+
+  return merged.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+function looksLikeChoiceText(text) {
+  const value = String(text || "").trim();
+  return /(^|\s)[A-D]\s*[.．、]/i.test(value) || /[A-D]\s*[.．、].*[A-D]\s*[.．、]/i.test(value);
+}
+
+function hasQuestionSentence(text) {
+  const value = String(text || "").trim();
+  if (!value) return false;
+  const chineseCount = (value.match(/[\u4e00-\u9fff]/gu) || []).length;
+  const questionWords = /已知|若|如图|求|计算|证明|选择|填写|判断|解答|设|根据|下列|那么|多少|为何|为什么/u;
+  return chineseCount >= 8 || (chineseCount >= 2 && questionWords.test(value));
+}
+
+function hasQuestionStemEvidence(text) {
+  const value = String(text || "").trim();
+  if (hasQuestionSentence(value)) return true;
+  const chineseCount = (value.match(/[\u4e00-\u9fff]/gu) || []).length;
+  const hasMathExpression = /[a-zA-Z0-9]\s*[=<>+\-*/^]|[=<>]\s*[a-zA-Z0-9]|[{}\[\]]/u.test(value);
+  const hasMathTopic = /方程|函数|比例|几何|面积|体积|周长|概率|数列|角|圆|三角形|代数式/u.test(value);
+  return (chineseCount >= 2 && hasMathExpression) || (chineseCount >= 4 && hasMathTopic);
+}
+
+function isFigureOrTableLabel(text) {
+  return /^\s*(?:图|表|步骤|条件|方案)\s*(?:[（(]?\s*(?:\d{1,3}|[①②③④⑤⑥⑦⑧⑨⑩])\s*[）)]?)/u.test(String(text || ""));
+}
+
+function isTableOrFigureBlock(block, context = {}) {
+  const text = String(block?.text ?? block ?? "").trim();
+  if (!text) return false;
+  if (isFigureOrTableLabel(text) || /图\s*[①②③④⑤⑥⑦⑧⑨⑩]/u.test(text)) return true;
+  if (/^\s*\d{1,3}\s*$/u.test(text)) return true;
+
+  const compact = text.replace(/\s+/g, "");
+  const chineseCount = (compact.match(/[\u4e00-\u9fff]/gu) || []).length;
+  const mathCount = (compact.match(/[0-9a-zA-Z+\-*/=<>^()[\]{}]/g) || []).length;
+  const shortCells = text.split(/\s+/).filter((token) => /^[\d.+\-*/=a-zA-Z]+$/.test(token));
+  const formulaLike = /(?:\d+[a-zA-Z]|[a-zA-Z]\s*[+\-*/=]|\d+\s*[+\-*/=]\s*\d+)/.test(text);
+  const dataDominated = compact.length > 0 && mathCount / compact.length >= 0.58 && chineseCount < 4;
+  const gridLikeText = shortCells.length >= 3 && chineseCount < 4;
+
+  if (formulaLike && chineseCount < 4) return true;
+  if (dataDominated || gridLikeText) return true;
+  if (context.forceSupporting && !hasQuestionSentence(text)) return true;
+  return false;
+}
+
+function createQuestionNumberContext(blocks, width = 0, height = 0) {
+  const source = Array.isArray(blocks) ? blocks : [];
+  const naturalLanguageBlocks = source.filter((block) => {
+    const text = String(block.text || "");
+    return (text.match(/[\u4e00-\u9fff]/gu) || []).length >= 4 && !isFigureOrTableLabel(text);
+  });
+  const xValues = (naturalLanguageBlocks.length ? naturalLanguageBlocks : source)
+    .map((block) => Number(block.x))
+    .filter(Number.isFinite)
+    .sort((a, b) => a - b);
+  const percentileIndex = Math.min(xValues.length - 1, Math.max(0, Math.floor(xValues.length * 0.12)));
+  const pageContentLeft = xValues.length ? xValues[percentileIndex] : 0;
+  const inferredWidth = width || Math.max(1, ...source.map((block) => Number(block.x || 0) + Number(block.w || 0)));
+  const inferredHeight = height || Math.max(1, ...source.map((block) => Number(block.y || 0) + Number(block.h || 0)));
+  return {
+    blocks: source,
+    width: inferredWidth,
+    height: inferredHeight,
+    pageContentLeft,
+    allowedOffset: Math.max(48, Math.min(inferredWidth * 0.12, 130))
+  };
+}
+
+function getAdjacentQuestionSentence(block, context = {}) {
+  if (!block || !Array.isArray(context.blocks)) return "";
+  const centerY = Number(block.y || 0) + Number(block.h || 0) / 2;
+  const right = Number(block.x || 0) + Number(block.w || 0);
+  return context.blocks
+    .filter((candidate) => candidate !== block)
+    .filter((candidate) => Number(candidate.x || 0) >= right - Math.max(8, Number(block.h || 0) * 0.5))
+    .filter((candidate) => Math.abs(Number(candidate.y || 0) + Number(candidate.h || 0) / 2 - centerY) <= Math.max(12, Number(block.h || 0)))
+    .sort((a, b) => Number(a.x || 0) - Number(b.x || 0))[0]?.text || "";
+}
+
+function groupOcrBlocksIntoLines(blocks, width = 0, height = 0) {
+  const source = (Array.isArray(blocks) ? blocks : [])
+    .map((block, index) => ({
+      ...block,
+      index,
+      x: Number(block.x) || 0,
+      y: Number(block.y) || 0,
+      w: Math.max(1, Number(block.w) || 1),
+      h: Math.max(1, Number(block.h) || 1)
+    }))
+    .filter((block) => String(block.text || "").trim())
+    .sort((a, b) => (a.y + a.h / 2) - (b.y + b.h / 2) || a.x - b.x);
+  if (!source.length) return [];
+
+  const pageWidth = width || Math.max(...source.map((block) => block.x + block.w));
+  const typicalHeight = median(source.map((block) => block.h)) || 18;
+  const rows = [];
+  for (const block of source) {
+    const centerY = block.y + block.h / 2;
+    let target = null;
+    for (let index = rows.length - 1; index >= Math.max(0, rows.length - 4); index -= 1) {
+      const row = rows[index];
+      const tolerance = Math.max(4, Math.min(row.averageHeight, block.h) * 0.6);
+      if (Math.abs(centerY - row.centerY) <= tolerance) {
+        target = row;
+        break;
+      }
+      if (centerY - row.centerY > typicalHeight * 1.2) break;
+    }
+    if (!target) {
+      rows.push({ blocks: [block], centerY, averageHeight: block.h });
+      continue;
+    }
+    target.blocks.push(block);
+    target.centerY = target.blocks.reduce((sum, item) => sum + item.y + item.h / 2, 0) / target.blocks.length;
+    target.averageHeight = target.blocks.reduce((sum, item) => sum + item.h, 0) / target.blocks.length;
+  }
+
+  const maxJoinGap = Math.max(12, pageWidth * 0.05);
+  const lines = [];
+  for (const row of rows) {
+    const ordered = row.blocks.sort((a, b) => a.x - b.x);
+    let segment = [];
+    const flush = () => {
+      if (!segment.length) return;
+      const left = Math.min(...segment.map((block) => block.x));
+      const top = Math.min(...segment.map((block) => block.y));
+      const right = Math.max(...segment.map((block) => block.x + block.w));
+      const bottom = Math.max(...segment.map((block) => block.y + block.h));
+      lines.push({
+        text: segment.map((block) => String(block.text || "").trim()).filter(Boolean).join(" ").replace(/\s+/g, " ").trim(),
+        x: left,
+        y: top,
+        w: right - left,
+        h: bottom - top,
+        blockIndexes: segment.map((block) => block.index),
+        blocks: segment.map((block) => ({ ...block }))
+      });
+      segment = [];
+    };
+    for (const block of ordered) {
+      const previousRight = segment.length ? Math.max(...segment.map((item) => item.x + item.w)) : block.x;
+      if (segment.length && block.x - previousRight > maxJoinGap) flush();
+      segment.push(block);
+    }
+    flush();
+  }
+  return lines.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+function mergeDetachedQuestionNumberLines(lines, width = 0) {
+  const source = (Array.isArray(lines) ? lines : []).slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  if (!source.length) return [];
+  const pageWidth = width || Math.max(...source.map((line) => line.x + line.w));
+  const consumed = new Set();
+  const merged = [];
+
+  for (let index = 0; index < source.length; index += 1) {
+    if (consumed.has(index)) continue;
+    const line = source[index];
+    const markerMatch = /^\s*(?:第\s*)?(\d{1,3})(?:\s*题|[.．、。:：])\s*$/u.exec(String(line.text || ""));
+    if (!markerMatch || isSubQuestionNumber(line.text) || isFigureOrTableLabel(line.text)) {
+      merged.push(line);
+      continue;
+    }
+
+    const markerCenter = line.y + line.h / 2;
+    const markerRight = line.x + line.w;
+    const maxHorizontalGap = Math.max(pageWidth * 0.08, line.h * 3);
+    let bestIndex = -1;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (let candidateIndex = 0; candidateIndex < source.length; candidateIndex += 1) {
+      if (candidateIndex === index || consumed.has(candidateIndex)) continue;
+      const candidate = source[candidateIndex];
+      if (candidate.x < markerRight - Math.max(3, line.h * 0.2)) continue;
+      const horizontalGap = candidate.x - markerRight;
+      if (horizontalGap > maxHorizontalGap) continue;
+      const centerDelta = Math.abs(candidate.y + candidate.h / 2 - markerCenter);
+      if (centerDelta > Math.max(line.h, candidate.h) * 0.85) continue;
+      if (!hasQuestionStemEvidence(candidate.text)) continue;
+      const score = centerDelta * 3 + Math.max(0, horizontalGap);
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = candidateIndex;
+      }
+    }
+
+    if (bestIndex < 0) {
+      merged.push(line);
+      continue;
+    }
+    const stemLine = source[bestIndex];
+    consumed.add(bestIndex);
+    const left = Math.min(line.x, stemLine.x);
+    const top = Math.min(line.y, stemLine.y);
+    const right = Math.max(line.x + line.w, stemLine.x + stemLine.w);
+    const bottom = Math.max(line.y + line.h, stemLine.y + stemLine.h);
+    const combined = {
+      text: `${String(line.text || "").trim()} ${String(stemLine.text || "").trim()}`.replace(/\s+/g, " ").trim(),
+      x: left,
+      y: top,
+      w: right - left,
+      h: bottom - top,
+      blockIndexes: [...new Set([...(line.blockIndexes || []), ...(stemLine.blockIndexes || [])])],
+      blocks: [...(line.blocks || []), ...(stemLine.blocks || [])]
+    };
+    console.log(`[ocr-line-merge] detached Q${markerMatch[1]} marker joined with stem; gap=${Math.round(stemLine.x - markerRight)}px`);
+    merged.push(combined);
+  }
+  return merged.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+function explainRejectedAnchor(line, context) {
+  const text = String(line?.text || "").trim();
+  if (isSubQuestionNumber(text)) return "sub-question marker";
+  if (isFigureOrTableLabel(text)) return "figure/table label";
+  if (isTableOrFigureBlock(line)) return "table, formula, or numeric data";
+  if (Number(line?.x) > Number(context.pageContentLeft) + Number(context.allowedOffset)) return "outside question-number column";
+  const match = /^\s*(?:第\s*)?(\d{1,3})(?:\s*题|[.．、。:：])\s*(.*)$/u.exec(text);
+  if (!match) return "not a main-question prefix";
+  if (!hasQuestionStemEvidence(match[2])) return "missing question stem or formula";
+  return "failed strict anchor validation";
+}
+
+function extractMainQuestionAnchors(ocrLines, width = 0, height = 0) {
+  const lines = (Array.isArray(ocrLines) ? ocrLines : []).slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  const context = createQuestionNumberContext(lines, width, height);
+  const anchors = [];
+  for (const line of lines) {
+    const text = String(line.text || "").trim();
+    const looseMatch = /^\s*(?:第\s*)?(\d{1,3})(?:\s*题|[.．、。:：])/u.exec(text);
+    const startInfo = getQuestionNumberStartInfo(text, line, context);
+    if (!startInfo) {
+      if (looseMatch) {
+        const reason = explainRejectedAnchor(line, context);
+        console.log(`[anchor] Q${looseMatch[1]} found=false reason=${reason}`);
+        line.blocks?.forEach((block) => {
+          console.log(`[anchor-debug] raw text="${String(block.text || "").slice(0, 80)}" x=${Math.round(block.x)} y=${Math.round(block.y)}`);
+        });
+        console.log(`[anchor-debug] grouped text="${text.slice(0, 120)}" x=${Math.round(line.x)} y=${Math.round(line.y)}`);
+      }
+      continue;
+    }
+    console.log(`[ocr-line] text="${text.slice(0, 120)}" y=${Math.round(line.y)}`);
+    console.log(`[anchor] Q${startInfo.number} found=true`);
+    anchors.push({
+      questionNumber: startInfo.number,
+      sourceQuestionNumber: startInfo.number,
+      top: line.y,
+      startY: line.y,
+      left: line.x,
+      text,
+      line,
+      startInfo
+    });
+  }
+
+  const byNumber = new Map();
+  anchors.forEach((anchor) => {
+    const existing = byNumber.get(anchor.sourceQuestionNumber);
+    if (!existing || anchor.startY < existing.startY) byNumber.set(anchor.sourceQuestionNumber, anchor);
+  });
+  return [...byNumber.values()].sort((a, b) => a.startY - b.startY || a.left - b.left);
+}
+
+function recoverNumberMarkerAnchors(ocrLines, anchors, visionQuestions, width = 0, height = 0) {
+  const lines = (Array.isArray(ocrLines) ? ocrLines : []).slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  const result = (Array.isArray(anchors) ? anchors : []).slice();
+  const existingNumbers = new Set(result.map((anchor) => String(anchor.sourceQuestionNumber)));
+  const visionByNumber = new Map(
+    (Array.isArray(visionQuestions) ? visionQuestions : [])
+      .map((question) => [normalizeSourceQuestionNumber(question.questionNumber), question])
+      .filter(([number]) => number)
+  );
+  const context = createQuestionNumberContext(lines, width, height);
+  const markerPattern = /^\s*(?:\u7b2c\s*)?(\d{1,3})(?:\s*\u9898|[.\uFF0E\u3001])(?:\s*(.*))?$/u;
+
+  for (const line of lines) {
+    const text = String(line.text || "").trim();
+    const match = markerPattern.exec(text);
+    if (!match || isSubQuestionNumber(text) || isFigureOrTableLabel(text)) continue;
+    const number = String(Number(match[1]));
+    if (existingNumbers.has(number) || !visionByNumber.has(number)) continue;
+    if (Number(line.x) > Number(context.pageContentLeft) + Number(context.allowedOffset || 0)) continue;
+
+    const visionQuestion = visionByNumber.get(number);
+    const ocrBodyText = String(match[2] || "").trim();
+    const visionBodyText = String(visionQuestion?.summary || "").trim();
+    const bodyText = ocrBodyText || visionBodyText;
+    const evidenceSource = ocrBodyText
+      ? "ocr-explicit-prefix+existing-vision-result"
+      : "ocr-number-marker+existing-vision-result";
+    result.push({
+      questionNumber: number,
+      sourceQuestionNumber: number,
+      top: line.y,
+      startY: line.y,
+      left: line.x,
+      text: ocrBodyText ? text : (bodyText ? `${text} ${bodyText}` : text),
+      line,
+      startInfo: {
+        number,
+        kind: "explicit-marker-with-vision-evidence",
+        matchIndex: Math.max(0, text.indexOf(match[1])),
+        textLength: Math.max(1, text.length),
+        bodyText
+      },
+      evidenceSource
+    });
+    existingNumbers.add(number);
+    console.log(`[anchor] Q${number} found=true evidence=${evidenceSource} y=${Math.round(line.y)}`);
+  }
+
+  return result.sort((a, b) => a.startY - b.startY || a.left - b.left);
+}
+
+function recoverDiscontinuousQuestionAnchors(ocrLines, anchors, visionQuestions, width = 0, height = 0) {
+  const lines = (Array.isArray(ocrLines) ? ocrLines : []).slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  const result = (Array.isArray(anchors) ? anchors : []).slice().sort((a, b) => a.startY - b.startY);
+  const existingNumbers = new Set(result.map((anchor) => String(anchor.sourceQuestionNumber)));
+  const visionRegions = normalizeVisualQuestionRegions(visionQuestions, width, height);
+  const candidatesByNumber = new Map();
+  visionRegions.forEach((candidate) => {
+    const number = String(candidate.sourceQuestionNumber || "");
+    if (!number) return;
+    if (!candidatesByNumber.has(number)) candidatesByNumber.set(number, []);
+    candidatesByNumber.get(number).push(candidate);
+  });
+
+  const originalAnchors = result.slice();
+  for (let index = 0; index < originalAnchors.length - 1; index += 1) {
+    const previousAnchor = originalAnchors[index];
+    const nextAnchor = originalAnchors[index + 1];
+    const previousNumber = Number(previousAnchor.sourceQuestionNumber);
+    const nextNumber = Number(nextAnchor.sourceQuestionNumber);
+    if (!Number.isInteger(previousNumber) || !Number.isInteger(nextNumber) || nextNumber <= previousNumber + 1) continue;
+
+    const gapTop = Number(previousAnchor.startY);
+    const gapBottom = Number(nextAnchor.startY);
+    console.log(`[sequence-review] gap Q${previousNumber}->Q${nextNumber} y=[${Math.round(gapTop)},${Math.round(gapBottom)})`);
+    for (let number = previousNumber + 1; number < nextNumber; number += 1) {
+      const normalizedNumber = String(number);
+      if (existingNumbers.has(normalizedNumber)) continue;
+      const visionCandidates = (candidatesByNumber.get(normalizedNumber) || [])
+        .filter((candidate) => candidate.box.y >= gapTop && candidate.box.y < gapBottom)
+        .sort((a, b) => a.box.y - b.box.y);
+      let recovered = null;
+
+      for (const candidate of visionCandidates) {
+        const candidateTop = Math.max(gapTop, candidate.box.y);
+        const candidateBottom = Math.min(gapBottom, candidate.box.y + candidate.box.h);
+        const linesInside = lines.filter((line) => {
+          const centerY = Number(line.y) + Number(line.h) / 2;
+          return centerY >= candidateTop && centerY < candidateBottom;
+        });
+        const explicitPrefix = linesInside.find((line) => {
+          const match = /^\s*(?:第\s*)?(\d{1,3})(?:\s*题|[.．、。:：])/u.exec(String(line.text || ""));
+          return match && Number(match[1]) === number && !isSubQuestionNumber(line.text) && !isFigureOrTableLabel(line.text);
+        });
+        const combinedText = [candidate.summary, ...linesInside.map((line) => line.text)].filter(Boolean).join(" ");
+        const hasVisualStructureEvidence = candidate.rawModelBoxes.length > 0 &&
+          candidate.box.h >= Math.max(1, height * 0.015) &&
+          hasQuestionStemEvidence(candidate.summary);
+        const hasContentEvidence = hasQuestionStemEvidence(candidate.summary) ||
+          linesInside.some((line) => hasQuestionStemEvidence(line.text)) ||
+          hasQuestionStemEvidence(combinedText);
+        if (!explicitPrefix && !hasContentEvidence && !hasVisualStructureEvidence) continue;
+        if (!linesInside.length && !hasVisualStructureEvidence) continue;
+
+        const top = explicitPrefix ? Number(explicitPrefix.y) : Number(candidate.box.y);
+        const line = explicitPrefix || {
+          text: String(candidate.summary || combinedText).trim(),
+          x: candidate.box.x,
+          y: top,
+          w: candidate.box.w,
+          h: Math.max(1, Math.min(candidate.box.h, median(linesInside.map((item) => item.h)) || 18)),
+          blockIndexes: [...new Set(linesInside.flatMap((item) => item.blockIndexes || []))],
+          blocks: linesInside.flatMap((item) => item.blocks || [])
+        };
+        recovered = {
+          questionNumber: normalizedNumber,
+          sourceQuestionNumber: normalizedNumber,
+          top,
+          startY: top,
+          left: Number(line.x) || candidate.box.x,
+          text: String(line.text || candidate.summary || "").trim(),
+          line,
+          startInfo: {
+            number: normalizedNumber,
+            kind: "sequence-gap-review",
+            matchIndex: 0,
+            textLength: Math.max(1, String(line.text || "").length),
+            bodyText: String(candidate.summary || "").trim()
+          },
+          evidenceSource: explicitPrefix
+            ? "sequence-gap-review+ocr-prefix+vision"
+            : linesInside.length
+              ? "sequence-gap-review+ocr-content+vision"
+              : "sequence-gap-review+vision-structure"
+        };
+        break;
+      }
+
+      if (recovered) {
+        result.push(recovered);
+        existingNumbers.add(normalizedNumber);
+        console.log(
+          `[sequence-review] recovered Q${normalizedNumber} y=${Math.round(recovered.startY)} evidence=${recovered.evidenceSource}`
+        );
+      } else {
+        console.log(`[sequence-review] keep gap; Q${normalizedNumber} has insufficient existing evidence`);
+      }
+    }
+  }
+
+  const sortedResult = result.sort((a, b) => a.startY - b.startY || a.left - b.left);
+  sortedResult.forEach((anchor) => {
+    delete anchor.unresolvedFollowingNumbers;
+    delete anchor.preserveUnresolvedUntilNextAnchor;
+  });
+  for (let index = 0; index < sortedResult.length - 1; index += 1) {
+    const current = sortedResult[index];
+    const next = sortedResult[index + 1];
+    const currentNumber = Number(current.sourceQuestionNumber);
+    const nextNumber = Number(next.sourceQuestionNumber);
+    if (!Number.isInteger(currentNumber) || !Number.isInteger(nextNumber) || nextNumber <= currentNumber + 1) continue;
+
+    const unresolvedFollowingNumbers = [];
+    for (let number = currentNumber + 1; number < nextNumber; number += 1) {
+      unresolvedFollowingNumbers.push(String(number));
+    }
+    current.unresolvedFollowingNumbers = unresolvedFollowingNumbers;
+    current.preserveUnresolvedUntilNextAnchor = true;
+    console.log(
+      `[sequence-review] unresolved=[${unresolvedFollowingNumbers.join(",")}] merged into Q${current.sourceQuestionNumber} until Q${next.sourceQuestionNumber} boundary`
+    );
+  }
+
+  return sortedResult;
+}
+
+function isLikelyQuestionStartCandidate(candidate, textLeft, textRight, pageHeight) {
+  const text = String(candidate?.block?.text || "").trim();
+  if (!candidate?.number || !text || !candidate.startInfo) return false;
+  if (isTableOrFigureBlock(candidate.block)) return false;
+  if (looksLikeChoiceText(text)) return false;
+  if (/^\d{1,3}\s*[.．]\s*\d/u.test(text)) return false;
+  if (/^[A-D]\s*[.．、]/i.test(text) && candidate.startInfo?.kind !== "embedded") return false;
+  if (/^\d{1,3}\s*[)）]\s*$/u.test(text)) return false;
+
+  const number = Number(candidate.number);
+  if (!Number.isInteger(number) || number <= 0 || number > 200) return false;
+
+  const textWidth = Math.max(1, textRight - textLeft);
+  const xRatio = (candidate.x - textLeft) / textWidth;
+  if (xRatio > 0.38) return false;
+
+  const yRatio = candidate.y / Math.max(1, pageHeight);
+  if (yRatio < 0.015 && text.length < 8) return false;
+
+  return true;
+}
+
+function isSubQuestionNumber(text) {
+  return /^\s*(?:[\uFF08(]\s*(?:\d{1,2}|[\u2160-\u216B]|[ivx]{1,5})\s*[\uFF09)]|\d{1,2}\s*[\uFF09)]|[\u2460-\u2469])/iu.test(String(text || ""));
+}
+
+function extractSubQuestionNumber(text) {
+  const value = String(text || "").trim();
+  if (!isSubQuestionNumber(value)) return "";
+  const numeric = value.match(/\d{1,2}/);
+  if (numeric) return numeric[0];
+  const circled = value.match(/[\u2460-\u2469]/u);
+  if (circled) return String(circled[0].codePointAt(0) - 0x245f);
+  const roman = value.match(/[\u2160-\u216B]|[ivx]{1,5}/iu);
+  return roman ? roman[0].toUpperCase() : "";
+}
+
+function isMainQuestionNumber(text, block = null, context = {}) {
+  return Boolean(getQuestionNumberStartInfo(text, block, context));
+}
+
+function extractMainQuestionNumber(text, block = null, context = {}) {
+  return getQuestionNumberStartInfo(text, block, context)?.number || "";
+}
+
+function getQuestionNumberStartInfo(text, block = null, context = {}) {
+  const value = String(text || "").trim();
+  if (!value || isSubQuestionNumber(value) || isFigureOrTableLabel(value)) return null;
+  const match = /^\s*(?:第\s*)?(\d{1,3})(?:\s*题|[.．、。:：])\s*(.*)$/u.exec(value);
+  if (!match) return null;
+  const number = Number(match[1]);
+  if (!Number.isInteger(number) || number <= 0 || number > 200) return null;
+
+  if (block && Number.isFinite(context.pageContentLeft)) {
+    const blockX = Number(block.x);
+    if (!Number.isFinite(blockX) || blockX > context.pageContentLeft + Number(context.allowedOffset || 0)) return null;
+  }
+  const bodyText = String(match[2] || "").trim() || getAdjacentQuestionSentence(block, context);
+  if (!hasQuestionStemEvidence(bodyText)) return null;
+  if (isTableOrFigureBlock({ ...(block || {}), text: value })) return null;
+  return {
+    number: String(number),
+    kind: "explicit",
+    matchIndex: Math.max(0, match[0].indexOf(match[1])),
+    textLength: Math.max(1, value.length),
+    bodyText
+  };
+}
+
+function detectQuestionNumberStart(text, block = null, context = {}) {
+  return getQuestionNumberStartInfo(text, block, context)?.number || "";
+}
+
+function recoverLeadingQuestionStart(blocks, starts, leftBand, pageHeight) {
+  const firstStart = starts[0];
+  if (!firstStart || !Number.isInteger(Number(firstStart.number))) return null;
+  const expectedNumber = Number(firstStart.number) - 1;
+  if (expectedNumber <= 0) return null;
+
+  // Only infer a missing leading question when the recognised starts themselves
+  // are consecutive. This keeps an exam heading from being misread as a question.
+  const nextStart = starts[1];
+  if (!nextStart || Number(nextStart.number) !== Number(firstStart.number) + 1) return null;
+
+  const leadingBlocks = blocks.filter((block) => block.y + block.h / 2 < firstStart.y - 18);
+  const leadingText = leadingBlocks.map((block) => String(block.text || "")).join(" ").trim();
+  const leadingTop = leadingBlocks.length ? Math.min(...leadingBlocks.map((block) => block.y)) : 0;
+  const leadingBottom = leadingBlocks.length ? Math.max(...leadingBlocks.map((block) => block.y + block.h)) : 0;
+  const hasSubstantiveLeadingContent =
+    leadingBlocks.length >= 2 &&
+    (leadingBottom - leadingTop >= 60 || leadingText.length >= 80);
+  if (!hasSubstantiveLeadingContent) {
+    const hasVisibleLeadingRegion = firstStart.y >= Math.max(64, pageHeight * 0.06);
+    if (!hasVisibleLeadingRegion) return null;
+    return {
+      index: -1,
+      number: expectedNumber,
+      x: 0,
+      y: 0,
+      block: null,
+      inferredFromLeadingRegion: true
+    };
+  }
+
+  const leadingCandidates = leadingBlocks
+    .map((block, index) => {
+      const text = String(block.text || "").trim();
+      const looseMatch = text.match(/^(\d{1,3})(?:\s|[.．、])/);
+      return {
+        index,
+        number: looseMatch ? Number(looseMatch[1]) : 0,
+        x: block.x,
+        y: block.y,
+        block
+      };
+    })
+    .filter(
+      (candidate) =>
+        candidate.number === expectedNumber &&
+        candidate.x <= leftBand
+    )
+    .sort((a, b) => b.y - a.y || a.x - b.x);
+
+  if (leadingCandidates[0]) return leadingCandidates[0];
+
+  // OCR can miss the printed question number while still recognising its body.
+  // The region above a consecutive pair such as 25/26 is then kept as question 24.
+  return {
+    index: -1,
+    number: expectedNumber,
+    x: Math.min(...leadingBlocks.map((block) => block.x)),
+    y: leadingTop,
+    block: leadingBlocks[0],
+    inferredFromLeadingContent: true
+  };
+}
+
+function inferKnowledgeFromText(text) {
+  const value = String(text || "");
+  if (/比例|比值|比例式|成比例/.test(value)) return "比例与比例式";
+  if (/圆|圆心角|圆周角|扇形|弧长|周长/.test(value)) return "圆的相关计算";
+  if (/函数|一次函数|二次函数|反比例函数|坐标|图象/.test(value)) return "函数图象";
+  if (/方程|未知数|解方程|方程组/.test(value)) return "方程思想";
+  if (/几何|三角形|平行|垂直|相似|全等/.test(value)) return "几何推理";
+  if (/统计|概率|平均数|中位数|众数/.test(value)) return "统计与概率";
+  if (/表格|规律|方案|费用|利润|工程|速度|路程/.test(value)) return "综合应用";
+  return "";
+}
+
+function dedupeQuestionStarts(candidates) {
+  const byNumber = new Map();
+  for (const candidate of candidates) {
+    const number = String(candidate.number || "");
+    if (!number) continue;
+    if (!byNumber.has(number)) byNumber.set(number, []);
+    byNumber.get(number).push(candidate);
+  }
+
+  return [...byNumber.values()]
+    .map((matches) => {
+      const explicit = matches.filter((candidate) => candidate.startInfo?.kind === "explicit");
+      const preferred = explicit.length ? explicit : matches.filter((candidate) => candidate.startInfo?.kind !== "embedded");
+      return (preferred.length ? preferred : matches).sort((a, b) => a.y - b.y || a.x - b.x)[0];
+    })
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+function estimateQuestionMarkerY(block, startInfo) {
+  if (!block || !startInfo) return Number(block?.y) || 0;
+  if (startInfo.kind !== "embedded" || startInfo.matchIndex <= 0) return block.y;
+  const relativeOffset = Math.min(0.88, Math.max(0.2, startInfo.matchIndex / startInfo.textLength));
+  return block.y + block.h * relativeOffset;
+}
+
+function attachFigureCaptionContext(starts, captionCandidates, blocks, pageHeight) {
+  if (!starts.length || !captionCandidates.length) return starts;
+  const typicalLineHeight = median(blocks.map((block) => block.h)) || 18;
+  const figureLookback = Math.max(72, Math.min(pageHeight * 0.13, typicalLineHeight * 5.5));
+
+  return starts.map((start) => {
+    const caption = captionCandidates
+      .filter((candidate) => candidate.number === start.number && candidate.y < start.y)
+      .sort((a, b) => b.y - a.y)[0];
+    if (!caption || start.y - caption.y > pageHeight * 0.28) return start;
+    return {
+      ...start,
+      figureContextTop: Math.max(0, caption.y - figureLookback)
+    };
+  });
+}
+
+function buildQuestionBoxesByNumberStarts(blocks, width, height) {
+  if (!Array.isArray(blocks) || blocks.length < 2) return [];
+
+  const numberingContext = createQuestionNumberContext(blocks, width, height);
+  const textLeft = Math.min(...blocks.map((block) => block.x));
+  const textRight = Math.max(...blocks.map((block) => block.x + block.w));
+  const textTop = Math.min(...blocks.map((block) => block.y));
+  const textBottom = Math.max(...blocks.map((block) => block.y + block.h));
+  const leftBand = textLeft + Math.max(90, (textRight - textLeft) * 0.22);
+  const allCandidates = blocks
+    .map((block, index) => {
+      const startInfo = getQuestionNumberStartInfo(block.text, block, numberingContext);
+      return {
+        index,
+        number: startInfo?.number || "",
+        x: block.x,
+        y: estimateQuestionMarkerY(block, startInfo),
+        block,
+        startInfo
+      };
+    })
+    .filter((candidate) => candidate.number && candidate.x <= leftBand);
+  const captionCandidates = allCandidates.filter((candidate) => candidate.startInfo?.kind === "caption");
+  const candidates = allCandidates
+    .filter((candidate) => candidate.startInfo?.kind !== "caption")
+    .filter((candidate) => isLikelyQuestionStartCandidate(candidate, textLeft, textRight, height));
+
+  let starts = dedupeQuestionStarts(candidates);
+  starts = attachFigureCaptionContext(starts, captionCandidates, blocks, height);
+  if (starts.length < 2) return [];
+
+  console.log(
+    `[segment] question-number starts: ${starts
+      .map((start) => `${start.number}@${Math.round(start.x)},${Math.round(start.y)}`)
+      .join(", ")}`
+  );
+
+  const questions = [];
+  for (let index = 0; index < starts.length; index += 1) {
+    const start = starts[index];
+    const next = starts[index + 1];
+    const startY = Math.max(0, Math.min(start.y - 16, start.figureContextTop ?? start.y - 16));
+    const contentStartY = Math.max(0, start.y - 4);
+    const endY = next ? Math.max(contentStartY + 24, next.y - 3) : Math.min(height, textBottom + 34);
+    const selectedBlocks = blocks.filter((block) => {
+      const centerY = block.y + block.h / 2;
+      return centerY >= contentStartY && centerY < endY;
+    });
+    if (!selectedBlocks.length) {
+      if (!start.inferredFromLeadingRegion) continue;
+      const x = 0;
+      const y = Math.max(0, Math.floor(startY));
+      const paddedBottom = Math.min(height, Math.ceil(endY));
+      if (paddedBottom <= y) continue;
+      questions.push({
+        x,
+        y,
+        w: width,
+        h: paddedBottom - y,
+        number: start.number,
+        questionNumber: start.number,
+        title: `第 ${start.number} 题`,
+        problemText: `第 ${start.number} 题`,
+        type: "未知",
+        problemType: "未知",
+        knowledge: "",
+        mainKnowledgePoint: "",
+        knowledgePoints: [],
+        confidence: 0.25,
+        generatedBy: "leading-page-region-fallback"
+      });
+      continue;
+    }
+
+    const top = Math.min(...selectedBlocks.map((block) => block.y));
+    const bottom = Math.max(...selectedBlocks.map((block) => block.y + block.h));
+    const x = 0;
+    const y = Math.max(0, Math.floor(Math.min(top, startY) - 18));
+    const paddedRight = width;
+    const boundaryOverlap = Math.max(7, Math.min(14, median(selectedBlocks.map((block) => block.h)) * 0.4));
+    const paddedBottom = next
+      ? Math.min(height, Math.ceil(next.y + boundaryOverlap))
+      : Math.min(height, Math.ceil(Math.max(bottom + 28, endY + boundaryOverlap)));
+    if (paddedRight <= x || paddedBottom <= y) continue;
+
+    const embeddedQuestionText =
+      start.startInfo?.kind === "embedded"
+        ? String(start.block?.text || "").slice(start.startInfo.matchIndex).trim()
+        : "";
+    const mergedText = [embeddedQuestionText, ...selectedBlocks.map((block) => block.text)]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const knowledge = inferKnowledgeFromText(mergedText);
+    questions.push({
+      x,
+      y,
+      w: paddedRight - x,
+      h: paddedBottom - y,
+      number: start.number,
+      questionNumber: start.number,
+      title: mergedText.slice(0, 80) || `第 ${start.number} 题`,
+      problemText: mergedText.slice(0, 80) || `第 ${start.number} 题`,
+      type: "未知",
+      problemType: "未知",
+      knowledge,
+      mainKnowledgePoint: knowledge,
+      knowledgePoints: knowledge ? [knowledge] : [],
+      confidence: knowledge ? 0.62 : 0.45,
+      generatedBy: "question-number-fallback"
+    });
+  }
+
   return questions.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+function shouldPreferNumberFallback(questions, width, height) {
+  if (!questions.length) return true;
+  if (questions.length > 1) return false;
+  const question = questions[0];
+  const areaRatio = (question.w * question.h) / Math.max(1, width * height);
+  const heightRatio = question.h / Math.max(1, height);
+  return areaRatio > 0.5 || heightRatio > 0.55;
+}
+
+function questionNumberList(questions) {
+  return (Array.isArray(questions) ? questions : [])
+    .map((question) => Number.parseInt(question.questionNumber || question.number, 10))
+    .filter((number) => Number.isInteger(number) && number > 0);
+}
+
+function isConsecutiveQuestionSplit(questions) {
+  const numbers = questionNumberList(questions);
+  if (numbers.length !== questions.length || numbers.length < 2) return false;
+  const seen = new Set(numbers);
+  if (seen.size !== numbers.length) return false;
+  for (let index = 1; index < numbers.length; index += 1) {
+    if (numbers[index] !== numbers[index - 1] + 1) return false;
+  }
+  return true;
+}
+
+function isReliableFastQuestionSplit(questions, width, height) {
+  if (!isConsecutiveQuestionSplit(questions)) return false;
+  const pageArea = Math.max(1, width * height);
+  return questions.every((question) => {
+    const areaRatio = (question.w * question.h) / pageArea;
+    const heightRatio = question.h / Math.max(1, height);
+    return areaRatio > 0.015 && areaRatio < 0.65 && heightRatio > 0.025 && heightRatio < 0.72;
+  });
+}
+
+function median(values) {
+  const sorted = values.filter((value) => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
+  if (!sorted.length) return 0;
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function makeInferredQuestionBox(template, number, x, y, w, h, generatedBy) {
+  const label = `第 ${number} 题`;
+  const shouldUseLabel = /repair/.test(String(generatedBy || ""));
+  return {
+    ...template,
+    x: Math.max(0, Math.round(x)),
+    y: Math.max(0, Math.round(y)),
+    w: Math.max(1, Math.round(w)),
+    h: Math.max(1, Math.round(h)),
+    number: String(number),
+    questionNumber: String(number),
+    title: shouldUseLabel ? label : template?.title && String(template.title).trim() ? template.title : label,
+    problemText: shouldUseLabel ? label : template?.problemText && String(template.problemText).trim() ? template.problemText : label,
+    confidence: Math.min(Number(template?.confidence) || 0.35, 0.38),
+    generatedBy
+  };
+}
+
+function repairQuestionNumberSplit(questions, width, height, blocks = []) {
+  const sorted = (Array.isArray(questions) ? questions : [])
+    .map((question) => ({
+      ...question,
+      numberValue: Number.parseInt(question.questionNumber || question.number, 10)
+    }))
+    .filter((question) => Number.isInteger(question.numberValue) && question.numberValue > 0)
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+  if (sorted.length < 2 || isConsecutiveQuestionSplit(sorted)) return sorted;
+
+  const left = Math.max(0, Math.min(...sorted.map((question) => question.x)));
+  const right = Math.min(width, Math.max(...sorted.map((question) => question.x + question.w)));
+  const boxWidth = Math.max(1, right - left);
+  const repaired = [];
+  const first = sorted[0];
+
+  if (first.numberValue > 1 && first.y > Math.max(50, height * 0.035)) {
+    const count = Math.min(first.numberValue - 1, 4);
+    const sliceHeight = first.y / count;
+    for (let index = 0; index < count; index += 1) {
+      repaired.push(
+        makeInferredQuestionBox(first, first.numberValue - count + index, left, index * sliceHeight, boxWidth, sliceHeight - 6, "question-number-gap-repair")
+      );
+    }
+  }
+
+  for (let index = 0; index < sorted.length; index += 1) {
+    const current = { ...sorted[index] };
+    const next = sorted[index + 1];
+    delete current.numberValue;
+
+    if (!next) {
+      repaired.push(current);
+      continue;
+    }
+
+    const currentNumber = sorted[index].numberValue;
+    const nextNumber = next.numberValue;
+    const missingCount = nextNumber - currentNumber - 1;
+    if (missingCount <= 0) {
+      repaired.push(current);
+      continue;
+    }
+
+    const spanTop = sorted[index].y;
+    const spanBottom = Math.max(next.y - 8, spanTop + current.h);
+    const spanHeight = spanBottom - spanTop;
+    const sliceCount = missingCount + 1;
+    if (spanHeight < Math.max(70, height * 0.045) * sliceCount) {
+      repaired.push(current);
+      continue;
+    }
+
+    const sliceHeight = spanHeight / sliceCount;
+    repaired.push({
+      ...current,
+      x: left,
+      y: Math.round(spanTop),
+      w: boxWidth,
+      h: Math.max(1, Math.round(sliceHeight - 6)),
+      generatedBy: "question-number-gap-repair"
+    });
+    for (let offset = 1; offset <= missingCount; offset += 1) {
+      repaired.push(
+        makeInferredQuestionBox(
+          current,
+          currentNumber + offset,
+          left,
+          spanTop + sliceHeight * offset,
+          boxWidth,
+          sliceHeight - 6,
+          "question-number-gap-repair"
+        )
+      );
+    }
+  }
+
+  const repairedHeights = repaired.map((question) => question.h);
+  const typicalHeight = median(repairedHeights.slice(0, -1));
+  const last = repaired[repaired.length - 1];
+  if (last && typicalHeight > 0 && last.h > typicalHeight * 1.75) {
+    const lastNumber = Number.parseInt(last.questionNumber || last.number, 10);
+    const extraCount = Math.min(2, Math.max(1, Math.round(last.h / typicalHeight) - 1));
+    const sliceCount = extraCount + 1;
+    const sliceHeight = last.h / sliceCount;
+    repaired.pop();
+    for (let index = 0; index < sliceCount; index += 1) {
+      repaired.push(
+        makeInferredQuestionBox(
+          last,
+          lastNumber + index,
+          last.x,
+          last.y + sliceHeight * index,
+          last.w,
+          sliceHeight - 6,
+          index === 0 ? "question-number-fallback" : "question-number-tail-repair"
+        )
+      );
+    }
+  }
+
+  return expandQuestionBoxesToVerticalBands(
+    repaired
+    .filter((question) => question.w > 2 && question.h > 2)
+      .sort((a, b) => a.y - b.y || a.x - b.x),
+    blocks,
+    width,
+    height
+  );
+}
+
+function clampPixelBox(box, width, height) {
+  if (!box) return null;
+  const x = Number(box.x);
+  const y = Number(box.y);
+  const w = Number(box.w);
+  const h = Number(box.h);
+  if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) return null;
+  const left = Math.max(0, Math.min(width, x));
+  const top = Math.max(0, Math.min(height, y));
+  const right = Math.max(left, Math.min(width, x + w));
+  const bottom = Math.max(top, Math.min(height, y + h));
+  if (right - left < 2 || bottom - top < 2) return null;
+  return { x: left, y: top, w: right - left, h: bottom - top };
+}
+
+function normalizedBoxToPixels(box, width, height) {
+  if (!box) return null;
+  const values = [box.x, box.y, box.w, box.h].map(Number);
+  if (!values.every(Number.isFinite) || values.some((value) => value < 0 || value > 1)) return null;
+  return clampPixelBox({ x: values[0] * width, y: values[1] * height, w: values[2] * width, h: values[3] * height }, width, height);
+}
+
+function unionPixelBoxes(boxes, width, height) {
+  const valid = (Array.isArray(boxes) ? boxes : []).map((box) => clampPixelBox(box, width, height)).filter(Boolean);
+  if (!valid.length) return null;
+  const left = Math.min(...valid.map((box) => box.x));
+  const top = Math.min(...valid.map((box) => box.y));
+  const right = Math.max(...valid.map((box) => box.x + box.w));
+  const bottom = Math.max(...valid.map((box) => box.y + box.h));
+  return clampPixelBox({ x: left, y: top, w: right - left, h: bottom - top }, width, height);
+}
+
+function padPixelBox(box, width, height, horizontalRatio = 0.015, verticalRatio = 0.008) {
+  if (!box) return null;
+  const horizontal = width * horizontalRatio;
+  const vertical = height * verticalRatio;
+  return clampPixelBox(
+    { x: box.x - horizontal, y: box.y - vertical, w: box.w + horizontal * 2, h: box.h + vertical * 2 },
+    width,
+    height
+  );
+}
+
+function getBoundaryGap(imageHeight) {
+  return Math.max(2, Math.round(imageHeight * 0.005));
+}
+
+function mergeBoxesWithinBoundary(boxes, nextQuestionStart, width, height) {
+  const merged = unionPixelBoxes(boxes, width, height);
+  if (!merged || !Number.isFinite(nextQuestionStart)) return merged;
+  const boundaryBottom = Math.max(merged.y + 1, nextQuestionStart - getBoundaryGap(height));
+  return clampPixelBox(
+    { ...merged, h: Math.min(merged.y + merged.h, boundaryBottom) - merged.y },
+    width,
+    height
+  );
+}
+
+function getQuestionStartY(question) {
+  const ocrStart = Number(question?.expectedBand?.startY);
+  if (Number.isFinite(ocrStart)) return ocrStart;
+  const modelTop = Number(question?.box?.y ?? question?.finalBox?.y ?? question?.y);
+  return Number.isFinite(modelTop) ? modelTop : 0;
+}
+
+function normalizeSourceQuestionNumber(value) {
+  const match = String(value || "").match(/\d{1,3}/);
+  if (!match) return "";
+  const number = Number(match[0]);
+  return Number.isInteger(number) && number > 0 && number <= 200 ? String(number) : "";
+}
+
+function extractOptionLabels(text) {
+  const labels = new Set();
+  const pattern = /(?:^|\s)([A-D])\s*[.\uFF0E\u3001:：]/gi;
+  for (const match of String(text || "").matchAll(pattern)) labels.add(match[1].toUpperCase());
+  return [...labels];
+}
+
+function normalizeSimilarityText(text) {
+  return String(text || "").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function textJaccardSimilarity(leftText, rightText) {
+  const toBigrams = (value) => {
+    const normalized = normalizeSimilarityText(value);
+    if (!normalized) return new Set();
+    if (normalized.length === 1) return new Set([normalized]);
+    const result = new Set();
+    for (let index = 0; index < normalized.length - 1; index += 1) result.add(normalized.slice(index, index + 2));
+    return result;
+  };
+  const left = toBigrams(leftText);
+  const right = toBigrams(rightText);
+  if (!left.size || !right.size) return 0;
+  const intersection = [...left].filter((item) => right.has(item)).length;
+  return intersection / (left.size + right.size - intersection);
+}
+
+function boxIntersectionArea(a, b) {
+  const left = Math.max(a.x, b.x);
+  const top = Math.max(a.y, b.y);
+  const right = Math.min(a.x + a.w, b.x + b.w);
+  const bottom = Math.min(a.y + a.h, b.y + b.h);
+  return Math.max(0, right - left) * Math.max(0, bottom - top);
+}
+
+function boxIou(a, b) {
+  const intersection = boxIntersectionArea(a, b);
+  const union = a.w * a.h + b.w * b.h - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function boxContainmentRatio(a, b) {
+  const intersection = boxIntersectionArea(a, b);
+  const smaller = Math.min(a.w * a.h, b.w * b.h);
+  return smaller > 0 ? intersection / smaller : 0;
+}
+
+function horizontalOverlapRatio(a, b) {
+  const overlap = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  return overlap / Math.max(1, Math.min(a.w, b.w));
+}
+
+function classifyOcrNumbering(blocks, width = 0, height = 0) {
+  const annotations = new Map();
+  let currentMainQuestion = "";
+  const numberingContext = createQuestionNumberContext(blocks, width, height);
+  const sorted = (Array.isArray(blocks) ? blocks : [])
+    .map((block, index) => ({ block, index }))
+    .sort((a, b) => a.block.y - b.block.y || a.block.x - b.block.x);
+
+  for (const { block, index } of sorted) {
+    const text = String(block.text || "").trim();
+    if (isSubQuestionNumber(text)) {
+      const subQuestionNumber = extractSubQuestionNumber(text);
+      annotations.set(index, {
+        type: "subQuestion",
+        subQuestionNumber,
+        parentQuestionNumber: currentMainQuestion
+      });
+      console.log(`[numbering] text="${text.slice(0, 40)}" type=subQuestion parent=${currentMainQuestion || "?"}`);
+      continue;
+    }
+    const startInfo = getQuestionNumberStartInfo(text, block, numberingContext);
+    if (!startInfo) {
+      const tableOrFigure = isTableOrFigureBlock(block);
+      if (tableOrFigure) {
+        annotations.set(index, {
+          type: "supportingContent",
+          parentQuestionNumber: currentMainQuestion
+        });
+        console.log(`[block] text="${text.slice(0, 40)}" type=tableOrFigure`);
+        if (currentMainQuestion) console.log(`[parent] assigned to Q${currentMainQuestion}`);
+      }
+      if (/^\s*\d{1,3}\s*$/u.test(text)) {
+        console.log(`[numbering] text="${text}" validMainQuestion=false reason=single table cell number`);
+      } else if (/^\s*(?:第\s*)?\d{1,3}(?:\s*题|[.．、。:：])/u.test(text)) {
+        console.log(`[numbering] text="${text.slice(0, 40)}" validMainQuestion=false reason=missing natural-language stem or outside question-number column`);
+      }
+      continue;
+    }
+    currentMainQuestion = startInfo.number;
+    annotations.set(index, { type: "mainQuestion", number: currentMainQuestion, startInfo });
+    console.log(`[numbering] text="${text.slice(0, 40)}" type=mainQuestion number=${currentMainQuestion}`);
+  }
+  return annotations;
+}
+
+function buildOcrQuestionBands(blocks, width, height, prepared = {}) {
+  if (!Array.isArray(blocks) || !blocks.length) return [];
+  const ocrLines = Array.isArray(prepared.ocrLines)
+    ? prepared.ocrLines
+    : mergeDetachedQuestionNumberLines(groupOcrBlocksIntoLines(blocks, width, height), width);
+  const anchors = Array.isArray(prepared.anchors)
+    ? prepared.anchors
+    : extractMainQuestionAnchors(ocrLines, width, height);
+  if (!anchors.length) return [];
+  const numbering = classifyOcrNumbering(ocrLines, width, height);
+
+  return anchors.map((anchor, index) => {
+    const next = anchors[index + 1];
+    const top = Math.max(0, anchor.startY - 3);
+    const bottom = next ? Math.max(top + 18, next.startY - 2) : height;
+    const selectedLineEntries = ocrLines
+      .map((line, lineIndex) => ({ line, lineIndex, center: line.y + line.h / 2 }))
+      .filter((item) => item.center >= top && item.center < bottom);
+    const selectedLines = selectedLineEntries.map((item) => item.line);
+    const lineIndexes = [...new Set(selectedLines.flatMap((line) => line.blockIndexes || []))];
+    const text = selectedLines.map((line) => line.text).join(" ").replace(/\s+/g, " ").trim();
+    const subQuestions = selectedLineEntries
+      .map((item) => numbering.get(item.lineIndex))
+      .filter((annotation) => annotation?.type === "subQuestion" && annotation.parentQuestionNumber === anchor.sourceQuestionNumber)
+      .map((annotation) => annotation.subQuestionNumber)
+      .filter(Boolean);
+    const supportingContentIndexes = selectedLineEntries
+      .filter((item) => {
+        const annotation = numbering.get(item.lineIndex);
+        return annotation?.type === "supportingContent" && annotation.parentQuestionNumber === anchor.sourceQuestionNumber;
+      })
+      .flatMap((item) => item.line.blockIndexes || []);
+    subQuestions.forEach((subQuestionNumber) => console.log(`[merge] subQuestion（${subQuestionNumber}） merged into Q${anchor.sourceQuestionNumber}`));
+    if (supportingContentIndexes.length) {
+      console.log(`[merge] table continuation merged into Q${anchor.sourceQuestionNumber}`);
+    }
+    const box = unionPixelBoxes(lineIndexes.map((blockIndex) => blocks[blockIndex]).filter(Boolean), width, height) || {
+      x: 0, y: top, w: width, h: bottom - top
+    };
+    console.log(
+      `[interval] Q${anchor.sourceQuestionNumber}=[${Math.round(anchor.startY)},${next ? `Q${next.sourceQuestionNumber}.top=${Math.round(next.startY)}` : height})`
+    );
+    return {
+      sourceQuestionNumber: anchor.sourceQuestionNumber,
+      startY: anchor.startY,
+      nextStartY: next?.startY ?? height,
+      nextQuestionNumber: next?.sourceQuestionNumber || "",
+      lineIndexes,
+      text,
+      optionLabels: extractOptionLabels(text),
+      subQuestions: [...new Set(subQuestions)],
+      supportingContentIndexes: [...new Set(supportingContentIndexes)],
+      box,
+      startInfo: anchor.startInfo,
+      evidenceSource: "ocr-anchor",
+      unresolvedFollowingNumbers: [...new Set(anchor.unresolvedFollowingNumbers || [])],
+      preserveUnresolvedUntilNextAnchor: Boolean(anchor.preserveUnresolvedUntilNextAnchor)
+    };
+  });
+}
+
+function normalizeVisualQuestionRegions(questions, width, height) {
+  return (Array.isArray(questions) ? questions : [])
+    .map((question, index) => {
+      const stemBoxes = (question.stemBoxes || []).map((box) => normalizedBoxToPixels(box, width, height)).filter(Boolean);
+      const optionBoxes = (question.optionBoxes || []).map((box) => normalizedBoxToPixels(box, width, height)).filter(Boolean);
+      const otherBoxes = (question.otherBoxes || []).map((box) => normalizedBoxToPixels(box, width, height)).filter(Boolean);
+      const rawModelBoxes = [...stemBoxes, ...optionBoxes, ...otherBoxes];
+      const box = unionPixelBoxes(rawModelBoxes, width, height);
+      if (!box) return null;
+      return {
+        sourceQuestionNumber: normalizeSourceQuestionNumber(question.questionNumber),
+        questionRole: "mainQuestion",
+        parentQuestionNumber: "",
+        subQuestions: [],
+        summary: String(question.summary || "").trim(),
+        type: normalizeQuestionType(question.type),
+        text: String(question.summary || "").trim(),
+        stemBoxes,
+        optionBoxes,
+        otherBoxes,
+        rawModelBoxes,
+        ocrLineIndexes: [],
+        optionLabels: [],
+        box,
+        mergeReasons: [`视觉结构候选 ${index + 1}`],
+        uncertain: false
+      };
+    })
+    .filter(Boolean);
+}
+
+function isSupportingQuestionRole(role) {
+  return ["subQuestion", "table", "figure", "formula", "supportingContent"].includes(String(role || ""));
+}
+
+function mergeQuestionRoles(leftRole, rightRole) {
+  if (leftRole === "mainQuestion" || rightRole === "mainQuestion") return "mainQuestion";
+  if (leftRole === "subQuestion" || rightRole === "subQuestion") return "subQuestion";
+  return "supportingContent";
+}
+
+function mergeQuestionCandidate(base, extra, width, height, reason, nextQuestionStart = Number.POSITIVE_INFINITY) {
+  const mergedBox = mergeBoxesWithinBoundary([base.box, extra.box], nextQuestionStart, width, height) || base.box;
+  const sourceQuestionNumber = base.sourceQuestionNumber || extra.sourceQuestionNumber;
+  return {
+    ...base,
+    sourceQuestionNumber,
+    questionRole: mergeQuestionRoles(base.questionRole, extra.questionRole),
+    parentQuestionNumber: base.parentQuestionNumber || extra.parentQuestionNumber || "",
+    subQuestions: [...new Set([...(base.subQuestions || []), ...(extra.subQuestions || [])])],
+    summary: base.summary.length >= extra.summary.length ? base.summary : extra.summary,
+    type: base.type !== "未知" ? base.type : extra.type,
+    text: [base.text, extra.text].filter(Boolean).join(" ").replace(/\s+/g, " ").trim(),
+    stemBoxes: [...(base.stemBoxes || []), ...(extra.stemBoxes || [])],
+    optionBoxes: [...(base.optionBoxes || []), ...(extra.optionBoxes || [])],
+    otherBoxes: [...(base.otherBoxes || []), ...(extra.otherBoxes || [])],
+    rawModelBoxes: [...(base.rawModelBoxes || []), ...(extra.rawModelBoxes || [])],
+    ocrLineIndexes: [...new Set([...(base.ocrLineIndexes || []), ...(extra.ocrLineIndexes || [])])],
+    optionLabels: [...new Set([...(base.optionLabels || []), ...(extra.optionLabels || [])])],
+    box: mergedBox,
+    mergeReasons: [...(base.mergeReasons || []), ...(extra.mergeReasons || []), reason],
+    uncertain: Boolean(base.uncertain || extra.uncertain)
+  };
+}
+
+function hasStrongVisionQuestionBeforeFirstOcrAnchor(candidate, ocrBands, imageHeight) {
+  const firstBand = (Array.isArray(ocrBands) ? ocrBands : [])
+    .filter((band) => band?.sourceQuestionNumber && Number.isFinite(Number(band.startY)))
+    .sort((a, b) => Number(a.startY) - Number(b.startY))[0];
+  if (!firstBand || !candidate?.box) return false;
+
+  const modelNumber = Number(candidate.sourceQuestionNumber);
+  const firstOcrNumber = Number(firstBand.sourceQuestionNumber);
+  const modelBoxes = Array.isArray(candidate.rawModelBoxes) ? candidate.rawModelBoxes : [];
+  const minimumHeight = Math.max(18, Number(imageHeight) * 0.02);
+  return Number.isInteger(modelNumber) &&
+    Number.isInteger(firstOcrNumber) &&
+    modelNumber < firstOcrNumber &&
+    Number(candidate.box.y) < Number(firstBand.startY) &&
+    Number(candidate.box.h) >= minimumHeight &&
+    modelBoxes.length > 0 &&
+    hasQuestionStemEvidence(candidate.summary || candidate.text);
+}
+
+function normalizeQuestionRegions(visionQuestions, ocrBands, blocks, width, height) {
+  const visual = normalizeVisualQuestionRegions(visionQuestions, width, height);
+  const numberingContext = createQuestionNumberContext(blocks, width, height);
+  visual.forEach((candidate) => {
+    const lines = blocks
+      .filter((block) => block.y + block.h / 2 >= candidate.box.y && block.y + block.h / 2 <= candidate.box.y + candidate.box.h)
+      .sort((a, b) => a.y - b.y || a.x - b.x);
+    const firstNumberedLine = lines.find(
+      (line) => isSubQuestionNumber(line.text) || isMainQuestionNumber(line.text, line, numberingContext)
+    );
+    const markerText = firstNumberedLine?.text || candidate.summary;
+    const markerY = firstNumberedLine?.y ?? candidate.box.y;
+    const parentBand = [...ocrBands]
+      .filter((band) => band.startY <= markerY && markerY < band.nextStartY)
+      .sort((a, b) => b.startY - a.startY)[0];
+    if (hasStrongVisionQuestionBeforeFirstOcrAnchor(candidate, ocrBands, height)) {
+      candidate.questionRole = "mainQuestion";
+      candidate.parentQuestionNumber = "";
+      candidate.uncertain = true;
+      candidate.evidenceSource = "vision-structure-before-first-ocr-anchor";
+      candidate.mergeReasons.push("OCR漏掉页面首题题号，保留已有视觉题号与完整结构区域");
+      console.log(
+        `[vision-anchor] preserve Q${candidate.sourceQuestionNumber} before first OCR anchor Q${ocrBands[0]?.sourceQuestionNumber || "?"}`
+      );
+      return;
+    }
+    if (isSubQuestionNumber(markerText)) {
+      const subQuestionNumber = extractSubQuestionNumber(markerText);
+      candidate.questionRole = "subQuestion";
+      candidate.parentQuestionNumber = parentBand?.sourceQuestionNumber || "";
+      candidate.sourceQuestionNumber = candidate.parentQuestionNumber;
+      candidate.subQuestions = subQuestionNumber ? [subQuestionNumber] : [];
+      candidate.text = lines.map((line) => line.text).join(" ") || candidate.text;
+      candidate.mergeReasons.push(`小问（${subQuestionNumber || "?"}）归属最近主问题 Q${candidate.parentQuestionNumber || "?"}`);
+      console.log(`[numbering] text="${String(markerText).slice(0, 40)}" type=subQuestion parent=${candidate.parentQuestionNumber || "?"}`);
+      return;
+    }
+
+    const mainInfo = firstNumberedLine
+      ? getQuestionNumberStartInfo(firstNumberedLine.text, firstNumberedLine, numberingContext)
+      : null;
+    if (mainInfo) {
+      candidate.questionRole = "mainQuestion";
+      candidate.parentQuestionNumber = "";
+      candidate.sourceQuestionNumber = mainInfo.number;
+      return;
+    }
+
+    if (parentBand) {
+      candidate.questionRole = "supportingContent";
+      candidate.parentQuestionNumber = parentBand.sourceQuestionNumber;
+      candidate.sourceQuestionNumber = "";
+      candidate.text = lines.map((line) => line.text).join(" ") || candidate.text;
+      candidate.mergeReasons.push(`无合法主问题号的图表/公式/续接区域归入 Q${parentBand.sourceQuestionNumber}`);
+      console.log(`[block] type=tableOrFigure`);
+      console.log(`[parent] assigned to Q${parentBand.sourceQuestionNumber}`);
+      return;
+    }
+
+    candidate.questionRole = "supportingContent";
+    candidate.parentQuestionNumber = "";
+    candidate.sourceQuestionNumber = "";
+    candidate.uncertain = true;
+    candidate.mergeReasons.push("未发现合法正文题号，禁止根据模型编号独立成题");
+    console.log(`[render] fake Q${normalizeSourceQuestionNumber(candidate.sourceQuestionNumber) || "?"} prevented`);
+  });
+  const usedVisual = new Set();
+  const candidates = [];
+
+  for (const band of ocrBands) {
+    let matchIndex = visual.findIndex(
+      (candidate, index) =>
+        !usedVisual.has(index) &&
+        candidate.questionRole !== "subQuestion" &&
+        candidate.sourceQuestionNumber === band.sourceQuestionNumber
+    );
+    if (matchIndex < 0) {
+      let bestScore = 0;
+      visual.forEach((candidate, index) => {
+        if (usedVisual.has(index) || candidate.sourceQuestionNumber || candidate.questionRole === "subQuestion") return;
+        const overlap = boxIntersectionArea(candidate.box, band.box) / Math.max(1, candidate.box.w * candidate.box.h);
+        if (overlap > bestScore) {
+          bestScore = overlap;
+          matchIndex = index;
+        }
+      });
+      if (bestScore < 0.18) matchIndex = -1;
+    }
+
+    const ocrCandidate = {
+      sourceQuestionNumber: band.sourceQuestionNumber,
+      questionRole: "mainQuestion",
+      parentQuestionNumber: "",
+      subQuestions: band.subQuestions || [],
+      summary: band.text.slice(0, 100),
+      type: band.optionLabels.length ? "选择题" : "未知",
+      text: band.text,
+      stemBoxes: [],
+      optionBoxes: [],
+      otherBoxes: [],
+      rawModelBoxes: [],
+      ocrLineIndexes: band.lineIndexes,
+      optionLabels: band.optionLabels,
+      box: band.box,
+      expectedBand: band,
+      mergeReasons: ["OCR 从当前题号收集到下一题题号之前"],
+      uncertain: false
+    };
+    if (matchIndex >= 0) {
+      usedVisual.add(matchIndex);
+      const merged = mergeQuestionCandidate(visual[matchIndex], ocrCandidate, width, height, "视觉题干/选项与 OCR 题号区间合并");
+      merged.expectedBand = band;
+      candidates.push(merged);
+    } else {
+      candidates.push(ocrCandidate);
+    }
+  }
+
+  visual.forEach((candidate, index) => {
+    if (!usedVisual.has(index)) candidates.push(candidate);
+  });
+  return candidates.sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x);
+}
+
+function mergeQuestionRegions(candidates, width, height) {
+  const nextKnownStarts = new Array(candidates.length).fill(Number.POSITIVE_INFINITY);
+  let nextKnownStart = Number.POSITIVE_INFINITY;
+  for (let index = candidates.length - 1; index >= 0; index -= 1) {
+    nextKnownStarts[index] = nextKnownStart;
+    if (candidates[index].sourceQuestionNumber) nextKnownStart = getQuestionStartY(candidates[index]);
+  }
+
+  const result = [];
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidate = candidates[candidateIndex];
+    const previous = result[result.length - 1];
+    if (!previous) {
+      result.push(candidate);
+      continue;
+    }
+    const sameNumber = previous.sourceQuestionNumber && previous.sourceQuestionNumber === candidate.sourceQuestionNumber;
+    const differentKnownNumbers = previous.sourceQuestionNumber && candidate.sourceQuestionNumber && !sameNumber;
+    const gap = candidate.box.y - (previous.box.y + previous.box.h);
+    const closeVertically = gap <= height * 0.045;
+    const horizontalOverlap = horizontalOverlapRatio(previous.box, candidate.box);
+    const sameNumberSimilarity = textJaccardSimilarity(previous.text || previous.summary, candidate.text || candidate.summary);
+    const sameNumberMergeable = sameNumber && (
+      sameNumberSimilarity > 0.35 || closeVertically || boxContainmentRatio(previous.box, candidate.box) > 0.25
+    );
+    const previousIncompleteOptions = previous.optionLabels.length > 0 && previous.optionLabels.length < 4;
+    const candidateStartsWithOption = /^[\s]*[A-D]\s*[.\uFF0E\u3001]/i.test(candidate.text || "");
+    const candidateStartsNewQuestion = Boolean(getQuestionNumberStartInfo(candidate.text || ""));
+    const textContinues = /[,，:：\uFF08(\/+\-=]$/.test(String(previous.text || "").trim());
+    const nextBoundary = nextKnownStarts[candidateIndex];
+    const staysInsideBoundary = !Number.isFinite(nextBoundary) || candidate.box.y < nextBoundary;
+    const shouldMerge = !differentKnownNumbers && (!candidateStartsNewQuestion || sameNumber) && staysInsideBoundary && (
+      sameNumberMergeable ||
+      (closeVertically && horizontalOverlap > 0.5 && (candidateStartsWithOption || previousIncompleteOptions || textContinues))
+    );
+    if (shouldMerge) {
+      const reason = candidate.questionRole === "subQuestion"
+        ? `小问（${candidate.subQuestions?.join("、") || "?"}）合并到 Q${previous.sourceQuestionNumber || "?"}`
+        : sameNumber
+        ? "相同原题号区域合并"
+        : candidateStartsWithOption
+          ? "下一区域以选项开头，归入上一题"
+          : "相邻区域横向重叠且语义连续";
+      result[result.length - 1] = mergeQuestionCandidate(previous, candidate, width, height, reason, nextBoundary);
+      if (candidate.questionRole === "subQuestion") {
+        console.log(`[merge] subQuestion（${candidate.subQuestions?.join("、") || "?"}） merged into Q${previous.sourceQuestionNumber || "?"}`);
+      }
+    } else {
+      if (sameNumber) {
+        previous.uncertain = true;
+        candidate.uncertain = true;
+        previous.mergeReasons = [...(previous.mergeReasons || []), "相同题号但内容与位置差异明显，保留并标记待确认"];
+      }
+      result.push(candidate);
+    }
+  }
+  return result;
+}
+
+function deduplicateQuestions(candidates, width, height) {
+  const kept = [];
+  const removed = [];
+  for (const candidate of candidates) {
+    let duplicateIndex = -1;
+    let duplicateReason = "";
+    for (let index = 0; index < kept.length; index += 1) {
+      const existing = kept[index];
+      const sameNumber = candidate.sourceQuestionNumber && candidate.sourceQuestionNumber === existing.sourceQuestionNumber;
+      const textSimilarity = textJaccardSimilarity(candidate.text || candidate.summary, existing.text || existing.summary);
+      const iou = boxIou(candidate.box, existing.box);
+      const containment = boxContainmentRatio(candidate.box, existing.box);
+      if (sameNumber && textSimilarity > 0.75) {
+        duplicateIndex = index;
+        duplicateReason = `题号相同且文本相似度 ${textSimilarity.toFixed(2)}`;
+        break;
+      }
+      if (iou > 0.6 && textSimilarity > 0.55) {
+        duplicateIndex = index;
+        duplicateReason = `IoU ${iou.toFixed(2)} 且文本相似`;
+        break;
+      }
+      if (containment > 0.82 && textSimilarity > 0.65) {
+        duplicateIndex = index;
+        duplicateReason = `区域包含率 ${containment.toFixed(2)} 且题干相同`;
+        break;
+      }
+      if (sameNumber && textSimilarity < 0.35 && iou < 0.2) {
+        existing.uncertain = true;
+        candidate.uncertain = true;
+      }
+    }
+    if (duplicateIndex < 0) {
+      kept.push(candidate);
+      continue;
+    }
+    const existing = kept[duplicateIndex];
+    const existingScore = existing.box.w * existing.box.h + existing.optionLabels.length * width * height * 0.02;
+    const candidateScore = candidate.box.w * candidate.box.h + candidate.optionLabels.length * width * height * 0.02;
+    const preferred = existingScore >= candidateScore ? existing : candidate;
+    const discarded = preferred === existing ? candidate : existing;
+    preferred.mergeReasons = [...(preferred.mergeReasons || []), `去重保留更完整区域：${duplicateReason}`];
+    kept[duplicateIndex] = preferred;
+    removed.push({ box: discarded.box, sourceQuestionNumber: discarded.sourceQuestionNumber, reason: duplicateReason });
+  }
+  return { questions: kept.sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x), removed };
+}
+
+function validateQuestionCrop(candidate, nextCandidate, blocks, width, height) {
+  const validation = [];
+  const originalBottom = candidate.box.y + candidate.box.h;
+  const questionStartY = getQuestionStartY(candidate);
+  let box = unionPixelBoxes([candidate.box, candidate.expectedBand?.box], width, height) || candidate.box;
+  box = padPixelBox(box, width, height);
+  const topPadding = Math.max(2, height * 0.006);
+  const finalTop = Math.max(box.y, questionStartY - topPadding);
+  box = clampPixelBox({ ...box, y: finalTop, h: box.y + box.h - finalTop }, width, height) || box;
+  const nextCandidateAnchorStart = Number(nextCandidate?.expectedBand?.startY);
+  const nextStarts = [
+    Number(candidate.expectedBand?.nextStartY),
+    Number(nextCandidate ? getQuestionStartY(nextCandidate) : Number.NaN),
+    Number.isFinite(nextCandidateAnchorStart) ? Number.NaN : Number(nextCandidate?.box?.y)
+  ].filter((value) => Number.isFinite(value) && value > questionStartY + 1);
+  const nextStart = nextStarts.length ? Math.min(...nextStarts) : Number.POSITIVE_INFINITY;
+  const boundaryGap = getBoundaryGap(height);
+  if (Number.isFinite(nextStart) && box.y + box.h >= nextStart - boundaryGap) {
+    box = clampPixelBox({ ...box, h: Math.max(12, nextStart - boundaryGap - box.y) }, width, height) || box;
+    validation.push("已按下一题题号修正底边");
+  }
+
+  const includedIndexes = blocks
+    .map((block, index) => ({ block, index, center: block.y + block.h / 2 }))
+    .filter((item) => item.center >= box.y && item.center <= box.y + box.h)
+    .map((item) => item.index);
+  const includedText = includedIndexes.map((index) => blocks[index]?.text || "").join(" ");
+  const optionLabels = [...new Set([...candidate.optionLabels, ...extractOptionLabels(includedText)])];
+  const isChoice = candidate.type === "选择题" || optionLabels.length > 0;
+  const hasStem = normalizeSimilarityText(candidate.text || includedText).length >= 6;
+  const problems = [];
+  if (!hasStem) problems.push("未确认完整题干");
+  if (isChoice && optionLabels.length < 2) problems.push("选择题选项少于两个");
+  if (isChoice && candidate.expectedBand?.optionLabels?.length > optionLabels.length) problems.push("存在选项截断风险");
+  if (candidate.uncertain) problems.push("相同题号存在内容差异");
+  validation.push(problems.length ? `需要确认：${problems.join("；")}` : "完整性检查通过");
+
+  return {
+    ...candidate,
+    optionLabels,
+    finalBox: {
+      x: Math.round(box.x), y: Math.round(box.y), w: Math.round(box.w), h: Math.round(box.h)
+    },
+    originalBottom,
+    questionStartY,
+    nextQuestionStart: Number.isFinite(nextStart) ? nextStart : null,
+    needsReview: problems.length > 0,
+    validation,
+    ocrLineIndexes: [...new Set([...(candidate.ocrLineIndexes || []), ...includedIndexes])]
+  };
+}
+
+async function callVisionQuestionStructure(image) {
+  return callQwenMultimodalJson({
+    model: QWEN_VL_MODEL,
+    schema: visionQuestionStructureSchema,
+    instructions: VISION_QUESTION_STRUCTURE_PROMPT,
+    content: [
+      { type: "input_text", text: "完整阅读整页试卷，先确认所有题目结构，再统一返回题干、选项和其他区域。" },
+      { type: "input_image", label: "整页试卷原图", image_url: image, detail: "high" }
+    ],
+    maxOutputTokens: 5000
+  });
+}
+
+function buildFinalQuestionPayload(validated, blocks, width, height, displayIndex) {
+  const finalBox = validated.finalBox;
+  const text = validated.text || validated.summary || "";
+  const knowledge = inferKnowledgeFromText(text);
+  return {
+    ...finalBox,
+    finalBox,
+    originalBottom: Math.round(validated.originalBottom ?? finalBox.y + finalBox.h),
+    questionStartY: Math.round(validated.questionStartY ?? finalBox.y),
+    nextQuestionStart: Number.isFinite(validated.nextQuestionStart) ? Math.round(validated.nextQuestionStart) : null,
+    number: validated.sourceQuestionNumber,
+    questionNumber: validated.sourceQuestionNumber,
+    sourceQuestionNumber: validated.sourceQuestionNumber,
+    questionRole: validated.questionRole || "mainQuestion",
+    parentQuestionNumber: validated.parentQuestionNumber || "",
+    subQuestions: [...new Set(validated.subQuestions || [])],
+    displayIndex,
+    title: validated.summary || text.slice(0, 100) || `题目 ${displayIndex}`,
+    problemText: validated.summary || text.slice(0, 100),
+    type: validated.type,
+    problemType: validated.type,
+    knowledge,
+    mainKnowledgePoint: knowledge,
+    knowledgePoints: knowledge ? [knowledge] : [],
+    confidence: validated.needsReview ? 0.55 : 0.9,
+    needsReview: validated.needsReview,
+    uncertain: validated.uncertain,
+    validation: validated.validation,
+    mergeReasons: validated.mergeReasons,
+    optionLabels: validated.optionLabels,
+    rawModelBoxes: validated.rawModelBoxes,
+    ocrLineBoxes: validated.ocrLineIndexes.map((index) => ({ index, ...blocks[index] })).filter((item) => item.text),
+    generatedBy: "vision-ocr-question-merge"
+  };
+}
+
+function validateNonOverlappingQuestions(questions, width, height) {
+  const boundaryGap = getBoundaryGap(height);
+  const minimumHeight = Math.max(18, Math.round(height * 0.02));
+  const sorted = (Array.isArray(questions) ? questions : [])
+    .map((question) => ({ ...question, finalBox: { ...question.finalBox } }))
+    .sort((a, b) => a.finalBox.y - b.finalBox.y || a.finalBox.x - b.finalBox.x);
+
+  for (let index = 0; index < sorted.length - 1; index += 1) {
+    const current = sorted[index];
+    const next = sorted[index + 1];
+    const nextTop = Number.isFinite(Number(next.questionStartY)) ? Number(next.questionStartY) : next.finalBox.y;
+    const currentBottom = current.finalBox.y + current.finalBox.h;
+    const overlaps = currentBottom > nextTop - boundaryGap;
+    console.log(`[boundary] Q${current.sourceQuestionNumber || current.displayIndex} original bottom: ${Math.round(current.originalBottom ?? currentBottom)}`);
+    console.log(`[boundary] Q${next.sourceQuestionNumber || next.displayIndex} start: ${Math.round(nextTop)}`);
+    console.log(`[boundary] Q${current.sourceQuestionNumber || current.displayIndex} overlaps Q${next.sourceQuestionNumber || next.displayIndex}: ${overlaps}`);
+
+    if (!overlaps) continue;
+    const correctedBottom = Math.max(current.finalBox.y + 1, nextTop - boundaryGap);
+    const correctedHeight = correctedBottom - current.finalBox.y;
+    current.finalBox.h = Math.max(1, Math.round(correctedHeight));
+    current.x = current.finalBox.x;
+    current.y = current.finalBox.y;
+    current.w = current.finalBox.w;
+    current.h = current.finalBox.h;
+    current.nextQuestionStart = Math.round(nextTop);
+    current.validation = [...(current.validation || []), "防重叠校验：底边已截断到下一题题号之前"];
+    if (correctedHeight < minimumHeight) {
+      current.needsReview = true;
+      current.validation.push("需要确认：硬边界截断后题目高度过小");
+    }
+    console.log(`[boundary] Q${current.sourceQuestionNumber || current.displayIndex} corrected bottom: ${Math.round(correctedBottom)}`);
+  }
+
+  return sorted.map((question, index) => ({ ...question, displayIndex: index + 1 }));
+}
+
+function attachSupportingContentResults(questions, width, height) {
+  const sorted = (Array.isArray(questions) ? questions : []).sort(
+    (a, b) => a.finalBox.y - b.finalBox.y || a.finalBox.x - b.finalBox.x
+  );
+  const result = [];
+  let currentMainQuestion = null;
+  const mainQuestionsByNumber = new Map();
+  for (const question of sorted) {
+    if (!isSupportingQuestionRole(question.questionRole)) {
+      currentMainQuestion = question;
+      if (question.sourceQuestionNumber) mainQuestionsByNumber.set(String(question.sourceQuestionNumber), question);
+      result.push(question);
+      continue;
+    }
+    const explicitParent = question.parentQuestionNumber
+      ? mainQuestionsByNumber.get(String(question.parentQuestionNumber))
+      : null;
+    const parent = explicitParent || currentMainQuestion;
+    if (!parent) {
+      console.log(`[render] standalone card skipped`);
+      console.log(`[render] fake Q${question.sourceQuestionNumber || question.displayIndex || "?"} prevented`);
+      continue;
+    }
+    const mergedBox = unionPixelBoxes([parent.finalBox, question.finalBox], width, height);
+    if (mergedBox) {
+      parent.finalBox = {
+        x: Math.round(mergedBox.x), y: Math.round(mergedBox.y), w: Math.round(mergedBox.w), h: Math.round(mergedBox.h)
+      };
+      parent.x = parent.finalBox.x;
+      parent.y = parent.finalBox.y;
+      parent.w = parent.finalBox.w;
+      parent.h = parent.finalBox.h;
+    }
+    parent.subQuestions = [...new Set([...(parent.subQuestions || []), ...(question.subQuestions || [])])];
+    parent.mergeReasons = [
+      ...(parent.mergeReasons || []),
+      question.questionRole === "subQuestion"
+        ? `独立小问（${question.subQuestions?.join("、") || "?"}）并入父题`
+        : "表格、图形、公式或续接区域并入父题"
+    ];
+    if (question.questionRole === "subQuestion") {
+      console.log(`[merge] subQuestion（${question.subQuestions?.join("、") || "?"}） merged into Q${parent.sourceQuestionNumber || "?"}`);
+    } else {
+      console.log(`[merge] table continuation merged into Q${parent.sourceQuestionNumber || "?"}`);
+    }
+    console.log(`[render] standalone card skipped`);
+  }
+  return result;
+}
+
+function getAnchorFinalBox(anchor, blocks, width, height) {
+  const boundaryGap = getBoundaryGap(height);
+  const topPadding = Math.max(2, Math.round(height * 0.007));
+  const horizontalPadding = Math.max(8, Math.round(width * 0.015));
+  const anchorLines = (anchor.lineIndexes || []).map((index) => blocks[index]).filter(Boolean);
+  const contentLines = anchorLines.length ? anchorLines : blocks;
+  const contentBox = unionPixelBoxes(contentLines, width, height) || anchor.box || { x: 0, y: anchor.startY, w: width, h: 1 };
+  const top = Math.max(0, Math.round(anchor.startY - topPadding));
+  const nextStart = Number(anchor.nextStartY);
+  const bottom = Number.isFinite(nextStart) && nextStart < height
+    ? Math.max(top + 1, Math.round(nextStart - boundaryGap))
+    : height;
+  const left = Math.max(0, Math.round(contentBox.x - horizontalPadding));
+  const right = Math.min(width, Math.round(contentBox.x + contentBox.w + horizontalPadding));
+  return { x: left, y: top, w: Math.max(1, right - left), h: Math.max(1, bottom - top) };
+}
+
+function alignQuestionToAnchor(question, anchor, blocks, width, height) {
+  const anchorBox = getAnchorFinalBox(anchor, blocks, width, height);
+  const originalBottom = question.finalBox.y + question.finalBox.h;
+  const mergedHorizontal = unionPixelBoxes([
+    { ...question.finalBox, y: anchorBox.y, h: anchorBox.h },
+    anchorBox
+  ], width, height) || anchorBox;
+  const finalBox = {
+    x: mergedHorizontal.x,
+    y: anchorBox.y,
+    w: mergedHorizontal.w,
+    h: anchorBox.h
+  };
+  const truncated = originalBottom >= Number(anchor.nextStartY) - getBoundaryGap(height);
+  console.log(`[boundary] Q${anchor.sourceQuestionNumber} originalBottom=${Math.round(originalBottom)}`);
+  if (Number(anchor.nextStartY) < height) {
+    if (anchor.nextQuestionNumber) {
+      console.log(`[boundary] Q${anchor.nextQuestionNumber} startY=${Math.round(anchor.nextStartY)}`);
+    }
+    console.log(`[boundary] Q${anchor.sourceQuestionNumber} nextStartY=${Math.round(anchor.nextStartY)}`);
+  }
+  console.log(`[boundary] Q${anchor.sourceQuestionNumber} truncated=${truncated}`);
+  console.log(`[boundary] Q${anchor.sourceQuestionNumber} correctedBottom=${Math.round(finalBox.y + finalBox.h)}`);
+  return {
+    ...question,
+    ...finalBox,
+    finalBox,
+    number: anchor.sourceQuestionNumber,
+    questionNumber: anchor.sourceQuestionNumber,
+    sourceQuestionNumber: anchor.sourceQuestionNumber,
+    questionRole: "mainQuestion",
+    evidenceSource: "ocr-anchor",
+    parentQuestionNumber: "",
+    subQuestions: [...new Set([...(question.subQuestions || []), ...(anchor.subQuestions || [])])],
+    questionStartY: Math.round(anchor.startY),
+    nextQuestionStart: Number(anchor.nextStartY) < height ? Math.round(anchor.nextStartY) : null,
+    optionLabels: [...new Set([...(question.optionLabels || []), ...(anchor.optionLabels || [])])],
+    mergeReasons: [...(question.mergeReasons || []), "按 OCR 主问题号锚点校准题目区间"],
+    validation: [...(question.validation || []), "题目范围已限制在相邻 OCR 主问题号之间"],
+    ocrLineBoxes: (anchor.lineIndexes || []).map((index) => ({ index, ...blocks[index] })).filter((line) => line.text)
+  };
+}
+
+function createQuestionFromAnchor(anchor, blocks, width, height, displayIndex) {
+  const finalBox = getAnchorFinalBox(anchor, blocks, width, height);
+  const text = String(anchor.text || "").trim();
+  const optionLabels = Array.isArray(anchor.optionLabels) ? anchor.optionLabels : extractOptionLabels(text);
+  const needsReview = normalizeSimilarityText(text).length < 6;
+  const knowledge = inferKnowledgeFromText(text);
+  console.log(`[rebuild] created Q${anchor.sourceQuestionNumber} from OCR anchors`);
+  console.log(`[rebuild] Q${anchor.sourceQuestionNumber} top=${finalBox.y}`);
+  console.log(`[rebuild] Q${anchor.sourceQuestionNumber} bottom=${finalBox.y + finalBox.h}`);
+  return {
+    ...finalBox,
+    finalBox,
+    originalBottom: finalBox.y + finalBox.h,
+    questionStartY: Math.round(anchor.startY),
+    nextQuestionStart: Number(anchor.nextStartY) < height ? Math.round(anchor.nextStartY) : null,
+    number: anchor.sourceQuestionNumber,
+    questionNumber: anchor.sourceQuestionNumber,
+    sourceQuestionNumber: anchor.sourceQuestionNumber,
+    questionRole: "mainQuestion",
+    parentQuestionNumber: "",
+    subQuestions: [...new Set(anchor.subQuestions || [])],
+    displayIndex,
+    title: text.slice(0, 100) || `题目 ${anchor.sourceQuestionNumber}`,
+    problemText: text.slice(0, 100),
+    type: optionLabels.length ? "选择题" : "未知",
+    problemType: optionLabels.length ? "选择题" : "未知",
+    knowledge,
+    mainKnowledgePoint: knowledge,
+    knowledgePoints: knowledge ? [knowledge] : [],
+    confidence: needsReview ? 0.62 : 0.88,
+    needsReview,
+    uncertain: false,
+    validation: [needsReview ? "需要确认：OCR 锚点题干较短" : "由 OCR 主问题号锚点补建，完整性检查通过"],
+    mergeReasons: ["AI 未保留独立题目，使用现有 OCR 主问题号区间补建"],
+    optionLabels,
+    rawModelBoxes: [],
+    ocrLineBoxes: (anchor.lineIndexes || []).map((index) => ({ index, ...blocks[index] })).filter((line) => line.text),
+    generatedBy: "ocr-anchor-rebuild",
+    generatedFrom: "ocr-anchor",
+    isPrimary: true
+  };
+}
+
+function reconcileQuestionsWithOcrAnchors(questions, anchors, blocks, width, height, { alignExisting = true } = {}) {
+  const sortedAnchors = (Array.isArray(anchors) ? anchors : [])
+    .filter((anchor) => anchor.sourceQuestionNumber)
+    .sort((a, b) => a.startY - b.startY);
+  if (!sortedAnchors.length) return questions;
+
+  const source = Array.isArray(questions) ? questions : [];
+  const byNumber = new Map();
+  source.forEach((question) => {
+    if (question.questionRole !== "mainQuestion" || !question.sourceQuestionNumber) return;
+    const number = String(question.sourceQuestionNumber);
+    if (!byNumber.has(number)) byNumber.set(number, []);
+    byNumber.get(number).push(question);
+  });
+  const anchorNumbers = sortedAnchors.map((anchor) => String(anchor.sourceQuestionNumber));
+  const aiNumbers = [...byNumber.keys()];
+  const missingNumbers = anchorNumbers.filter((number) => !byNumber.has(number));
+  console.log(`[sequence] anchors=[${anchorNumbers.join(",")}]`);
+  console.log(`[sequence] aiQuestions=[${aiNumbers.join(",")}]`);
+  console.log(`[sequence] missing=[${missingNumbers.join(",")}]`);
+  sortedAnchors.forEach((anchor) => console.log(`[anchor] found Q${anchor.sourceQuestionNumber} at y=${Math.round(anchor.startY)}`));
+
+  const anchorByNumber = new Map(sortedAnchors.map((anchor) => [String(anchor.sourceQuestionNumber), anchor]));
+  const aligned = source.map((question) => {
+    const anchor = anchorByNumber.get(String(question.sourceQuestionNumber || ""));
+    if (!alignExisting || !anchor || question.questionRole !== "mainQuestion") return question;
+    return alignQuestionToAnchor(question, anchor, blocks, width, height);
+  });
+  missingNumbers.forEach((number) => {
+    aligned.push(createQuestionFromAnchor(anchorByNumber.get(number), blocks, width, height, aligned.length + 1));
+  });
+  return aligned
+    .sort((a, b) => a.finalBox.y - b.finalBox.y || a.finalBox.x - b.finalBox.x)
+    .map((question, index) => ({ ...question, displayIndex: index + 1 }));
+}
+
+function validateQuestionSequence(questions, anchors, blocks, width, height) {
+  return reconcileQuestionsWithOcrAnchors(questions, anchors, blocks, width, height, { alignExisting: false });
+}
+
+function getBoundaryAnchorInfo(anchor, fallbackNextTop = Number.NaN) {
+  const sourceQuestionNumber = String(anchor?.sourceQuestionNumber || anchor?.questionNumber || "").trim();
+  const top = Number(anchor?.top ?? anchor?.startY);
+  const nextStartY = Number(anchor?.nextStartY ?? fallbackNextTop);
+  if (!sourceQuestionNumber || !Number.isFinite(top)) return null;
+  return { ...anchor, sourceQuestionNumber, questionNumber: sourceQuestionNumber, top, startY: top, nextStartY };
+}
+
+function logQuestionCoordinateStage(stage, questions, boxField = "finalBox") {
+  (Array.isArray(questions) ? questions : []).forEach((question) => {
+    const number = String(question?.sourceQuestionNumber || question?.questionNumber || question?.number || "?");
+    const box = boxField === "box" ? question?.box : question?.finalBox;
+    if (!box) return;
+    const top = Number(box.y);
+    const bottom = top + Number(box.h);
+    console.log(`[Q${number}][${stage}] top=${Math.round(top)} bottom=${Math.round(bottom)} x=${Math.round(Number(box.x) || 0)} w=${Math.round(Number(box.w) || 0)}`);
+  });
+}
+
+function createMinimalQuestionFromBoundaryAnchor(anchor, nextTop, questions, context, displayIndex) {
+  const { blocks = [], width = 0, height = 0 } = context || {};
+  const normalizedAnchor = {
+    ...anchor,
+    sourceQuestionNumber: String(anchor.sourceQuestionNumber),
+    startY: Number(anchor.top),
+    nextStartY: Number.isFinite(nextTop) ? nextTop : (Number(anchor.nextStartY) || height),
+    lineIndexes: anchor.lineIndexes || [],
+    text: anchor.text || "",
+    optionLabels: anchor.optionLabels || [],
+    subQuestions: anchor.subQuestions || []
+  };
+  if (width > 0 && height > 0) {
+    return createQuestionFromAnchor(normalizedAnchor, blocks, width, height, displayIndex);
+  }
+
+  const template = (Array.isArray(questions) ? questions : []).find((question) => question?.finalBox) || {};
+  const templateBox = template.finalBox || {};
+  const top = Math.round(Number(anchor.top));
+  const bottom = Number.isFinite(nextTop)
+    ? Math.max(top + 1, Math.round(nextTop - 1))
+    : Math.max(top + 1, Math.round(top + Number(templateBox.h || 1)));
+  const finalBox = {
+    x: Math.round(Number(templateBox.x) || 0),
+    y: top,
+    w: Math.max(1, Math.round(Number(templateBox.w) || 1)),
+    h: Math.max(1, bottom - top)
+  };
+  return {
+    ...finalBox,
+    finalBox,
+    number: normalizedAnchor.sourceQuestionNumber,
+    questionNumber: normalizedAnchor.sourceQuestionNumber,
+    sourceQuestionNumber: normalizedAnchor.sourceQuestionNumber,
+    questionRole: "mainQuestion",
+    displayIndex,
+    generatedFrom: "ocr-anchor",
+    generatedBy: "ocr-anchor-rebuild",
+    isPrimary: true,
+    needsReview: false,
+    validation: [],
+    mergeReasons: ["Created from an existing OCR question-number anchor"],
+    optionLabels: [],
+    subQuestions: [],
+    ocrLineBoxes: []
+  };
+}
+
+function normalizeMainQuestionAnchorList(anchors = []) {
+  const normalized = (Array.isArray(anchors) ? anchors : [])
+    .map((anchor, index, list) => getBoundaryAnchorInfo(
+      anchor,
+      list[index + 1]?.top ?? list[index + 1]?.startY
+    ))
+    .filter(Boolean)
+    .sort((a, b) => a.top - b.top || Number(a.sourceQuestionNumber) - Number(b.sourceQuestionNumber));
+  const seen = new Set();
+  return normalized.filter((anchor) => {
+    const key = `${anchor.sourceQuestionNumber}:${Math.round(anchor.top)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getMainQuestionAnchorsInsideBox(box, anchors = []) {
+  if (!box) return [];
+  const top = Number(box.y);
+  const bottom = top + Number(box.h);
+  if (!Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= top) return [];
+  return normalizeMainQuestionAnchorList(anchors).filter(
+    (anchor) => anchor.top >= top && anchor.top < bottom
+  );
+}
+
+function splitQuestionCandidatesByMainQuestionAnchors(questions, anchors, context = {}) {
+  const sortedAnchors = normalizeMainQuestionAnchorList(anchors);
+  if (!sortedAnchors.length) return Array.isArray(questions) ? questions : [];
+  const source = Array.isArray(questions) ? questions : [];
+  const splitResults = [];
+  let didSplit = false;
+
+  for (const question of source) {
+    const candidateBox = question?.finalBox || question?.box;
+    const anchorsInside = getMainQuestionAnchorsInsideBox(candidateBox, sortedAnchors);
+    if (anchorsInside.length < 2) {
+      splitResults.push(question);
+      continue;
+    }
+
+    didSplit = true;
+    console.log(
+      `[multi-anchor-split] candidate=${question.sourceQuestionNumber || question.displayIndex || "?"} anchors=[${anchorsInside.map((anchor) => anchor.sourceQuestionNumber).join(",")}]`
+    );
+    for (const anchor of anchorsInside) {
+      const anchorIndex = sortedAnchors.findIndex((candidate) =>
+        candidate.sourceQuestionNumber === anchor.sourceQuestionNumber &&
+        candidate.top === anchor.top
+      );
+      const nextAnchor = sortedAnchors[anchorIndex + 1];
+      const rebuilt = createMinimalQuestionFromBoundaryAnchor(
+        anchor,
+        Number(nextAnchor?.top),
+        source,
+        context,
+        splitResults.length + 1
+      );
+      const sameQuestion = String(question.sourceQuestionNumber || "") === String(anchor.sourceQuestionNumber);
+      splitResults.push({
+        ...rebuilt,
+        ...(sameQuestion ? {
+          title: question.title,
+          problemText: question.problemText,
+          type: question.type,
+          problemType: question.problemType,
+          knowledge: question.knowledge,
+          mainKnowledgePoint: question.mainKnowledgePoint,
+          knowledgePoints: question.knowledgePoints,
+          confidence: question.confidence,
+          rawModelBoxes: question.rawModelBoxes || []
+        } : {}),
+        sourceQuestionNumber: String(anchor.sourceQuestionNumber),
+        questionNumber: String(anchor.sourceQuestionNumber),
+        number: String(anchor.sourceQuestionNumber),
+        questionRole: "mainQuestion",
+        generatedFrom: "multi-anchor-split",
+        generatedBy: "local-main-question-anchor-split",
+        mergeReasons: [
+          ...(sameQuestion ? question.mergeReasons || [] : rebuilt.mergeReasons || []),
+          `候选区域包含 ${anchorsInside.length} 个合法主问题号，已按 OCR 锚点拆分`
+        ]
+      });
+    }
+  }
+
+  if (!didSplit) return source;
+
+  const primaryByNumber = new Map();
+  for (const question of splitResults) {
+    const number = String(question?.sourceQuestionNumber || "");
+    if (!number) continue;
+    const existing = primaryByNumber.get(number);
+    if (!existing || (
+      existing.generatedFrom === "multi-anchor-split" &&
+      question.generatedFrom !== "multi-anchor-split"
+    )) {
+      primaryByNumber.set(number, question);
+    }
+  }
+  const deduplicated = splitResults.filter((question) => {
+    const number = String(question?.sourceQuestionNumber || "");
+    return !number || primaryByNumber.get(number) === question;
+  });
+  const ordered = deduplicated
+    .sort((a, b) => Number(a?.finalBox?.y ?? a?.box?.y ?? 0) - Number(b?.finalBox?.y ?? b?.box?.y ?? 0))
+    .map((question, index) => ({ ...question, displayIndex: index + 1 }));
+  if (Number(context.width) > 0 && Number(context.height) > 0) {
+    return enforceHardQuestionBoundaries(ordered, sortedAnchors, context);
+  }
+  return ordered;
+}
+
+function splitQuestionsUntilSingleMainQuestion(questions, anchors, context = {}) {
+  const sortedAnchors = normalizeMainQuestionAnchorList(anchors);
+  let result = Array.isArray(questions) ? questions : [];
+  const maxPasses = Math.max(1, sortedAnchors.length + 1);
+
+  for (let pass = 0; pass < maxPasses; pass += 1) {
+    const offenders = result.filter((question) =>
+      getMainQuestionAnchorsInsideBox(question?.finalBox || question?.box, sortedAnchors).length > 1
+    );
+    if (!offenders.length) return result;
+    console.log(`[multi-anchor-split] pass=${pass + 1} offenders=${offenders.length}`);
+    const split = splitQuestionCandidatesByMainQuestionAnchors(result, sortedAnchors, context);
+    if (split.length === result.length && split.every((question, index) => question === result[index])) break;
+    result = enforceHardQuestionBoundaries(split, sortedAnchors, context);
+  }
+
+  const unresolved = result.find((question) =>
+    getMainQuestionAnchorsInsideBox(question?.finalBox || question?.box, sortedAnchors).length > 1
+  );
+  if (unresolved) {
+    const inside = getMainQuestionAnchorsInsideBox(unresolved.finalBox || unresolved.box, sortedAnchors);
+    throw new Error(
+      `Unable to split question crop with multiple main anchors: ${inside.map((anchor) => anchor.sourceQuestionNumber).join(",")}`
+    );
+  }
+  return result;
+}
+
+function collectQuestionContentBlocks(question, anchor, nextAnchorTop, context = {}) {
+  const blocks = Array.isArray(context.blocks) ? context.blocks : [];
+  const candidates = [
+    ...(Array.isArray(question?.ocrLineBoxes)
+      ? question.ocrLineBoxes.map((block) => ({ ...block, contentSource: "ocr" }))
+      : []),
+    ...(Array.isArray(question?.rawModelBoxes)
+      ? question.rawModelBoxes.map((block) => ({ ...block, contentSource: "vision" }))
+      : []),
+    ...(Array.isArray(anchor?.lineIndexes)
+      ? anchor.lineIndexes.map((index) => blocks[index]).filter(Boolean).map((block) => ({ ...block, contentSource: "ocr-anchor" }))
+      : []),
+    ...blocks.filter((block) => {
+      const centerY = Number(block?.y) + Number(block?.h) / 2;
+      return Number.isFinite(centerY) && centerY >= Number(anchor.top) && (
+        !Number.isFinite(nextAnchorTop) || centerY < nextAnchorTop
+      );
+    }).map((block) => ({ ...block, contentSource: "ocr-interval" }))
+  ];
+  const seen = new Set();
+  return candidates.filter((block) => {
+    const x = Number(block?.x);
+    const y = Number(block?.y);
+    const w = Number(block?.w ?? block?.width);
+    const h = Number(block?.h ?? block?.height);
+    if (![x, y, w, h].every(Number.isFinite) || w <= 0 || h <= 0) return false;
+    if (Number.isFinite(nextAnchorTop) && y >= nextAnchorTop) return false;
+    if (
+      block.contentSource === "vision" &&
+      Number.isFinite(nextAnchorTop) &&
+      y + h >= nextAnchorTop
+    ) return false;
+    const key = `${Math.round(x * 10)}:${Math.round(y * 10)}:${Math.round(w * 10)}:${Math.round(h * 10)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map((block) => ({
+    ...block,
+    x: Number(block.x),
+    y: Number(block.y),
+    w: Number(block.w ?? block.width),
+    h: Number(block.h ?? block.height)
+  }));
+}
+
+function contentBlockBottom(block) {
+  return Number(block?.y) + Number(block?.h ?? block?.height);
+}
+
+function isFormulaLikeContent(block) {
+  const text = String(block?.text || "");
+  return /[=+\-*/√∠∫∑()（）\[\]{}]|(?:cm|mm|km|m)(?:2|3|²|³)?\b|\d+\s*\/\s*\d+/iu.test(text);
+}
+
+function isBottomTooTight(question, contentBlocks, finalBottom, medianLineHeight = 0) {
+  if (!Array.isArray(contentBlocks) || !contentBlocks.length) return false;
+  const sorted = contentBlocks.slice().sort((a, b) => contentBlockBottom(a) - contentBlockBottom(b));
+  const last = sorted[sorted.length - 1];
+  const contentBottom = contentBlockBottom(last);
+  const distance = Number(finalBottom) - contentBottom;
+  return distance < 8 ||
+    distance < Number(medianLineHeight || 0) * 0.4 ||
+    isFormulaLikeContent(last) ||
+    contentBottom >= Number(finalBottom);
+}
+
+function validateCropContainsContent(question, details) {
+  const contentBottom = Number(details.contentBottom);
+  const hardBottom = Number(details.hardBottom);
+  const bottomPadding = Number(details.bottomPadding);
+  const medianLineHeight = Number(details.medianLineHeight);
+  let finalBottom = Number(details.finalBottom);
+  const minimumSafetyPadding = Math.max(8, medianLineHeight * 0.4);
+  const requiredBottom = Math.ceil(contentBottom + Math.max(minimumSafetyPadding, bottomPadding));
+  if (finalBottom < requiredBottom) {
+    const expandedTo = finalBottom < hardBottom
+      ? Math.min(Math.ceil(hardBottom), requiredBottom)
+      : finalBottom;
+    console.warn(
+      `[crop-incomplete] Q${question.sourceQuestionNumber} contentBottom=${Math.ceil(contentBottom)} finalBottom=${Math.ceil(finalBottom)} distance=${Math.ceil(finalBottom - contentBottom)} expandedTo=${expandedTo}`
+    );
+    if (expandedTo <= contentBottom) {
+      question.needsReview = true;
+      question.validation = [
+        ...(question.validation || []),
+        "需要确认：内容底部已触及下一题硬边界，无法继续向下扩展"
+      ];
+    }
+    finalBottom = expandedTo;
+  }
+  return finalBottom;
+}
+
+function enforceHardQuestionBoundaries(questions, anchors, context = {}) {
+  const height = Number(context.height) || Math.max(
+    1,
+    ...(Array.isArray(questions) ? questions : []).map((question) => Number(question?.finalBox?.y || 0) + Number(question?.finalBox?.h || 0)),
+    ...(Array.isArray(anchors) ? anchors : []).map((anchor) => Number(anchor?.nextStartY || anchor?.top || anchor?.startY || 0))
+  );
+  const boundaryGap = Number.isFinite(Number(context.boundaryGap))
+    ? Math.max(1, Number(context.boundaryGap))
+    : getBoundaryGap(height);
+  const topPadding = Number.isFinite(Number(context.topPadding))
+    ? Math.max(0, Number(context.topPadding))
+    : Math.max(4, Math.round(height * 0.0035));
+  const rawAnchors = (Array.isArray(anchors) ? anchors : [])
+    .map((anchor, index, list) => getBoundaryAnchorInfo(anchor, list[index + 1]?.top ?? list[index + 1]?.startY))
+    .filter(Boolean)
+    .sort((a, b) => a.top - b.top);
+  const sortedAnchors = rawAnchors.map((anchor, index) => ({
+    ...anchor,
+    cropTop: Math.max(0, Math.round(anchor.top - topPadding)),
+    nextStartY: Number.isFinite(Number(rawAnchors[index + 1]?.top))
+      ? Number(rawAnchors[index + 1].top)
+      : Number(anchor.nextStartY)
+  }));
+  if (!sortedAnchors.length) return Array.isArray(questions) ? questions : [];
+
+  const result = (Array.isArray(questions) ? questions : []).map((question) => ({
+    ...question,
+    finalBox: question.finalBox ? { ...question.finalBox } : null
+  }));
+  const byNumber = new Map();
+  result.forEach((question) => {
+    const number = String(question.sourceQuestionNumber || "");
+    if (number && question.questionRole !== "subQuestion" && !byNumber.has(number)) byNumber.set(number, question);
+  });
+
+  sortedAnchors.forEach((anchor, index) => {
+    const number = String(anchor.sourceQuestionNumber);
+    if (byNumber.has(number)) return;
+    const created = createMinimalQuestionFromBoundaryAnchor(
+      anchor,
+      Number(sortedAnchors[index + 1]?.top),
+      result,
+      context,
+      result.length + 1
+    );
+    result.push(created);
+    byNumber.set(number, created);
+    console.log(`[Q${number}][created] top=${created.finalBox.y} bottom=${created.finalBox.y + created.finalBox.h}`);
+  });
+
+  sortedAnchors.forEach((anchor, index) => {
+    const question = byNumber.get(String(anchor.sourceQuestionNumber));
+    if (!question?.finalBox) return;
+    const previousAnchor = sortedAnchors[index - 1];
+    const nextAnchor = sortedAnchors[index + 1];
+    const nextAnchorTop = Number(nextAnchor?.top);
+    const originalBox = { ...question.finalBox };
+    const originalBottom = Number(originalBox.y) + Number(originalBox.h);
+    let finalTop = Math.max(0, Math.floor(anchor.cropTop));
+    const hasEarlierMainQuestion = result.some((candidate) =>
+      candidate !== question &&
+      candidate?.questionRole === "mainQuestion" &&
+      candidate?.sourceQuestionNumber &&
+      candidate?.finalBox &&
+      Number(candidate.finalBox.y) < Number(anchor.top)
+    );
+    const contentBlocks = collectQuestionContentBlocks(question, anchor, nextAnchorTop, context);
+    const lineHeights = contentBlocks
+      .map((block) => Number(block.h))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const medianLineHeight = median(lineHeights) || Math.max(12, height * 0.012);
+    const detectedContentTop = contentBlocks.length
+      ? Math.min(...contentBlocks.map((block) => Number(block.y)).filter(Number.isFinite))
+      : finalTop;
+    if (
+      !previousAnchor &&
+      !hasEarlierMainQuestion &&
+      !question.containsPageHeader &&
+      Number.isFinite(detectedContentTop) &&
+      detectedContentTop < finalTop
+    ) {
+      const maximumUpwardRecovery = Math.max(18, Math.min(60, Math.round(height * 0.035)));
+      const topSafetyPadding = Math.max(8, Math.min(20, Math.round(medianLineHeight * 0.45)));
+      const recoveredTop = Math.max(
+        0,
+        Math.floor(anchor.top - maximumUpwardRecovery),
+        Math.floor(detectedContentTop - topSafetyPadding)
+      );
+      if (recoveredTop < finalTop) {
+        console.log(
+          `[top-recovery] Q${question.sourceQuestionNumber} anchorTop=${Math.floor(anchor.top)} contentTop=${Math.floor(detectedContentTop)} oldTop=${finalTop} recoveredTop=${recoveredTop}`
+        );
+        finalTop = recoveredTop;
+        question.mergeReasons = [
+          ...(question.mergeReasons || []),
+          "题号上方已有视觉内容已向上恢复并保留"
+        ];
+        question.validation = [
+          ...(question.validation || []),
+          "顶部已根据现有视觉内容向上扩展"
+        ];
+      }
+    }
+    const detectedContentBottom = contentBlocks.length
+      ? Math.max(...contentBlocks.map(contentBlockBottom))
+      : originalBottom;
+    const contentBottom = Math.min(
+      Number.isFinite(nextAnchorTop) ? nextAnchorTop : height,
+      Math.max(finalTop + 1, detectedContentBottom)
+    );
+    const lastContentBlock = contentBlocks
+      .slice()
+      .sort((a, b) => contentBlockBottom(a) - contentBlockBottom(b))
+      .at(-1);
+    const baseBottomPadding = Math.max(height * 0.015, medianLineHeight * 0.8);
+    const bottomPadding = Math.min(
+      40,
+      Math.max(
+        12,
+        isFormulaLikeContent(lastContentBlock)
+          ? Math.max(baseBottomPadding, medianLineHeight * 1.2, height * 0.018)
+          : baseBottomPadding
+      )
+    );
+    let desiredBottom = Math.ceil(contentBottom + bottomPadding);
+    const standardHardBottom = Number.isFinite(nextAnchorTop)
+      ? Math.min(
+          Math.floor(nextAnchorTop - boundaryGap),
+          Number.isFinite(Number(nextAnchor?.cropTop)) ? Math.floor(Number(nextAnchor.cropTop) - 1) : height
+        )
+      : height;
+    const unresolvedFollowingNumbers = Array.isArray(anchor.unresolvedFollowingNumbers)
+      ? anchor.unresolvedFollowingNumbers.map(String).filter(Boolean)
+      : [];
+    const preserveUnresolvedGap = Boolean(
+      nextAnchor &&
+      anchor.preserveUnresolvedUntilNextAnchor &&
+      unresolvedFollowingNumbers.length
+    );
+    if (preserveUnresolvedGap) {
+      desiredBottom = Math.max(desiredBottom, standardHardBottom);
+      question.needsReview = true;
+      question.uncertain = true;
+      question.mergedUnresolvedQuestionNumbers = unresolvedFollowingNumbers;
+      question.mergeReasons = [
+        ...(question.mergeReasons || []),
+        `未能独立定位题目 ${unresolvedFollowingNumbers.join("、")}，其图像内容暂归入本题`
+      ];
+      question.validation = [
+        ...(question.validation || []),
+        `需要确认：题目 ${unresolvedFollowingNumbers.join("、")} 未能独立分块，内容已保留在本题中`
+      ];
+      console.log(
+        `[sequence-fallback] unresolved=[${unresolvedFollowingNumbers.join(",")}] preserved in Q${question.sourceQuestionNumber} bottom=${standardHardBottom}`
+      );
+    }
+    let hardBottom = standardHardBottom;
+    if (
+      nextAnchor &&
+      contentBlocks.length > 0 &&
+      desiredBottom > standardHardBottom &&
+      contentBottom >= standardHardBottom
+    ) {
+      // Pixel crops use half-open ranges, so ending exactly at the next anchor
+      // keeps every current-question pixel without including the next question.
+      nextAnchor.cropTop = Math.max(Number(nextAnchor.cropTop) || 0, Math.floor(nextAnchorTop));
+      hardBottom = Math.floor(nextAnchorTop);
+      console.log(
+        `[boundary-share] Q${question.sourceQuestionNumber} uses next anchor edge=${hardBottom}; Q${nextAnchor.sourceQuestionNumber} cropTop=${nextAnchor.cropTop}`
+      );
+    }
+    let finalBottom = Math.max(finalTop + 1, Math.min(desiredBottom, hardBottom));
+    if (isBottomTooTight(question, contentBlocks, finalBottom, medianLineHeight)) {
+      finalBottom = validateCropContainsContent(question, {
+        contentBottom,
+        hardBottom,
+        bottomPadding,
+        medianLineHeight,
+        finalBottom
+      });
+    }
+    finalBottom = Math.max(finalTop + 1, Math.min(Math.ceil(finalBottom), Math.floor(hardBottom)));
+    const finalLeft = Math.max(0, Math.floor(Number(originalBox.x) || 0));
+    const finalRight = Math.max(finalLeft + 1, Math.ceil(Number(originalBox.x || 0) + Number(originalBox.w || 1)));
+    question.finalBox = {
+      x: finalLeft,
+      y: finalTop,
+      w: Math.max(1, finalRight - finalLeft),
+      h: Math.max(1, finalBottom - finalTop)
+    };
+    question.x = question.finalBox.x;
+    question.y = question.finalBox.y;
+    question.w = question.finalBox.w;
+    question.h = question.finalBox.h;
+    question.questionStartY = finalTop;
+    question.nextQuestionStart = Number.isFinite(nextAnchorTop) ? Math.floor(nextAnchorTop) : null;
+    question.contentBottom = Math.ceil(contentBottom);
+    question.bottomPadding = Math.ceil(bottomPadding);
+    question.sourceQuestionNumber = String(anchor.sourceQuestionNumber);
+    question.questionNumber = String(anchor.sourceQuestionNumber);
+    question.number = String(anchor.sourceQuestionNumber);
+    console.log(`[Q${question.sourceQuestionNumber}] contentBottom=${Math.ceil(contentBottom)}`);
+    console.log(`[Q${question.sourceQuestionNumber}] medianLineHeight=${Math.round(medianLineHeight * 10) / 10}`);
+    console.log(`[Q${question.sourceQuestionNumber}] bottomPadding=${Math.ceil(bottomPadding)}`);
+    console.log(`[Q${question.sourceQuestionNumber}] nextQuestionTop=${Number.isFinite(nextAnchorTop) ? Math.floor(nextAnchorTop) : "page-end"}`);
+    console.log(`[Q${question.sourceQuestionNumber}] desiredBottom=${desiredBottom}`);
+    console.log(`[Q${question.sourceQuestionNumber}] finalBottom=${finalBottom}`);
+    console.log(`[Q${question.sourceQuestionNumber}][after-boundary] top=${finalTop} bottom=${finalBottom} anchorTop=${Math.floor(anchor.top)} hardBottom=${hardBottom}`);
+  });
+
+  return result
+    .filter((question) => question?.finalBox)
+    .sort((a, b) => a.finalBox.y - b.finalBox.y || a.finalBox.x - b.finalBox.x)
+    .map((question, index) => ({ ...question, displayIndex: index + 1 }));
+}
+
+function validateFinalQuestionBoxes(questions, anchors = []) {
+  const sorted = (Array.isArray(questions) ? questions : [])
+    .filter((question) => question?.finalBox)
+    .slice()
+    .sort((a, b) => a.finalBox.y - b.finalBox.y || a.finalBox.x - b.finalBox.x);
+  for (let index = 0; index < sorted.length - 1; index += 1) {
+    const current = sorted[index];
+    const next = sorted[index + 1];
+    const currentBottom = Number(current.finalBox.y) + Number(current.finalBox.h);
+    const nextTop = Number(next.finalBox.y);
+    if (currentBottom > nextTop) {
+      const error = new Error(
+        `Question overlap: Q${current.sourceQuestionNumber} bottom=${currentBottom}, Q${next.sourceQuestionNumber} top=${nextTop}`
+      );
+      console.error(`[boundary-assert] ${error.message}`);
+      if (process.env.NODE_ENV !== "production") throw error;
+    }
+  }
+  return sorted;
+}
+
+function validateSingleMainQuestionPerCrop(questions, anchors = []) {
+  const sortedAnchors = (Array.isArray(anchors) ? anchors : [])
+    .map((anchor) => ({
+      number: String(anchor.sourceQuestionNumber || anchor.questionNumber || ""),
+      top: Number(anchor.top ?? anchor.startY)
+    }))
+    .filter((anchor) => anchor.number && Number.isFinite(anchor.top))
+    .sort((a, b) => a.top - b.top);
+
+  for (const question of Array.isArray(questions) ? questions : []) {
+    if (!question?.finalBox) continue;
+    const sourceNumber = String(question.sourceQuestionNumber || "");
+    const cropTop = Number(question.finalBox.y);
+    const cropBottom = cropTop + Number(question.finalBox.h);
+    const anchorsInsideCrop = sortedAnchors.filter(
+      (anchor) => anchor.top >= cropTop && anchor.top < cropBottom
+    );
+    const foreignAnchors = anchorsInsideCrop.filter((anchor) => anchor.number !== sourceNumber);
+    console.log(
+      `[single-question-check] Q${sourceNumber || "?"} anchors=[${anchorsInsideCrop.map((anchor) => anchor.number).join(",")}] top=${cropTop} bottom=${cropBottom}`
+    );
+    if (!foreignAnchors.length) continue;
+
+    const error = new Error(
+      `Question crop contains another main question: Q${sourceNumber || "?"} contains Q${foreignAnchors[0].number} at y=${foreignAnchors[0].top}`
+    );
+    console.error(`[single-question-assert] ${error.message}`);
+    throw error;
+  }
+  return questions;
+}
+
+function normalizeQuestionText(text) {
+  return String(text || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/题目\s*\d+/g, "")
+    .replace(/ai\s*自动分割/gi, "")
+    .replace(/[√×✓✗✔✘]/g, "")
+    .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function questionTextPrefixSimilarity(leftText, rightText, length = 30) {
+  const left = normalizeQuestionText(leftText).slice(0, length);
+  const right = normalizeQuestionText(rightText).slice(0, length);
+  if (!left || !right) return 0;
+  let same = 0;
+  const compared = Math.min(left.length, right.length);
+  while (same < compared && left[same] === right[same]) same += 1;
+  return same / Math.max(left.length, right.length);
+}
+
+function getQuestionOcrContext(question, blocks) {
+  const box = question.finalBox || question;
+  const sourceNumber = normalizeSourceQuestionNumber(question.sourceQuestionNumber || question.questionNumber);
+  const numberingContext = createQuestionNumberContext(blocks);
+  const lines = (Array.isArray(blocks) ? blocks : [])
+    .map((block, index) => ({ ...block, index, centerY: block.y + block.h / 2 }))
+    .filter((block) => block.centerY >= box.y && block.centerY <= box.y + box.h)
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+  const numberLines = lines.filter((line) => {
+    const info = getQuestionNumberStartInfo(line.text, line, numberingContext);
+    return info && (!sourceNumber || info.number === sourceNumber) && info.kind !== "caption";
+  });
+  const questionNumberTop = numberLines.length ? Math.min(...numberLines.map((line) => line.y)) : Number.NaN;
+  const text = lines.map((line) => line.text).join(" ").replace(/\s+/g, " ").trim();
+  return { lines, text, questionNumberTop };
+}
+
+function hasPageHeaderContent(question, imageHeight) {
+  const text = String(question.ocrText || question.problemText || "");
+  const keywordPatterns = [
+    /班级/, /姓名/, /学校/, /考号/, /试卷/, /总分/, /时间/,
+    /选择题/, /填空题/, /解答题/, /共\s*\d+\s*小题/, /每题\s*\d+\s*分/
+  ];
+  const matchedKeywords = keywordPatterns.filter((pattern) => pattern.test(text)).length;
+  const nearPageTop = question.finalBox.y < imageHeight * 0.1;
+  const hasClassAndName = /班级/.test(text) && /姓名/.test(text);
+  const numberBelowTop = Number.isFinite(question.questionNumberTop) &&
+    question.questionNumberTop - question.finalBox.y > question.finalBox.h * 0.2;
+  return matchedKeywords >= 2 || (nearPageTop && hasClassAndName) || (nearPageTop && matchedKeywords >= 1 && numberBelowTop);
+}
+
+function scoreQuestionBox(question, groupMaxArea) {
+  const text = question.ocrText || question.problemText || "";
+  const optionLabels = extractOptionLabels(text);
+  const hasQuestionNumber = Number.isFinite(question.questionNumberTop) || Boolean(question.sourceQuestionNumber);
+  const normalized = normalizeQuestionText(text);
+  const numberOffset = Number.isFinite(question.questionNumberTop)
+    ? (question.questionNumberTop - question.finalBox.y) / Math.max(1, question.finalBox.h)
+    : 1;
+  let score = 0;
+  if (hasQuestionNumber) score += 30;
+  if (normalized.length >= 12) score += 20;
+  if (optionLabels.length >= 2) score += 20;
+  if (optionLabels.length >= 4) score += 15;
+  if (numberOffset >= 0 && numberOffset < 0.2) score += 15;
+  if (question.containsPageHeader) score -= 40;
+  if (numberOffset > 0.2) score -= 25;
+  const area = question.finalBox.w * question.finalBox.h;
+  if (groupMaxArea > 0 && area > groupMaxArea * 0.82) score -= 10;
+  score -= Math.min(8, Math.max(0, numberOffset) * 8);
+  return score;
+}
+
+function deduplicateNestedQuestionBoxes(questions, blocks, width, height) {
+  const topPadding = Math.max(2, Math.round(height * 0.007));
+  const enriched = (Array.isArray(questions) ? questions : []).map((question) => {
+    const copy = { ...question, finalBox: { ...question.finalBox } };
+    const context = getQuestionOcrContext(copy, blocks);
+    copy.ocrText = context.text || copy.problemText || "";
+    copy.normalizedQuestionText = normalizeQuestionText(copy.ocrText);
+    copy.questionNumberTop = context.questionNumberTop;
+    copy.containsPageHeader = hasPageHeaderContent(copy, height);
+    copy.isPrimary = true;
+
+    if (copy.sourceQuestionNumber === "1" && Number.isFinite(copy.questionNumberTop)) {
+      const oldBottom = copy.finalBox.y + copy.finalBox.h;
+      const correctedTop = Math.max(0, copy.questionNumberTop - topPadding);
+      if (correctedTop > copy.finalBox.y) {
+        copy.finalBox.y = correctedTop;
+        copy.finalBox.h = Math.max(1, oldBottom - correctedTop);
+        copy.x = copy.finalBox.x;
+        copy.y = copy.finalBox.y;
+        copy.w = copy.finalBox.w;
+        copy.h = copy.finalBox.h;
+        copy.validation = [...(copy.validation || []), "已从第1题题号附近开始裁剪，移除页眉区域"];
+      }
+    }
+    return copy;
+  });
+
+  const groups = new Map();
+  enriched.forEach((question, index) => {
+    const key = question.sourceQuestionNumber || `unknown:${index}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ question, index });
+  });
+
+  const removedIndexes = new Set();
+  const removed = [];
+  for (const [sourceQuestionNumber, entries] of groups.entries()) {
+    if (entries.length < 2 || sourceQuestionNumber.startsWith("unknown:")) continue;
+    const groupMaxArea = Math.max(...entries.map(({ question }) => question.finalBox.w * question.finalBox.h));
+    entries.forEach(({ question }) => {
+      question.dedupeScore = scoreQuestionBox(question, groupMaxArea);
+    });
+    console.log(`[dedupe] sourceQuestionNumber=${sourceQuestionNumber}`);
+    console.log(`[dedupe] candidates=${entries.length}`);
+
+    for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) {
+      const leftEntry = entries[leftIndex];
+      if (removedIndexes.has(leftEntry.index)) continue;
+      for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
+        const rightEntry = entries[rightIndex];
+        if (removedIndexes.has(rightEntry.index)) continue;
+        const left = leftEntry.question;
+        const right = rightEntry.question;
+        const intersection = boxIntersectionArea(left.finalBox, right.finalBox);
+        const containmentLeft = intersection / Math.max(1, left.finalBox.w * left.finalBox.h);
+        const containmentRight = intersection / Math.max(1, right.finalBox.w * right.finalBox.h);
+        const prefixSimilarity = questionTextPrefixSimilarity(left.ocrText, right.ocrText);
+        const jaccardSimilarity = textJaccardSimilarity(left.ocrText, right.ocrText);
+        const smallTextInLarge = left.normalizedQuestionText.includes(right.normalizedQuestionText) ||
+          right.normalizedQuestionText.includes(left.normalizedQuestionText);
+        const nested = containmentLeft >= 0.8 || containmentRight >= 0.8;
+        const sameQuestionEvidence = prefixSimilarity >= 0.65 || jaccardSimilarity >= 0.55 || smallTextInLarge || sourceQuestionNumber === left.sourceQuestionNumber;
+
+        console.log(
+          `[dedupe] boxA containment=${containmentLeft.toFixed(2)} containsPageHeader=${left.containsPageHeader} score=${left.dedupeScore.toFixed(1)}`
+        );
+        console.log(
+          `[dedupe] boxB containment=${containmentRight.toFixed(2)} containsPageHeader=${right.containsPageHeader} score=${right.dedupeScore.toFixed(1)}`
+        );
+        if (!nested || !sameQuestionEvidence) continue;
+
+        const keepLeft = left.dedupeScore >= right.dedupeScore;
+        const keptEntry = keepLeft ? leftEntry : rightEntry;
+        const removedEntry = keepLeft ? rightEntry : leftEntry;
+        removedIndexes.add(removedEntry.index);
+        removedEntry.question.isPrimary = false;
+        const reason = removedEntry.question.containsPageHeader
+          ? "nested duplicate with page header"
+          : "nested duplicate with lower completeness score";
+        console.log(`[dedupe] keep=box${keepLeft ? "A" : "B"}`);
+        console.log(`[dedupe] remove=box${keepLeft ? "B" : "A"} reason=${reason}`);
+        removed.push({
+          ...removedEntry.question.finalBox,
+          sourceQuestionNumber,
+          reason
+        });
+        if (!keepLeft) break;
+      }
+    }
+  }
+
+  const finalQuestions = enriched
+    .filter((question, index) => !removedIndexes.has(index))
+    .map((question, index) => ({ ...question, displayIndex: index + 1, isPrimary: true }));
+  return { questions: finalQuestions, removed };
+}
+
+async function handleSegmentV2(req, res) {
+  const requestStartedAt = Date.now();
+  const timings = {};
+  const bodyReadStartedAt = Date.now();
+  const body = await readJsonBody(req);
+  timings.requestBodyReadMs = Date.now() - bodyReadStartedAt;
+  if (!body.image || !body.width || !body.height) {
+    sendJson(res, 400, { error: "缺少 image、width 或 height" });
+    return;
+  }
+
+  const width = Number(body.width);
+  const height = Number(body.height);
+  const mode = String(body.mode || "initial");
+  const cacheLookupStartedAt = Date.now();
+  const cacheKey = getSegmentCacheKey(body.image, width, height, `${mode}:vision-ocr-v2`);
+  const cachedSegment = getCachedSegmentResult(cacheKey);
+  timings.cacheLookupMs = Date.now() - cacheLookupStartedAt;
+  if (cachedSegment) {
+    timings.backendTotalMs = Date.now() - requestStartedAt;
+    timings.cacheHit = true;
+    timings.originalColdBackendMs = Number(cachedSegment.timings?.backendTotalMs) || 0;
+    console.log(`[segment-v2] result cache hit: ${cachedSegment.questions?.length || 0} questions`);
+    console.log(`[segment-timing] ${JSON.stringify(timings)}`);
+    sendJson(res, 200, { ...cachedSegment, timings, cacheHit: true });
+    return;
+  }
+
+  const recognitionStartedAt = Date.now();
+  const [ocrResult, visionResult] = await Promise.allSettled([
+    (async () => {
+      const startedAt = Date.now();
+      try {
+        return await extractTextBlocks(body.image);
+      } finally {
+        timings.ocrMs = Date.now() - startedAt;
+      }
+    })(),
+    (async () => {
+      const startedAt = Date.now();
+      try {
+        return await callVisionQuestionStructure(body.image);
+      } finally {
+        timings.visionModelMs = Date.now() - startedAt;
+      }
+    })()
+  ]);
+  timings.parallelRecognitionMs = Date.now() - recognitionStartedAt;
+  const textBlocks = ocrResult.status === "fulfilled" ? ocrResult.value : [];
+  const visionQuestions = visionResult.status === "fulfilled" ? visionResult.value?.questions || [] : [];
+  if (ocrResult.status === "rejected") console.warn("[segment-v2] OCR failed:", ocrResult.reason?.message || ocrResult.reason);
+  if (visionResult.status === "rejected") console.warn("[segment-v2] vision failed:", visionResult.reason?.message || visionResult.reason);
+  console.log(`[segment-v2] raw vision=${visionQuestions.length}, OCR lines=${textBlocks.length}`);
+
+  const anchorStageStartedAt = Date.now();
+  const groupedOcrLines = groupOcrBlocksIntoLines(textBlocks, width, height);
+  const ocrLines = mergeDetachedQuestionNumberLines(groupedOcrLines, width);
+  let mainQuestionAnchors = extractMainQuestionAnchors(ocrLines, width, height);
+  mainQuestionAnchors = recoverNumberMarkerAnchors(
+    ocrLines,
+    mainQuestionAnchors,
+    visionQuestions,
+    width,
+    height
+  );
+  mainQuestionAnchors = recoverDiscontinuousQuestionAnchors(
+    ocrLines,
+    mainQuestionAnchors,
+    visionQuestions,
+    width,
+    height
+  );
+  mainQuestionAnchors.forEach((anchor) => {
+    console.log(`[Q${anchor.sourceQuestionNumber}][anchor] top=${Math.round(anchor.startY)}`);
+  });
+  const ocrBands = buildOcrQuestionBands(textBlocks, width, height, {
+    ocrLines,
+    anchors: mainQuestionAnchors
+  });
+  timings.ocrLineAndAnchorMs = Date.now() - anchorStageStartedAt;
+  console.log(`[ai] AI questions=[${visionQuestions.map((question) => normalizeSourceQuestionNumber(question.questionNumber)).filter(Boolean).join(",")}]`);
+  logQuestionCoordinateStage("ai", normalizeVisualQuestionRegions(visionQuestions, width, height), "box");
+  const regionStageStartedAt = Date.now();
+  const normalized = normalizeQuestionRegions(visionQuestions, ocrBands, textBlocks, width, height);
+  const merged = mergeQuestionRegions(normalized, width, height);
+  logQuestionCoordinateStage("after-merge", merged, "box");
+  const deduplicated = deduplicateQuestions(merged, width, height);
+  logQuestionCoordinateStage("after-dedupe", deduplicated.questions, "box");
+  let validated = deduplicated.questions.map((question, index, list) =>
+    validateQuestionCrop(question, list[index + 1], textBlocks, width, height)
+  );
+  timings.regionMergeAndInitialValidationMs = Date.now() - regionStageStartedAt;
+  logQuestionCoordinateStage("after-initial-boundary", validated);
+
+  if (!validated.length && textBlocks.length) {
+    const fallback = buildQuestionBoxesByNumberStarts(textBlocks, width, height);
+    validated = fallback.map((question) => ({
+      sourceQuestionNumber: question.questionNumber || question.number || "",
+      summary: question.problemText || question.title || "",
+      type: question.problemType || question.type || "未知",
+      text: question.problemText || question.title || "",
+      rawModelBoxes: [],
+      ocrLineIndexes: [],
+      optionLabels: [],
+      mergeReasons: ["视觉结构不可用，采用 OCR 题号区间兜底"],
+      uncertain: true,
+      needsReview: true,
+      validation: ["需要确认：视觉结构未返回"],
+      finalBox: { x: question.x, y: question.y, w: question.w, h: question.h }
+    }));
+  }
+
+  const reconciliationStageStartedAt = Date.now();
+  let questions = validated.map((question, index) => buildFinalQuestionPayload(question, textBlocks, width, height, index + 1));
+  questions = splitQuestionCandidatesByMainQuestionAnchors(
+    questions,
+    ocrBands,
+    { blocks: textBlocks, width, height }
+  );
+  questions = reconcileQuestionsWithOcrAnchors(questions, ocrBands, textBlocks, width, height);
+  questions = attachSupportingContentResults(questions, width, height);
+  questions = reconcileQuestionsWithOcrAnchors(questions, ocrBands, textBlocks, width, height);
+  questions = validateNonOverlappingQuestions(questions, width, height);
+  const nestedDedupe = deduplicateNestedQuestionBoxes(questions, textBlocks, width, height);
+  logQuestionCoordinateStage("after-nested-dedupe", nestedDedupe.questions);
+  questions = validateQuestionSequence(nestedDedupe.questions, ocrBands, textBlocks, width, height);
+  if (!questions.length) {
+    const wholePage = buildWholePageQuestion(width, height, "视觉模型和 OCR 均未可靠识别，保留整页");
+    questions = [{
+      ...wholePage,
+      finalBox: { x: 0, y: 0, w: width, h: height },
+      sourceQuestionNumber: "",
+      displayIndex: 1,
+      needsReview: true,
+      uncertain: true,
+      validation: ["需要确认：未识别出题目边界"],
+      mergeReasons: ["整页兜底"],
+      optionLabels: [],
+      rawModelBoxes: [],
+      ocrLineBoxes: [],
+      generatedBy: "whole-page-review-fallback"
+    }];
+  }
+  timings.reconciliationAndDedupeMs = Date.now() - reconciliationStageStartedAt;
+
+  const finalBoundaryStageStartedAt = Date.now();
+  questions = enforceHardQuestionBoundaries(questions, ocrBands, { blocks: textBlocks, width, height });
+  questions = splitQuestionsUntilSingleMainQuestion(
+    questions,
+    ocrBands,
+    { blocks: textBlocks, width, height }
+  );
+  validateFinalQuestionBoxes(questions, ocrBands);
+  validateSingleMainQuestionPerCrop(questions, ocrBands);
+  timings.finalBoundaryValidationMs = Date.now() - finalBoundaryStageStartedAt;
+  logQuestionCoordinateStage("api-response", questions);
+
+  const debugBuildStartedAt = Date.now();
+  const debug = {
+    rawModelBoxes: normalizeVisualQuestionRegions(visionQuestions, width, height).flatMap((question) => question.rawModelBoxes),
+    ocrLineBoxes: textBlocks.map((block, index) => ({ index, ...block })),
+    finalBoxes: questions.map((question) => ({
+      sourceQuestionNumber: question.sourceQuestionNumber,
+      needsReview: question.needsReview,
+      ...question.finalBox
+    })),
+    boundaryLines: questions.flatMap((question, index) => {
+      const lines = [{
+        y: question.questionStartY ?? question.finalBox.y,
+        sourceQuestionNumber: question.sourceQuestionNumber,
+        kind: "start"
+      }];
+      if (index < questions.length - 1) {
+        lines.push({
+          y: questions[index + 1].questionStartY ?? questions[index + 1].finalBox.y,
+          sourceQuestionNumber: questions[index + 1].sourceQuestionNumber,
+          kind: "hard-boundary"
+        });
+      }
+      return lines;
+    }),
+    deduplicatedBoxes: [
+      ...deduplicated.removed.map((item) => ({
+        ...item.box,
+        sourceQuestionNumber: item.sourceQuestionNumber,
+        reason: item.reason
+      })),
+      ...nestedDedupe.removed
+    ]
+  };
+  timings.debugPayloadBuildMs = Date.now() - debugBuildStartedAt;
+
+  console.log(`[segment-v2] normalized=${normalized.length}, merged=${merged.length}, deduplicated=${deduplicated.questions.length}, nestedDeduplicated=${nestedDedupe.questions.length}, final=${questions.length}`);
+  console.log(`[render] final question numbers=[${questions.map((question) => question.sourceQuestionNumber).filter(Boolean).join(",")}]`);
+  questions.forEach((question) => {
+    console.log(
+      `[segment-v2] question=${question.sourceQuestionNumber || "?"}, reasons=${question.mergeReasons.join(" | ")}, validation=${question.validation.join(" | ")}`
+    );
+  });
+  deduplicated.removed.forEach((item) => console.log(`[segment-v2] removed duplicate ${item.sourceQuestionNumber || "?"}: ${item.reason}`));
+
+  timings.backendTotalMs = Date.now() - requestStartedAt;
+  timings.cacheHit = false;
+  console.log(`[segment-timing] ${JSON.stringify(timings)}`);
+
+  sendSegmentResult(res, cacheKey, {
+    questions,
+    fallbackToWholePage: questions.length === 1 && questions[0].generatedBy === "whole-page-review-fallback",
+    note: "视觉模型粗定位 + OCR 行边界修正 + 题目级合并去重",
+    model: QWEN_VL_MODEL,
+    provider: "qwen-vision-paddleocr-hybrid",
+    ocrBlockCount: textBlocks.length,
+    timings,
+    debug
+  });
 }
 
 async function handleSegment(req, res) {
@@ -1037,6 +3995,15 @@ async function handleSegment(req, res) {
 
   const width = Number(body.width);
   const height = Number(body.height);
+  const mode = String(body.mode || "initial");
+  const cacheKey = getSegmentCacheKey(body.image, width, height, mode);
+  const cachedSegment = getCachedSegmentResult(cacheKey);
+  if (cachedSegment) {
+    console.log(`[segment] result cache hit: ${cachedSegment.questions?.length || 0} questions`);
+    sendJson(res, 200, { ...cachedSegment, cacheHit: true });
+    return;
+  }
+
   const textBlocks = await extractTextBlocks(body.image);
   console.log(`[segment] OCR block count: ${textBlocks.length}`);
 
@@ -1044,12 +4011,46 @@ async function handleSegment(req, res) {
     const questions = [buildWholePageQuestion(width, height, "OCR 未识别到文字块，返回整页题块")];
     console.log("[segment] LLM grouping skipped: no OCR blocks");
     console.log(`[segment] final box count: ${questions.length}`);
-    sendJson(res, 200, {
+    sendSegmentResult(res, cacheKey, {
       questions,
       fallbackToWholePage: true,
       note: "OCR 未识别到文字块；TODO: 接入 PaddleOCR 或其他 OCR 服务后可细分题目。",
       model: SEGMENT_MODEL,
       ocrBlockCount: 0
+    });
+    return;
+  }
+
+  const fastNumberQuestions = buildQuestionBoxesByNumberStarts(textBlocks, width, height);
+  const fastSplitReliable = isConsecutiveQuestionSplit(fastNumberQuestions);
+  const repairedFastNumberQuestions = fastSplitReliable ? [] : repairQuestionNumberSplit(fastNumberQuestions, width, height, textBlocks);
+  const repairedFastSplitReliable = isConsecutiveQuestionSplit(repairedFastNumberQuestions);
+  if (fastNumberQuestions.length && !fastSplitReliable) {
+    console.log(
+      `[segment] fast question-number split not reliable, continue to LLM: ${questionNumberList(fastNumberQuestions).join(",") || "no-number"}`
+    );
+  }
+  if (SEGMENT_FAST_MODE && fastSplitReliable) {
+    console.log(`[segment] fast question-number split count: ${fastNumberQuestions.length}`);
+    sendSegmentResult(res, cacheKey, {
+      questions: fastNumberQuestions,
+      fallbackToWholePage: false,
+      note: "已按题号位置快速切分，跳过大模型分组。",
+      model: "ocr-question-number-fast-path",
+      ocrBlockCount: textBlocks.length
+    });
+    return;
+  }
+  if (SEGMENT_FAST_MODE && repairedFastSplitReliable) {
+    console.log(
+      `[segment] repaired question-number split count: ${repairedFastNumberQuestions.length}, numbers=${questionNumberList(repairedFastNumberQuestions).join(",")}`
+    );
+    sendSegmentResult(res, cacheKey, {
+      questions: repairedFastNumberQuestions,
+      fallbackToWholePage: false,
+      note: "已按题号和缺号位置修复切分，跳过大模型分组。",
+      model: "ocr-question-number-repaired-fast-path",
+      ocrBlockCount: textBlocks.length
     });
     return;
   }
@@ -1071,26 +4072,188 @@ async function handleSegment(req, res) {
           })
         }
       ],
-      maxOutputTokens: 3000
+      maxOutputTokens: 3000,
+      timeoutMs: SEGMENT_LLM_TIMEOUT_MS
     });
   } catch (error) {
     console.warn("[segment] LLM grouping failed, fallback to whole page:", error.message || error);
   }
 
   console.log(`[segment] LLM grouping result: ${JSON.stringify(grouping.questions || []).slice(0, 1200)}`);
-  let questions = buildQuestionBoxesFromGroups(grouping.questions, textBlocks, width, height);
+  let questions = mergeDuplicateQuestionBoxes(
+    buildQuestionBoxesFromGroups(grouping.questions, textBlocks, width, height),
+    width,
+    height
+  );
+  let usedNumberFallback = false;
+  const numberFallbackQuestions = shouldPreferNumberFallback(questions, width, height)
+    ? buildQuestionBoxesByNumberStarts(textBlocks, width, height)
+    : [];
+  const repairedNumberFallbackQuestions = isConsecutiveQuestionSplit(numberFallbackQuestions)
+    ? []
+    : repairQuestionNumberSplit(numberFallbackQuestions, width, height, textBlocks);
+  if (isConsecutiveQuestionSplit(numberFallbackQuestions)) {
+    console.log(`[segment] question-number fallback count: ${numberFallbackQuestions.length}`);
+    questions = numberFallbackQuestions;
+    usedNumberFallback = true;
+  } else if (isConsecutiveQuestionSplit(repairedNumberFallbackQuestions)) {
+    console.log(
+      `[segment] repaired question-number fallback count: ${repairedNumberFallbackQuestions.length}, numbers=${questionNumberList(repairedNumberFallbackQuestions).join(",")}`
+    );
+    questions = repairedNumberFallbackQuestions;
+    usedNumberFallback = true;
+  } else if (numberFallbackQuestions.length > 1) {
+    console.log(
+      `[segment] question-number fallback not reliable, keep LLM/whole-page result: ${questionNumberList(numberFallbackQuestions).join(",")}`
+    );
+  }
   if (!questions.length) {
     questions = [buildWholePageQuestion(width, height, "LLM 未返回有效题目分组，返回整页题块")];
   }
   console.log(`[segment] final box count: ${questions.length}`);
 
-  sendJson(res, 200, {
+  sendSegmentResult(res, cacheKey, {
     questions,
     fallbackToWholePage: questions.length === 1 && questions[0].x === 0 && questions[0].y === 0 && questions[0].w === width && questions[0].h === height,
-    note: grouping.note || "OCR blocks grouped by LLM; boxes generated by server.",
+    note: usedNumberFallback
+      ? "LLM 未可靠拆分时，已按题号位置兜底切分。"
+      : grouping.note || "OCR blocks grouped by LLM; boxes generated by server.",
     model: SEGMENT_MODEL,
     ocrBlockCount: textBlocks.length
   });
+}
+
+const transcriptCorrectionSchema = {
+  name: "math_transcript_correction",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      correctedText: {
+        type: "string",
+        description: "Corrected Chinese speech transcript, preserving the student's original meaning."
+      },
+      changed: {
+        type: "boolean",
+        description: "Whether an obvious speech recognition error was corrected."
+      }
+    },
+    required: ["correctedText", "changed"]
+  }
+};
+
+const TRANSCRIPT_CORRECTION_PROMPT = [
+  "你是初中数学讲解场景里的语音转写校对器。",
+  "浏览器语音识别已经先输出了一段中文，请结合当前题目图片，只修正明显的同音词、数字、字母、数学术语或标点识别错误。",
+  "例如把明显的 x、y、m、n、等于、比例、方程等数学表达恢复正确；不能凭空补充学生没有说过的步骤。",
+  "如果无法确定，就保留原文，不要为了通顺而改写。不要总结、解释或回答题目，只返回校对后的原句。"
+].join("\n");
+
+const TRANSCRIPT_CORRECTION_PROMPT_V2 = [
+  "你是初中数学讲解场景里的语音转写校对器。",
+  "浏览器语音识别已经先输出了一段中文。请结合当前题目图片、题卡摘要、知识点和前文讲解，只修正明显的同音词、近音词、数字、字母、数学术语或标点识别错误。",
+  "学生讲解通常紧贴题目条件，所以当 ASR 文本里出现和题目无关的词，要优先考虑它是不是题目中的数学词被误识别了。",
+  "重点恢复数学与题面词：x、y、m、n、等于、比例、方程、左数、右数、相邻、下方、上方、箭头、共同指向、差、和、积、商、选项、结论。",
+  "例如题目说“上方相邻的左数与右数之差等于下方箭头共同指向的数”，ASR 把“左数/右数/之差/箭头”听成“总数/右束支/树”等时，要按题目语义改回。",
+  "只校对学生确实可能说过的这一句，不要补充新的解题步骤，不要替学生回答题目。",
+  "如果无法确定，就保留原文。只返回 correctedText 和 changed。"
+].join("\n");
+
+async function handleTranscriptCorrection(req, res) {
+  const body = await readJsonBody(req);
+  const text = String(body.text || "").trim();
+  if (!text || !body.questionImage) {
+    sendJson(res, 200, { correctedText: text, changed: false, skipped: true });
+    return;
+  }
+
+  const result = await callQwenMultimodalJson({
+    model: QWEN_GUIDE_MODEL,
+    schema: transcriptCorrectionSchema,
+    instructions: TRANSCRIPT_CORRECTION_PROMPT_V2,
+    content: [
+      {
+        type: "input_text",
+        text: JSON.stringify({
+          asrText: text,
+          problemText: body.problemText || "",
+          knowledgePoints: body.knowledgePoints || [],
+          transcriptBeforeThisSentence: body.transcript || "",
+          correctionGoal: "把语音识别结果校正成贴合当前题目的学生原话；不要讲题，不要总结。",
+          instruction: "只返回 correctedText 和 changed，不要回答题目。"
+        })
+      },
+      { type: "input_image", label: "当前数学题目", image_url: body.questionImage, detail: "high" }
+    ],
+    maxOutputTokens: 500
+  });
+
+  const correctedText = String(result.correctedText || text).trim() || text;
+  sendJson(res, 200, {
+    correctedText,
+    changed: Boolean(result.changed) && correctedText !== text,
+    model: QWEN_GUIDE_MODEL,
+    provider: "qwen-multimodal-transcript-correction"
+  });
+}
+
+const finalAnswerSchema = {
+  name: "final_answer_check",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      correct: {
+        type: "boolean",
+        description: "Whether the student's final answer matches the current problem."
+      },
+      finalAnswer: { type: "string", description: "The answer understood from the student." },
+      feedback: { type: "string", description: "Short warm feedback when the answer is correct." },
+      hint: { type: "string", description: "A gentle checking hint when the answer is wrong or unclear." },
+      confidence: { type: "number", description: "Confidence from 0 to 1." }
+    },
+    required: ["correct", "finalAnswer", "feedback", "hint", "confidence"]
+  }
+};
+
+const FINAL_ANSWER_PROMPT = [
+  "你是初中数学错题讲解的收尾核对助手。",
+  "请结合当前题目图片、学生讲解文字、黑板图片和学生刚说出的最后答案，判断最后答案是否正确。",
+  "必须实际根据题目条件和计算关系核对，不能因为学生说得肯定就判定正确。",
+  "如果学生没有给出明确答案、答案看不清或题目条件不足以判断，correct 必须为 false，hint 要请学生把最后答案和单位再说清楚。",
+  "correct=true 时 feedback 只给一句简短、贴合内容的鼓励；correct=false 时不要直接说‘你错了’，只给一个温和的检查方向。",
+  "不要输出完整解题过程，不要替学生讲完。严格返回 JSON。"
+].join("\n");
+
+async function handleFinalAnswerCheck(req, res) {
+  const body = await readJsonBody(req);
+  if (!body.questionImage || !String(body.answer || "").trim()) {
+    sendJson(res, 400, { error: "缺少 questionImage 或 answer" });
+    return;
+  }
+
+  const result = await callQwenMultimodalJson({
+    model: QWEN_GUIDE_MODEL,
+    schema: finalAnswerSchema,
+    instructions: FINAL_ANSWER_PROMPT,
+    content: [
+      {
+        type: "input_text",
+        text: JSON.stringify({
+          studentAnswer: String(body.answer).trim(),
+          lectureText: body.lectureText || "",
+          latestHandwritingResult: body.latestHandwritingResult || null
+        })
+      },
+      { type: "input_image", label: "当前题目图片", image_url: body.questionImage, detail: "high" },
+      ...(body.boardImage ? [{ type: "input_image", label: "当前黑板图片", image_url: body.boardImage, detail: "high" }] : [])
+    ],
+    maxOutputTokens: 700
+  });
+
+  sendJson(res, 200, { ...result, model: QWEN_GUIDE_MODEL, provider: "qwen-multimodal-final-answer" });
 }
 
 async function handleGuide(req, res) {
@@ -1101,6 +4264,7 @@ async function handleGuide(req, res) {
   }
 
   const eventText = {
+    answer_to_lian_question: "学生正在回答恋恋刚才主动提出的问题。请及时回应这个回答，不要沉默，也不要当作普通连续讲解忽略。",
     active_help: "学生主动求助、提问或明确表示不会。",
     stuck: "学生明确表示不会、没思路或卡住。",
     silence: "学生讲解过程中普通沉默超过 2 分钟，当前只适合关怀询问。",
@@ -1120,13 +4284,16 @@ async function handleGuide(req, res) {
   const guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
-    instructions: [LIAN_GUIDE_PROMPT, COMPANION_DIALOGUE_POLICY].join("\n\n"),
+    instructions: [LIAN_GUIDE_PROMPT, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
     content: [
       {
         type: "input_text",
         text: JSON.stringify({
           event: eventText,
           eventType: body.eventType || "normal",
+          questionId: body.questionId || "",
+          questionTitle: body.questionTitle || "",
+          lianQuestion: body.lianQuestion || "",
           currentGuideState: guideState,
           lectureUnlocked,
           silenceSeconds: body.silenceSeconds || 0,
@@ -1139,17 +4306,22 @@ async function handleGuide(req, res) {
           thoughtSegments: body.thoughtSegments || 0,
           hasConclusion: Boolean(body.hasConclusion),
           hasMathStep: Boolean(body.hasMathStep),
+          studentFinalAnswerEvidence: Boolean(body.studentFinalAnswerEvidence),
           transcript: body.transcript || "",
           latestStudentSpeech: body.latestStudentSpeech || "",
           knownProblemText: body.problemText || "",
           knownKnowledgePoints: body.knowledgePoints || [],
           boundaryRules: [
+            "如果 eventType=answer_to_lian_question，必须优先回应 lianQuestion 和 latestStudentSpeech 的对应关系，shouldSpeak=true，通常一句话确认后再给一个很小的下一步。",
+            "如果学生回答的是要讲哪一道题、哪一步或哪种方式，先接受这个选择，不要根据黑板截图另行改成别的题号。",
             "lectureUnlocked=false 时只能启发引导或微提示，hintLevel 只能为 encourage/light。",
             "lectureUnlocked=false 时 speech 不得包含最终答案、中间完整算式或完整解题步骤。",
             "lectureUnlocked=true 时只讲一个小步骤，不得一次性讲完整题。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
             "如果只是普通 2 分钟沉默且 awaitingSilenceFollowup=false，只做关怀询问，不给公式。",
             "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
+            "lectureComplete 默认必须为 false；只有学生已经讲完关键思路并明确说出最终答案/选项时才设为 true。",
+            "lectureComplete=true 后 speech 只做一次收束，不得继续追问、要求复述或重复已经说过的选项。",
             "禁止使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。"
           ],
           styleRules: LIAN_STYLE_RULES
@@ -1219,7 +4391,10 @@ function serveStatic(req, res) {
       res.end("Not found");
       return;
     }
-    res.writeHead(200, { "Content-Type": mimeTypes[path.extname(filePath)] || "application/octet-stream" });
+    const extension = path.extname(filePath);
+    const headers = { "Content-Type": mimeTypes[extension] || "application/octet-stream" };
+    if ([".html", ".js", ".css"].includes(extension)) headers["Cache-Control"] = "no-store";
+    res.writeHead(200, headers);
     res.end(data);
   });
 }
@@ -1227,7 +4402,9 @@ function serveStatic(req, res) {
 const server = http.createServer(async (req, res) => {
   const pathname = new URL(req.url, `http://localhost:${PORT}`).pathname;
   try {
-    if (req.method === "POST" && pathname === "/api/segment") return await handleSegment(req, res);
+    if (req.method === "POST" && pathname === "/api/segment") return await handleSegmentV2(req, res);
+    if (req.method === "POST" && pathname === "/api/transcript-correct") return await handleTranscriptCorrection(req, res);
+    if (req.method === "POST" && pathname === "/api/final-answer") return await handleFinalAnswerCheck(req, res);
     if (req.method === "POST" && pathname === "/api/guide") return await handleGuide(req, res);
     if (req.method === "POST" && pathname === "/api/handwriting") return await handleHandwriting(req, res);
     if (req.method === "GET") return serveStatic(req, res);
@@ -1240,12 +4417,34 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`恋恋错题本服务已启动：http://127.0.0.1:${PORT}`);
-  console.log(
-    `DeepSeek API：${DEEPSEEK_BASE_URL}；题目分割模型：${SEGMENT_MODEL}`
-  );
-  console.log(
-    `Qwen 多模态 API：${QWEN_BASE_URL}；讲解引导模型：${QWEN_GUIDE_MODEL}；板书识别模型：${QWEN_HANDWRITING_MODEL}`
-  );
-});
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`恋恋错题本服务已启动：http://127.0.0.1:${PORT}`);
+    console.log(
+      `题目视觉分割：${QWEN_VL_MODEL}（Qwen 多模态）；旧版 OCR 文本分组：${SEGMENT_MODEL}（DeepSeek，当前未路由）`
+    );
+    console.log(
+      `Qwen 多模态 API：${QWEN_BASE_URL}；讲解引导模型：${QWEN_GUIDE_MODEL}；板书识别模型：${QWEN_HANDWRITING_MODEL}`
+    );
+    const ocrService = getPaddleOcrService();
+    if (ocrService) {
+      console.log("[segment] PaddleOCR service prewarming in background");
+    }
+  });
+}
+
+module.exports = {
+  groupOcrBlocksIntoLines,
+  mergeDetachedQuestionNumberLines,
+  extractMainQuestionAnchors,
+  recoverNumberMarkerAnchors,
+  recoverDiscontinuousQuestionAnchors,
+  buildOcrQuestionBands,
+  normalizeQuestionRegions,
+  reconcileQuestionsWithOcrAnchors,
+  enforceHardQuestionBoundaries,
+  validateFinalQuestionBoxes,
+  validateSingleMainQuestionPerCrop,
+  splitQuestionCandidatesByMainQuestionAnchors,
+  splitQuestionsUntilSingleMainQuestion
+};

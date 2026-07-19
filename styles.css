@@ -432,6 +432,12 @@ main {
   user-select: none;
 }
 
+.segment-debug-canvas {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+}
+
 .preview-stage.manual {
   cursor: crosshair;
 }
@@ -631,6 +637,7 @@ main {
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 12px;
   min-height: 148px;
+  align-items: start;
 }
 
 .question-list:empty::before {
@@ -645,7 +652,7 @@ main {
 
 .question-card {
   position: relative;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
@@ -660,14 +667,16 @@ main {
   position: relative;
   display: block;
   width: 100%;
-  height: 168px;
+  min-height: 72px;
+  height: auto;
   padding: 0;
   background: #f7f6ef;
 }
 
 .select-area img {
+  display: block;
   width: 100%;
-  height: 100%;
+  height: auto;
   padding: 8px;
   object-fit: contain;
   background: #fffdf8;
