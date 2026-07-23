@@ -122,7 +122,7 @@ const GUIDE_STATE_LABELS = {
   [GUIDE_STATES.ARCHIVE]: "总结归档"
 };
 
-const SILENCE_CARE_MS = 120000;
+const SILENCE_CARE_MS = 60000;
 const SILENCE_AFTER_CARE_MS = 60000;
 const ERROR_SILENCE_MS = 60000;
 const BOARD_RECOGNITION_DELAY_MS = 6500;
@@ -138,7 +138,14 @@ const LISTENING_START_PROMPTS = [
 const BOARD_EXPAND_EDGE_PX = 96;
 const BOARD_MAX_PAGES = 6;
 const REPEATED_GUIDANCE_COOLDOWN_MS = 90000;
-const ACTIVE_HELP_PATTERN = /为什么|不懂|怎么来|怎么来的|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下/;
+const ACTIVE_HELP_PATTERN = /为什么|不懂|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下|怎么(?:来|来的|求|算|做|解|得到|列|消元|化简)|如何(?:求|算|做|解|得到|列|消元|化简)|该(?:怎么|如何)|能不能(?:提示|讲|告诉)|可以怎么/;
+
+function isDirectHelpRequest(text) {
+  const normalized = String(text || "").replace(/\s/g, "");
+  if (!normalized) return false;
+  if (ACTIVE_HELP_PATTERN.test(normalized)) return true;
+  return /(?:吗|呢|怎么办|是什么|是多少|对不对|行不行)[？?]?$/.test(normalized);
+}
 
 const state = {
   source: null,
@@ -161,6 +168,7 @@ const state = {
   boardImageStates: {},
   boardHeights: {},
   handwritingResults: {},
+  transcriptsByQuestion: {},
   tool: "pen",
   brushColor: "#f8f2d8",
   brushSize: 5,
@@ -186,8 +194,13 @@ const state = {
   speechNoResultTimer: null,
   transcriptCorrectionRequestId: 0,
   awaitingFinalAnswer: false,
+  pendingFinalAnswerText: "",
   finalAnswerVerified: false,
+  verifiedFinalAnswerText: "",
+  boardCompletionVerified: false,
+  completionCheckInProgress: false,
   finalAnswerRequestId: 0,
+  answerKeyStatusByQuestion: {},
   currentQuestionCompleted: false,
   hasExplicitFinalAnswer: false,
   pendingLianQuestion: null,
@@ -224,6 +237,15 @@ const state = {
   interactiveStepCount: 0,
   activeGuideRequestId: 0,
   silenceGuidePending: false,
+  teachSessionPaused: false,
+  teachPausedAt: 0,
+  resumeListeningAfterNavigation: false,
+  resumeSpeechAfterNavigation: false,
+  resumePendingThoughtAfterNavigation: false,
+  resumeHandwritingAfterNavigation: false,
+  resumeIssueTimerAfterNavigation: false,
+  recognitionResumeTimer: null,
+  ignoreNextRecognitionEnd: false,
   activeNotebookId: null,
   notebook: loadNotebook()
 };
@@ -238,11 +260,149 @@ function pickPrompt(key, variants) {
   return selected;
 }
 
+function pauseTeachSessionForNavigation() {
+  if (state.teachSessionPaused || !state.lecture.length) return;
+
+  state.teachSessionPaused = true;
+  state.teachPausedAt = Date.now();
+  state.resumeListeningAfterNavigation = state.isListening;
+  state.resumePendingThoughtAfterNavigation = Boolean(state.pendingThoughtTimer || state.pendingThoughtText);
+  state.resumeHandwritingAfterNavigation = Boolean(state.recognitionTimer);
+  state.resumeIssueTimerAfterNavigation = Boolean(state.issueSilenceTimer);
+  state.resumeSpeechAfterNavigation = Boolean(
+    "speechSynthesis" in window && window.speechSynthesis.speaking && !window.speechSynthesis.paused
+  );
+
+  stopSpeechNoResultTimer();
+  clearTimeout(state.silenceTimer);
+  state.silenceTimer = null;
+  clearTimeout(state.pendingThoughtTimer);
+  state.pendingThoughtTimer = null;
+  clearTimeout(state.recognitionTimer);
+  state.recognitionTimer = null;
+  clearIssueSilenceTimer();
+  clearTimeout(state.recognitionResumeTimer);
+  state.recognitionResumeTimer = null;
+  state.silenceGuidePending = false;
+  state.activeGuideRequestId += 1;
+  state.handwritingRequestId += 1;
+  state.finalAnswerRequestId += 1;
+
+  if (state.resumeSpeechAfterNavigation) window.speechSynthesis.pause();
+  if (state.resumeListeningAfterNavigation && state.speechRecognition) {
+    state.ignoreNextRecognitionEnd = true;
+    state.isListening = false;
+    try {
+      state.speechRecognition.stop();
+    } catch {
+      state.ignoreNextRecognitionEnd = false;
+    }
+  }
+
+  dom.recognitionPill.classList.add("hidden");
+  dom.studentAvatar.classList.remove("speaking");
+  dom.lianAvatar.classList.remove("speaking");
+  dom.lianAvatar.classList.add("listening");
+  dom.studentState.textContent = "讲解已暂停";
+  dom.lianState.textContent = "讲解已暂停";
+  dom.micBtn.innerHTML = `${iconMap.mic}已暂停`;
+}
+
+function shiftTeachSessionTimes(pausedFor) {
+  if (!(pausedFor > 0)) return;
+  [
+    "lastGuideAt",
+    "lastSpeechAt",
+    "lastBoardWriteAt",
+    "lastUserInputAt",
+    "lastEncourageAt",
+    "lastThoughtReviewAt",
+    "lastIssueAt",
+    "silenceCareAskedAt"
+  ].forEach((key) => {
+    if (state[key]) state[key] += pausedFor;
+  });
+}
+
+function resumeRecognitionAfterNavigation(attempt = 0) {
+  if (state.teachSessionPaused || !state.resumeListeningAfterNavigation || state.currentQuestionCompleted) return;
+  const recognition = getSpeechRecognition();
+  if (!recognition) {
+    state.resumeListeningAfterNavigation = false;
+    return;
+  }
+
+  clearTimeout(state.recognitionResumeTimer);
+  state.recognitionResumeTimer = null;
+  state.isListening = true;
+  dom.studentState.textContent = "正在恢复收听";
+  dom.micBtn.innerHTML = `${iconMap.mic}停止收听`;
+  try {
+    recognition.start();
+  } catch {
+    state.isListening = false;
+    if (attempt < 3) {
+      state.recognitionResumeTimer = setTimeout(() => resumeRecognitionAfterNavigation(attempt + 1), 220);
+      return;
+    }
+    state.resumeListeningAfterNavigation = false;
+    dom.studentState.textContent = "准备讲题";
+    dom.micBtn.innerHTML = `${iconMap.mic}开始收听`;
+  }
+}
+
+function resumeTeachSessionAfterNavigation() {
+  if (!state.teachSessionPaused || !state.lecture.length) return;
+
+  const pausedFor = Math.max(0, Date.now() - state.teachPausedAt);
+  const shouldResumeListening = state.resumeListeningAfterNavigation && !state.currentQuestionCompleted;
+  const shouldResumeSpeech = state.resumeSpeechAfterNavigation;
+  const shouldResumeThought =
+    !state.currentQuestionCompleted && state.resumePendingThoughtAfterNavigation && Boolean(state.pendingThoughtText);
+  const shouldResumeHandwriting =
+    !state.currentQuestionCompleted && state.resumeHandwritingAfterNavigation && hasCurrentBoardInk();
+  const shouldResumeIssueTimer =
+    !state.currentQuestionCompleted && state.resumeIssueTimerAfterNavigation && Boolean(state.lastIssueAt);
+
+  state.teachSessionPaused = false;
+  state.teachPausedAt = 0;
+  state.resumeSpeechAfterNavigation = false;
+  state.resumeListeningAfterNavigation = shouldResumeListening;
+  state.resumePendingThoughtAfterNavigation = false;
+  state.resumeHandwritingAfterNavigation = false;
+  state.resumeIssueTimerAfterNavigation = false;
+  shiftTeachSessionTimes(pausedFor);
+
+  dom.studentState.textContent = shouldResumeListening ? "正在恢复收听" : "准备讲题";
+  dom.lianState.textContent = guideIdleText();
+  dom.micBtn.innerHTML = shouldResumeListening ? `${iconMap.mic}停止收听` : `${iconMap.mic}开始收听`;
+
+  if (shouldResumeSpeech && "speechSynthesis" in window && window.speechSynthesis.paused) {
+    window.speechSynthesis.resume();
+  }
+  if (shouldResumeThought) {
+    state.pendingThoughtTimer = setTimeout(handleThoughtPause, THOUGHT_PAUSE_MS);
+  }
+  if (shouldResumeHandwriting) scheduleHandwritingRecognition("返回讲解页后");
+  if (shouldResumeIssueTimer) resetIssueSilenceTimer();
+  if (shouldResumeListening) resumeRecognitionAfterNavigation();
+}
+
 function showView(viewId) {
+  const activeViewId = Object.entries(views).find(([, view]) => view.classList.contains("active"))?.[0] || "";
+  const leavingTeachView = activeViewId === "teachView" && viewId !== "teachView";
+  const returningToTeachView = activeViewId !== "teachView" && viewId === "teachView";
+
+  if (leavingTeachView && viewId !== "completeView") pauseTeachSessionForNavigation();
   Object.entries(views).forEach(([id, view]) => view.classList.toggle("active", id === viewId));
   dom.navBtns.forEach((button) => button.classList.toggle("active", button.dataset.view === viewId));
   if (viewId === "notebookView") renderNotebook();
-  if (viewId === "teachView") requestAnimationFrame(resizeBoardCanvas);
+  if (viewId === "teachView") {
+    requestAnimationFrame(() => {
+      resizeBoardCanvas();
+      if (returningToTeachView) resumeTeachSessionAfterNavigation();
+    });
+  }
 }
 
 dom.navBtns.forEach((button) => {
@@ -323,12 +483,20 @@ function clearIssueSilenceTimer() {
 
 function resetIssueSilenceTimer() {
   clearIssueSilenceTimer();
+  if (state.teachSessionPaused) {
+    state.resumeIssueTimerAfterNavigation = Boolean(state.lastIssueAt);
+    return;
+  }
   if (!state.lastIssueAt || state.guideState === GUIDE_STATES.INTERACTIVE) return;
   const delay = Math.max(0, ERROR_SILENCE_MS - (Date.now() - state.lastIssueAt));
   state.issueSilenceTimer = setTimeout(handleIssueSilenceTimeout, delay);
 }
 
 function handleIssueSilenceTimeout() {
+  if (state.teachSessionPaused) {
+    state.resumeIssueTimerAfterNavigation = Boolean(state.lastIssueAt);
+    return;
+  }
   if (state.currentQuestionCompleted) return;
   if (!state.lastIssueAt || state.guideState === GUIDE_STATES.INTERACTIVE) return;
   if (getLastUserInputAt() > state.lastIssueAt + 500) return;
@@ -745,51 +913,83 @@ function normalizeSegmentResult(result, sourceSize = state.source) {
   const visibleQuestionCount = rawQuestions.length;
   let segments = rawQuestions
     .map((item) => {
-      const nonStandaloneRoles = new Set(["subQuestion", "table", "figure", "formula", "supportingContent"]);
-      if (nonStandaloneRoles.has(item.questionRole) || (!item.sourceQuestionNumber && item.parentQuestionNumber)) {
-        const subNumber = Array.isArray(item.subQuestions) ? item.subQuestions.join("、") : "";
-        console.debug(
-          item.questionRole === "subQuestion"
-            ? `[render] skip standalone card for subQuestion（${subNumber || "?"}）`
-            : "[render] standalone supporting-content card skipped"
-        );
-        return null;
-      }
-      if (!item.finalBox || typeof item.finalBox !== "object") {
-        console.error("[frontend-received] missing finalBox; question skipped", item);
-        return null;
-      }
-      const finalBox = clampSegmentBox(item.finalBox, sourceSize.width, sourceSize.height);
-      if (!finalBox) return null;
-      const sourceNumber = String(item.sourceQuestionNumber || item.questionNumber || item.number || "").trim();
-      console.log(
-        `[Q${sourceNumber || "?"}][frontend-received] top=${finalBox.y} bottom=${finalBox.y + finalBox.h} x=${finalBox.x} w=${finalBox.w}`
-      );
-      const title = String(item.problemText || item.title || "").trim();
-      const type = item.problemType || item.type || "";
-      const knowledge = normalizeMainKnowledgePoint(item.mainKnowledgePoint || item.knowledge || item.knowledgePoints, `${title} ${type}`);
-      if (isSuspiciousWholePageSegment(finalBox, item, knowledge, visibleQuestionCount, sourceSize)) return null;
-      return {
-        finalBox,
-        meta: {
-          questionNumber: String(item.sourceQuestionNumber || item.questionNumber || item.number || "").trim(),
-          sourceQuestionNumber: String(item.sourceQuestionNumber || item.questionNumber || item.number || "").trim(),
-          displayIndex: Number(item.displayIndex) || 0,
-          problemText: title,
-          problemType: sanitizeMathLabel(type),
-          knowledgePoints: knowledge.points,
-          confidence: Number(item.confidence) || 0,
-          generatedBy: String(item.generatedBy || result?.model || ""),
-          needsReview: Boolean(item.needsReview),
-          uncertain: Boolean(item.uncertain),
-          validation: Array.isArray(item.validation) ? item.validation : [],
-          mergeReasons: Array.isArray(item.mergeReasons) ? item.mergeReasons : [],
-          questionRole: item.questionRole || "mainQuestion",
-          parentQuestionNumber: String(item.parentQuestionNumber || "").trim(),
-          subQuestions: Array.isArray(item.subQuestions) ? item.subQuestions.map(String) : [],
-          isPrimary: item.isPrimary !== false
+      try {
+        if (!item || typeof item !== "object") {
+          console.warn("[segment-normalize] ignored empty question result", item);
+          return null;
         }
-      };
+        const nonStandaloneRoles = new Set(["subQuestion", "table", "figure", "formula", "supportingContent"]);
+        if (nonStandaloneRoles.has(item.questionRole) || (!item.sourceQuestionNumber && item.parentQuestionNumber)) {
+          const subNumber = Array.isArray(item.subQuestions) ? item.subQuestions.join("、") : "";
+          console.debug(
+            item.questionRole === "subQuestion"
+              ? `[render] skip standalone card for subQuestion（${subNumber || "?"}）`
+              : "[render] standalone supporting-content card skipped"
+          );
+          return null;
+        }
+        const receivedBox = item.finalBox && typeof item.finalBox === "object" ? item.finalBox : item;
+        const finalBox = clampSegmentBox(receivedBox, sourceSize.width, sourceSize.height);
+        if (!finalBox) {
+          console.warn("[segment-normalize] invalid finalBox; question skipped", item);
+          return null;
+        }
+        const sourceNumber = String(item.sourceQuestionNumber || item.questionNumber || item.number || "").trim();
+        console.log(
+          `[Q${sourceNumber || "?"}][frontend-received] top=${finalBox.y} bottom=${finalBox.y + finalBox.h} x=${finalBox.x} w=${finalBox.w}`
+        );
+        const title = String(item.problemText || item.title || "").trim();
+        const type = item.problemType || item.type || "";
+        const knowledge = normalizeMainKnowledgePoint(item.mainKnowledgePoint || item.knowledge || item.knowledgePoints, `${title} ${type}`);
+        if (isSuspiciousWholePageSegment(finalBox, item, knowledge, visibleQuestionCount, sourceSize)) return null;
+        return {
+          finalBox,
+          meta: {
+            questionNumber: sourceNumber,
+            sourceQuestionNumber: sourceNumber,
+            displayIndex: Number(item.displayIndex) || 0,
+            problemText: title,
+            problemType: sanitizeMathLabel(type),
+            knowledgePoints: knowledge.points,
+            confidence: Number(item.confidence) || 0,
+            generatedBy: String(item.generatedBy || result?.model || ""),
+            needsReview: Boolean(item.needsReview),
+            uncertain: Boolean(item.uncertain),
+            validation: Array.isArray(item.validation) ? item.validation : [],
+            mergeReasons: Array.isArray(item.mergeReasons) ? item.mergeReasons : [],
+            questionRole: item.questionRole || "mainQuestion",
+            parentQuestionNumber: String(item.parentQuestionNumber || "").trim(),
+            subQuestions: Array.isArray(item.subQuestions) ? item.subQuestions.map(String) : [],
+            isPrimary: item.isPrimary !== false
+          }
+        };
+      } catch (error) {
+        console.error("[segment-normalize] question metadata failed; preserving remaining questions", error, item);
+        const fallbackBox = clampSegmentBox(item?.finalBox || item || {}, sourceSize.width, sourceSize.height);
+        if (!fallbackBox) return null;
+        const sourceNumber = String(item?.sourceQuestionNumber || item?.questionNumber || item?.number || "").trim();
+        return {
+          finalBox: fallbackBox,
+          meta: {
+            questionNumber: sourceNumber,
+            sourceQuestionNumber: sourceNumber,
+            displayIndex: Number(item?.displayIndex) || 0,
+            problemText: String(item?.problemText || item?.title || "").trim(),
+            problemType: "",
+            knowledgePoints: [],
+            confidence: Number(item?.confidence) || 0,
+            generatedBy: String(item?.generatedBy || result?.model || ""),
+            needsReview: Boolean(item?.needsReview),
+            uncertain: Boolean(item?.uncertain),
+            validation: [],
+            mergeReasons: [],
+            questionRole: "mainQuestion",
+            parentQuestionNumber: "",
+            subQuestions: [],
+            isPrimary: true
+          }
+        };
+      }
     })
     .filter(Boolean);
 
@@ -1389,8 +1589,13 @@ function startLecture(queue) {
   state.boardImageStates = {};
   state.boardHeights = {};
   state.handwritingResults = {};
+  state.transcriptsByQuestion = {};
   state.awaitingFinalAnswer = false;
+  state.pendingFinalAnswerText = "";
   state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.boardCompletionVerified = false;
+  state.completionCheckInProgress = false;
   state.finalAnswerRequestId = 0;
   state.currentQuestionCompleted = false;
   state.hasExplicitFinalAnswer = false;
@@ -1573,11 +1778,17 @@ function hasCurrentBoardInk(question = currentPageQuestion()) {
 }
 
 function markCurrentBoardInk(question = currentPageQuestion()) {
-  if (question) state.boardInkByQuestion[question.id] = true;
+  if (question) {
+    state.boardInkByQuestion[question.id] = true;
+    state.boardCompletionVerified = false;
+  }
 }
 
 function clearCurrentBoardInk(question = currentPageQuestion()) {
-  if (question) state.boardInkByQuestion[question.id] = false;
+  if (question) {
+    state.boardInkByQuestion[question.id] = false;
+    state.boardCompletionVerified = false;
+  }
 }
 
 function pushHistory() {
@@ -1590,7 +1801,9 @@ function pushHistory() {
 
 function saveCurrentPage() {
   const question = currentPageQuestion();
-  if (!question || !dom.canvas.width) return;
+  if (!question) return;
+  state.transcriptsByQuestion[question.id] = dom.transcriptInput.value;
+  if (!dom.canvas.width) return;
   const pages = pagesForQuestion(question.id);
   pages[0] = dom.canvas.toDataURL("image/png");
 }
@@ -1600,10 +1813,34 @@ function loadCurrentPage() {
   applyBoardHeight(question);
   clearCanvasOnly();
   if (!question) return;
+  dom.transcriptInput.value = state.transcriptsByQuestion[question.id] || "";
+  dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
+  prefetchVerifiedAnswerKey(question);
   if (dom.boardQuestionImage.src !== question.image) dom.boardQuestionImage.src = question.image;
   const pages = pagesForQuestion(question.id);
   drawDataUrlToCanvas(pages[0] || "");
   applyBoardImageState();
+}
+
+async function prefetchVerifiedAnswerKey(question) {
+  if (!question?.id || !question.image) return;
+  const currentStatus = state.answerKeyStatusByQuestion[question.id];
+  if (["loading", "ready"].includes(currentStatus)) return;
+  state.answerKeyStatusByQuestion[question.id] = "loading";
+  try {
+    const response = await fetch("/api/answer-key", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        questionImage: question.image,
+        problemText: question.problemText || ""
+      })
+    });
+    const result = await response.json().catch(() => ({}));
+    state.answerKeyStatusByQuestion[question.id] = response.ok && result.ready ? "ready" : "unverified";
+  } catch {
+    state.answerKeyStatusByQuestion[question.id] = "unverified";
+  }
 }
 
 function showBoardStatusPill(text, duration = 1200) {
@@ -1960,6 +2197,7 @@ function resetQuestionGuideState() {
   state.stuckCount = 0;
   state.currentQuestionCompleted = false;
   state.hasExplicitFinalAnswer = false;
+  state.pendingFinalAnswerText = "";
   state.pendingLianQuestion = null;
   clearIssueTracking();
   clearSilenceFollowup();
@@ -1967,12 +2205,17 @@ function resetQuestionGuideState() {
   state.handwritingRequestId += 1;
   state.awaitingFinalAnswer = false;
   state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.boardCompletionVerified = false;
+  state.completionCheckInProgress = false;
   state.finalAnswerRequestId += 1;
   state.silenceGuidePending = false;
   state.latestHandwritingResult = null;
   state.lastHandwritingIssueKey = "";
   state.lastHandwritingSuccessKey = "";
   state.lastHandwritingUnclearKey = "";
+  dom.eventLog.innerHTML = "";
+  state.logItemsByKey.clear();
   dom.recognitionPill.classList.add("hidden");
   dom.lianState.textContent = guideIdleText();
   dom.lianBubble.textContent = pickPrompt("question-change", [
@@ -1987,6 +2230,10 @@ function resetQuestionGuideState() {
 function scheduleHandwritingRecognition(reason) {
   clearTimeout(state.recognitionTimer);
   if (!hasCurrentBoardInk()) return;
+  if (state.teachSessionPaused) {
+    state.resumeHandwritingAfterNavigation = true;
+    return;
+  }
   if (state.isListening) {
     const quietFor = Date.now() - (state.lastSpeechAt || 0);
     if (quietFor < SPEECH_QUIET_BEFORE_BOARD_MS) {
@@ -2055,6 +2302,10 @@ function explainHandwritingError(error) {
 
 async function runHandwritingRecognition(reason) {
   const question = currentPageQuestion();
+  if (state.teachSessionPaused) {
+    state.resumeHandwritingAfterNavigation = Boolean(question && hasCurrentBoardInk(question));
+    return;
+  }
   if (state.currentQuestionCompleted || !question || !dom.canvas.width || !hasCurrentBoardInk(question)) return;
   if (state.isListening && Date.now() - (state.lastSpeechAt || 0) < SPEECH_QUIET_BEFORE_BOARD_MS) {
     scheduleHandwritingRecognition(reason);
@@ -2080,6 +2331,7 @@ async function runHandwritingRecognition(reason) {
     }
     state.latestHandwritingResult = result;
     state.handwritingResults[question.id] = result;
+    state.boardCompletionVerified = isBoardCompletionVerified(result);
 
     if (isIncompleteHandwritingIssue(result)) {
       dom.recognitionPill.textContent = "等你写完";
@@ -2141,6 +2393,41 @@ async function requestHandwritingAnalysis(question, reason) {
   state.handwritingDisabledUntil = 0;
   state.lastHandwritingServiceError = "";
   return result;
+}
+
+async function verifyCurrentBoardForCompletion(question) {
+  if (!question || !hasCurrentBoardInk(question)) {
+    state.boardCompletionVerified = false;
+    return {
+      verified: false,
+      result: null,
+      guidance: "黑板上还没有可核验的步骤。请写下一个关键关系式、公式或计算步骤，再点一次我讲完了。"
+    };
+  }
+
+  const requestId = ++state.handwritingRequestId;
+  const questionId = question.id;
+  saveCurrentPage();
+  dom.recognitionPill.textContent = "正在检查板书步骤";
+  dom.recognitionPill.classList.remove("hidden");
+
+  const result = normalizeHandwritingResult(
+    await requestHandwritingAnalysis(question, "完成讲解前检查：判断板书是否至少包含一个与本题相关且正确的关键步骤")
+  );
+  if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) {
+    return { verified: false, stale: true, result: null, guidance: "题目已经切换，本次板书检查已取消。" };
+  }
+
+  state.latestHandwritingResult = result;
+  state.handwritingResults[question.id] = result;
+  const verified = isBoardCompletionVerified(result);
+  state.boardCompletionVerified = verified;
+  dom.recognitionPill.textContent = verified ? "板书步骤已确认" : "板书还需一个正确步骤";
+  return {
+    verified,
+    result,
+    guidance: verified ? "" : getBoardCompletionGuidance(result)
+  };
 }
 
 async function createCurrentBoardSnapshot() {
@@ -2272,6 +2559,8 @@ function normalizeHandwritingResult(result) {
   const confidence = Number(result.confidence);
   const normalized = {
     ...result,
+    boardComplete: result.boardComplete === true,
+    missingBoardContent: String(result.missingBoardContent || "").trim(),
     confidence: Number.isFinite(confidence) ? confidence : 0
   };
 
@@ -2284,6 +2573,8 @@ function normalizeHandwritingResult(result) {
       expectedNextStep: normalized.expectedNextStep || "回到前面的关系式，重新核对等号后的结果。",
       guidance: normalized.guidance || "我们一起检查一下最后这个结果，按前面的关系式再算一遍。",
       positiveFeedback: "",
+      boardComplete: false,
+      missingBoardContent: normalized.missingBoardContent || "板书中的计算或最终结论还需要修正。",
       confidence: Math.max(normalized.confidence, 0.65)
     };
   }
@@ -2310,6 +2601,8 @@ function normalizeHandwritingResult(result) {
     expectedNextStep: normalized.expectedNextStep || "按比例式交叉相乘，重新算等号后的 x 值。",
     guidance: normalized.guidance || "我们一起检查一下最后这个 x 值，按前面的比例式交叉相乘再算一遍。",
     positiveFeedback: "",
+    boardComplete: false,
+    missingBoardContent: normalized.missingBoardContent || "板书中的计算与最终结论还没有一致。",
     confidence: Math.max(normalized.confidence, 0.72)
   };
 }
@@ -2325,6 +2618,33 @@ function isHandwritingCalculationCorrect(result) {
     !hasAssignmentConflict(result) &&
     !hasContradictoryCorrectSignal(result)
   );
+}
+
+function isBoardCompletionVerified(result) {
+  return Boolean(
+    result?.answerVerification === "double-verified" &&
+    result?.boardComplete === true &&
+    result?.isRelevant === true &&
+    result?.calculationStatus === "correct" &&
+    Number(result?.confidence) >= 0.6 &&
+    !isIncompleteHandwritingIssue(result) &&
+    !hasAssignmentConflict(result) &&
+    !hasContradictoryCorrectSignal(result)
+  );
+}
+
+function getBoardCompletionGuidance(result) {
+  if (!result) return "我还没能确认板书步骤。请在黑板上写下一个关键关系式、公式或计算步骤，再点一次我讲完了。";
+  if (isHandwritingCalculationWrong(result)) {
+    return result.guidance || result.issueSummary || "你的口头答案已经核对过了，但板书里还有一步需要检查。先把板书中的计算和最终结论改一致。";
+  }
+  if (result.calculationStatus === "unclear") {
+    return "答案已经核对过了，不过板书里的关键步骤我还没看清。请把其中一个关系式或计算步骤写清楚，再点一次我讲完了。";
+  }
+  const missing = String(result.missingBoardContent || result.expectedNextStep || "").trim();
+  return missing
+    ? `答案已经核对正确，板书还需要一个可核验的步骤：${missing}。补上后再点一次我讲完了。`
+    : "答案已经核对正确，黑板上再留下一个可核验的正确步骤，就可以结束这道题。";
 }
 
 function maybeSpeakHandwritingSuccess(result) {
@@ -2497,8 +2817,21 @@ function getSpeechRecognition() {
   recognition.interimResults = true;
 
   recognition.onstart = () => {
+    if (state.teachSessionPaused) {
+      state.isListening = false;
+      state.ignoreNextRecognitionEnd = true;
+      try {
+        recognition.stop();
+      } catch {
+        state.ignoreNextRecognitionEnd = false;
+      }
+      return;
+    }
     const wasListening = state.isListening;
     state.isListening = true;
+    state.resumeListeningAfterNavigation = false;
+    clearTimeout(state.recognitionResumeTimer);
+    state.recognitionResumeTimer = null;
     dom.micBtn.innerHTML = `${iconMap.mic}停止收听`;
     dom.studentAvatar.classList.remove("speaking");
     dom.studentState.textContent = "正在收听";
@@ -2508,21 +2841,25 @@ function getSpeechRecognition() {
   };
 
   recognition.onaudiostart = () => {
+    if (state.teachSessionPaused) return;
     dom.studentState.textContent = "正在收听";
     startSpeechNoResultTimer();
   };
 
   recognition.onsoundstart = () => {
+    if (state.teachSessionPaused) return;
     dom.studentState.textContent = "听到声音";
   };
 
   recognition.onspeechstart = () => {
+    if (state.teachSessionPaused) return;
     clearTimeout(state.recognitionTimer);
     dom.studentAvatar.classList.add("speaking");
     dom.studentState.textContent = "正在讲题";
   };
 
   recognition.onresult = (event) => {
+    if (state.teachSessionPaused) return;
     let finalText = "";
     let interimText = "";
     for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -2547,6 +2884,7 @@ function getSpeechRecognition() {
   };
 
   recognition.onerror = (event) => {
+    if (state.teachSessionPaused) return;
     if (event.error === "no-speech") {
       dom.studentAvatar.classList.remove("speaking");
       dom.studentState.textContent = "安静中";
@@ -2596,6 +2934,18 @@ function getSpeechRecognition() {
 
   recognition.onend = () => {
     stopSpeechNoResultTimer();
+    if (state.ignoreNextRecognitionEnd) {
+      state.ignoreNextRecognitionEnd = false;
+      state.isListening = false;
+      dom.studentAvatar.classList.remove("speaking");
+      if (state.teachSessionPaused) {
+        dom.studentState.textContent = "讲解已暂停";
+        dom.micBtn.innerHTML = `${iconMap.mic}已暂停`;
+      } else if (state.resumeListeningAfterNavigation) {
+        state.recognitionResumeTimer = setTimeout(() => resumeRecognitionAfterNavigation(), 120);
+      }
+      return;
+    }
     const draft = clearSpeechDraft();
     if (draft) {
       void handleRecognizedSpeech(draft);
@@ -2698,6 +3048,25 @@ async function toggleListening() {
       );
     }
   }
+}
+
+function stopListeningAfterSessionCompletion() {
+  stopSpeechNoResultTimer();
+  clearTimeout(state.recognitionTimer);
+  clearTimeout(state.silenceTimer);
+  clearPendingThought();
+  clearSilenceFollowup();
+  state.silenceGuidePending = false;
+  state.isListening = false;
+  clearSpeechDraft();
+  try {
+    state.speechRecognition?.stop();
+  } catch {
+    // Recognition may already be stopped by the browser.
+  }
+  dom.micBtn.innerHTML = `${iconMap.mic}开始收听`;
+  dom.studentAvatar.classList.remove("speaking");
+  dom.studentState.textContent = "讲解完成";
 }
 
 function appendTranscript(text) {
@@ -2824,7 +3193,19 @@ async function commitSpeechTextWithCorrection(text) {
 }
 
 async function handleRecognizedSpeech(text) {
-  const spokenText = await commitSpeechTextWithCorrection(text);
+  clearSpeechDraft();
+  const immediateText = normalizeMathSpeechText(text);
+  if (!immediateText) return;
+  appendTranscript(immediateText);
+
+  // A direct question must not wait for the optional transcript-correction request.
+  if (isDirectHelpRequest(immediateText) || state.awaitingFinalAnswer) {
+    handleStudentSpeech(immediateText);
+    void correctLatestTranscript(immediateText);
+    return;
+  }
+
+  const spokenText = await correctLatestTranscript(immediateText);
   if (spokenText) handleStudentSpeech(spokenText);
 }
 
@@ -2853,6 +3234,8 @@ function stopSpeechNoResultTimer() {
 
 function resetSilenceTimer(updateSpeechAt = true) {
   clearTimeout(state.silenceTimer);
+  state.silenceTimer = null;
+  if (state.teachSessionPaused) return;
   const now = Date.now();
   if (updateSpeechAt || !state.lastSpeechAt) state.lastSpeechAt = now;
   if (!state.lastUserInputAt) state.lastUserInputAt = getLastUserInputAt() || now;
@@ -2864,6 +3247,7 @@ function resetSilenceTimer(updateSpeechAt = true) {
 }
 
 function handleSilenceTimeout() {
+  if (state.teachSessionPaused) return;
   if (!state.isListening) return;
 
   const now = Date.now();
@@ -2893,22 +3277,25 @@ function handleSilenceTimeout() {
   setGuideState(GUIDE_STATES.MICRO_HINT);
   state.awaitingSilenceFollowup = true;
   state.silenceCareAskedAt = now;
-  lianSpeak(
-    pickPrompt("silence-care", [
-      "我听到你停了一会儿，是思路卡在哪一步了吗？你可以先说说卡住的地方。",
-      "你先不用急着算，刚才是不是有一步不太确定？说说你停在哪里。",
-      "我在听。要是刚好卡住了，你告诉我是哪一步，我们一起拆开看。"
+  requestSmartGuide("silence", "", {
+    force: true,
+    guideState: GUIDE_STATES.MICRO_HINT,
+    silenceSeconds: Math.round(idleMs / 1000),
+    fallbackText: pickPrompt("silence-care", [
+      "你停了一会儿。我们先接着刚才那一步想：题目里哪个条件还没有用上？",
+      "先不用急着往后算。回到刚才的思路，看看哪一个已知条件能接上这一步。",
+      "我们从刚才停下的位置接着看。你先找找题目里还没用到的那个关系。"
     ])
-  );
-  resetSilenceTimer(false);
+  });
 }
 
 function handleStudentSpeech(text) {
   text = normalizeMathSpeechText(text);
   if (!text) return;
   const normalized = text.replace(/\s/g, "");
+  markUserInput("speech");
   if (state.awaitingFinalAnswer) {
-    if (ACTIVE_HELP_PATTERN.test(normalized)) {
+    if (isDirectHelpRequest(normalized)) {
       lianSpeak(
         pickPrompt("final-answer-repeat", [
           "先不用急着讲过程，你先告诉我这道题最后得到的答案。",
@@ -2918,13 +3305,21 @@ function handleStudentSpeech(text) {
       );
       return;
     }
-    void handleFinalAnswerSubmission(text);
+    const combinedAnswer = [state.pendingFinalAnswerText, text].filter(Boolean).join(" ").trim();
+    if (!hasConcreteFinalAnswer(combinedAnswer)) {
+      state.pendingFinalAnswerText = combinedAnswer;
+      state.activeGuideRequestId += 1;
+      clearPendingThought();
+      dom.lianState.textContent = "等你说完答案";
+      return;
+    }
+    state.pendingFinalAnswerText = "";
+    void handleFinalAnswerSubmission(combinedAnswer);
     return;
   }
   recordFinalAnswerEvidence(text);
   if (state.currentQuestionCompleted) return;
   clearTimeout(state.recognitionTimer);
-  markUserInput("speech");
   state.activeGuideRequestId += 1;
   dom.studentAvatar.classList.add("speaking");
   dom.studentState.textContent = "正在讲题";
@@ -2941,7 +3336,7 @@ function handleStudentSpeech(text) {
     return;
   }
 
-  if (/听懂了|懂了|明白了|会了/.test(normalized) && state.guideState === GUIDE_STATES.INTERACTIVE && !ACTIVE_HELP_PATTERN.test(normalized)) {
+  if (/听懂了|懂了|明白了|会了/.test(normalized) && state.guideState === GUIDE_STATES.INTERACTIVE && !isDirectHelpRequest(normalized)) {
     clearPendingThought();
     setGuideState(GUIDE_STATES.HEURISTIC);
     clearIssueTracking();
@@ -2955,7 +3350,7 @@ function handleStudentSpeech(text) {
     return;
   }
 
-  if (ACTIVE_HELP_PATTERN.test(normalized)) {
+  if (isDirectHelpRequest(normalized)) {
     clearPendingThought();
     state.stuckCount += 1;
     clearSilenceFollowup();
@@ -3033,8 +3428,47 @@ function recordFinalAnswerEvidence(text) {
     /(?:选|选择|选了|选的是|答案是|答案为|正确选项是)[A-D](?:选项|项)?/.test(normalized) ||
     /[A-D](?:选项|项)/.test(normalized) ||
     /(?:正确答案|最后答案|最终答案)[^。！？!?]{0,12}[A-D]/.test(normalized);
-  if (mentionsOption) state.hasExplicitFinalAnswer = true;
-  return mentionsOption;
+  const mentionsNumericOrExpression =
+    /(?:最后|最终)?(?:答案|结果)(?:是|为|等于)?[^。！？!?]{1,24}/.test(normalized) ||
+    /(?:所以|因此|故)[^。！？!?]{0,24}(?:=|等于|是|为)[^。！？!?]{1,18}/.test(normalized) ||
+    /(?:最后|最终)[^。！？!?]{0,16}(?:=|等于|是|为)[^。！？!?]{1,18}/.test(normalized);
+  const hasEvidence = mentionsOption || mentionsNumericOrExpression;
+  if (hasEvidence) {
+    if (state.finalAnswerVerified) {
+      state.finalAnswerVerified = false;
+      state.verifiedFinalAnswerText = "";
+    }
+    state.hasExplicitFinalAnswer = true;
+  }
+  return hasEvidence;
+}
+
+function extractFinalAnswerCandidate(text) {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  const segments = value
+    .split(/[\n。！？!?]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const explicitPattern = /(?:最后|最终)?(?:答案|结果)|(?:所以|因此|故).*(?:=|等于|是|为)|(?:最后|最终).*(?:=|等于|是|为)|[A-D](?:选项|项)/i;
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    if (explicitPattern.test(segments[index])) return segments[index].slice(-240);
+  }
+  return state.hasExplicitFinalAnswer ? value.slice(-240) : "";
+}
+
+function hasConcreteFinalAnswer(text) {
+  const normalized = String(text || "")
+    .replace(/\s/g, "")
+    .replace(/^(?:最后|最终)?(?:答案|结果)?(?:是|为|等于)?/, "");
+  if (!normalized || /^(?:是|为|等于)$/.test(normalized)) return false;
+  return Boolean(
+    /[A-D]/i.test(normalized) ||
+      /(?:^|[=＝]|等于|为)[负-]?(?:\d|[零一二三四五六七八九十百千万])/.test(normalized) ||
+      /^[负-]?(?:\d|[零一二三四五六七八九十百千万])/.test(normalized) ||
+      /[a-zA-Z](?:=|＝|等于|为)[负-]?(?:\d|[零一二三四五六七八九十百千万])/.test(normalized) ||
+      /无解|无数解|不存在|无法确定/.test(normalized)
+  );
 }
 
 function scheduleThoughtPauseReview(text, flags = {}) {
@@ -3050,6 +3484,10 @@ function scheduleThoughtPauseReview(text, flags = {}) {
   dom.lianState.textContent = "安静听你讲";
   dom.lianAvatar.classList.add("listening");
 
+  if (state.teachSessionPaused) {
+    state.resumePendingThoughtAfterNavigation = true;
+    return;
+  }
   state.pendingThoughtTimer = setTimeout(handleThoughtPause, THOUGHT_PAUSE_MS);
 }
 
@@ -3063,6 +3501,10 @@ function clearPendingThought() {
 }
 
 function handleThoughtPause() {
+  if (state.teachSessionPaused) {
+    state.resumePendingThoughtAfterNavigation = Boolean(state.pendingThoughtText);
+    return;
+  }
   if (state.currentQuestionCompleted) return;
   const now = Date.now();
   if (now - state.lastSpeechAt < THOUGHT_PAUSE_MS - 200) {
@@ -3094,7 +3536,7 @@ function handleThoughtPause() {
 function shouldReviewThoughtPause(text, meta = {}) {
   const normalized = text.replace(/\s/g, "");
   const now = Date.now();
-  if (ACTIVE_HELP_PATTERN.test(normalized)) return false;
+  if (isDirectHelpRequest(normalized)) return false;
   if (now - state.lastGuideAt < THOUGHT_REVIEW_COOLDOWN_MS) return false;
   if (now - state.lastThoughtReviewAt < THOUGHT_REVIEW_COOLDOWN_MS) return false;
   if (normalized.length < 18 && meta.segmentCount < 2 && !meta.hasConclusion) return false;
@@ -3158,6 +3600,7 @@ function buildThoughtPauseFallback(text, meta = {}) {
 }
 
 async function requestSmartGuide(eventType, latestStudentSpeech = "", options = {}) {
+  if (state.teachSessionPaused) return false;
   if (state.currentQuestionCompleted) return false;
   const now = Date.now();
   const cooldown = options.cooldown ?? 15000;
@@ -3176,10 +3619,11 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
 
   try {
     const result = await requestAIGuide(eventType, latestStudentSpeech, options);
-    if (requestId !== state.activeGuideRequestId || currentPageQuestion()?.id !== questionId) return false;
+    if (state.teachSessionPaused || requestId !== state.activeGuideRequestId || currentPageQuestion()?.id !== questionId) {
+      return false;
+    }
     const lectureComplete = shouldCompleteCurrentLecture(result, latestStudentSpeech);
     const speech = formatGuideSpeech(eventType, result, fallbackText);
-    if (lectureComplete) markCurrentQuestionComplete();
     if (result.shouldSpeak === false && !options.force) {
       dom.lianState.textContent = guideIdleText();
       if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
@@ -3192,7 +3636,9 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     return true;
   } catch (error) {
     console.warn("AI guide fallback:", error);
-    if (requestId !== state.activeGuideRequestId || currentPageQuestion()?.id !== questionId) return false;
+    if (state.teachSessionPaused || requestId !== state.activeGuideRequestId || currentPageQuestion()?.id !== questionId) {
+      return false;
+    }
     lianSpeak(fallbackText);
     if (isSilenceGuide && state.isListening) resetSilenceTimer();
     return true;
@@ -3232,7 +3678,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       thoughtSegments: options.thoughtSegments || 0,
       hasConclusion: Boolean(options.hasConclusion),
       hasMathStep: Boolean(options.hasMathStep),
-      studentFinalAnswerEvidence: state.hasExplicitFinalAnswer
+      studentFinalAnswerEvidence: state.hasExplicitFinalAnswer,
+      answerVerified: state.finalAnswerVerified,
+      boardCompletionVerified: state.boardCompletionVerified
     })
   });
   const result = await response.json().catch(() => ({}));
@@ -3241,19 +3689,17 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
 }
 
 function shouldCompleteCurrentLecture(result, latestStudentSpeech = "") {
-  if (result?.lectureComplete === true) return true;
-  if (!state.hasExplicitFinalAnswer) return false;
-
-  const combined = [result?.speech, result?.studentAction, latestStudentSpeech]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s/g, "");
-  if (/(还没|没有|尚未|未完成|继续讲|再说|复述|下一步)/.test(combined)) return false;
-  return /(?:两个结论|结论.*(?:判断|确定|对上)|正确的选项|选上.*选项|讲解.*完成|思路.*完整|答案.*确定)/.test(combined);
+  void latestStudentSpeech;
+  return Boolean(
+    result?.lectureComplete === true &&
+    state.finalAnswerVerified &&
+    state.boardCompletionVerified
+  );
 }
 
 function markCurrentQuestionComplete() {
-  if (state.currentQuestionCompleted) return;
+  if (state.currentQuestionCompleted) return true;
+  if (!state.finalAnswerVerified || !state.boardCompletionVerified) return false;
   state.currentQuestionCompleted = true;
   clearPendingThought();
   clearTimeout(state.recognitionTimer);
@@ -3264,6 +3710,7 @@ function markCurrentQuestionComplete() {
   state.handwritingRequestId += 1;
   setGuideState(GUIDE_STATES.ARCHIVE);
   dom.lianState.textContent = "本题讲解完成";
+  return true;
 }
 
 function getBoardImageForGuide() {
@@ -3287,15 +3734,15 @@ function formatGuideSpeech(eventType, result, fallbackText) {
     speech += pickPrompt("formula-step", [
       ` 可以先写：${formulaOrStep}。你照这个关系再讲一遍。`,
       ` 你可以先把${formulaOrStep}写下来，再用自己的话说一次。`,
-      ` 先试着写出${formulaOrStep}，然后接着讲这一步。`
+      ` 先试着写出${formulaOrStep}，然后接着讲这一步就行了。`
     ]);
   }
 
-  if (lectureUnlocked && result?.askStudentToRepeat && !/讲一遍|说一遍|写到黑板|复述/.test(speech)) {
+  if (lectureUnlocked && result?.askStudentToRepeat && !/讲一遍|说一遍|写到黑板|复述|接着讲|继续讲|讲这一步/.test(speech)) {
     speech += pickPrompt("ask-repeat", [
       "听懂后，你用自己的话讲一遍，也可以写到黑板上。",
       "你理解后，把这一步再讲一次，或者在黑板上写出来。",
-      "接下来交给你，用自己的话复述一遍，写下来也可以。"
+      "你用自己的话讲一遍就好。"
     ]);
   }
 
@@ -3461,7 +3908,37 @@ function consumePendingLianQuestion() {
   return pending;
 }
 
+function prepareLianSpeechText(value) {
+  let text = String(value || "")
+    .replace(/[−﹣－]/g, "-")
+    .replace(/[×✕]/g, "乘")
+    .replace(/÷/g, "除以");
+
+  // SpeechSynthesis often drops a bare minus. Resolve binary subtraction first,
+  // then pronounce the remaining unary signs explicitly as "负".
+  text = text
+    .replace(/([A-Za-z\d①②③④⑤⑥⑦⑧⑨⑩）)\]])\s*-\s*(?=[A-Za-z\d①②③④⑤⑥⑦⑧⑨⑩（(\[])/g, "$1减")
+    .replace(/(减去|加上|等于|等于了|为|是|得到|得出|结果为|写成|代入)\s*-\s*(?=[A-Za-z\d])/g, "$1负")
+    .replace(/(^|[=＝（(【\[，,。；;：:、+*/])\s*-\s*(?=[A-Za-z\d])/gm, "$1负")
+    .replace(/-\s*(?=[A-Za-z\d])/g, "负")
+    .replace(/(?:左|右)(?:小|中|大|圆|方)?括号/g, "")
+    .replace(/[（）()【】\[\]{}｛｝]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Force the row-related reading háng without changing the visible response.
+  return text
+    .replace(/(最后一|最后|这一|那一|上一|下一|每一|同一|另一)\s*行/g, "$1杭")
+    .replace(/(第\s*[一二三四五六七八九十百\d]+)\s*行/g, "$1杭")
+    .replace(/([一二三四五六七八九十两\d]+)\s*行(?=(?:字|数|式|内容|数据|文字|公式|分别|是|为|中|里|上|下|，|。|；|：|$))/g, "$1杭")
+    .replace(/行列/g, "杭列")
+    .replace(/行数/g, "杭数")
+    .replace(/逐行/g, "逐杭")
+    .replace(/换行/g, "换杭");
+}
+
 function lianSpeak(text, options = {}) {
+  if (state.teachSessionPaused && options.allowWhilePaused !== true) return Promise.resolve(false);
   const now = Date.now();
   const dedupeKey = getGuidanceDedupeKey(text, options);
   const cooldownMs = Number.isFinite(options.cooldownMs) ? options.cooldownMs : REPEATED_GUIDANCE_COOLDOWN_MS;
@@ -3497,7 +3974,8 @@ function lianSpeak(text, options = {}) {
 
     if (!state.isMuted && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
+      const speechText = prepareLianSpeechText(text);
+      const utterance = new SpeechSynthesisUtterance(speechText);
       utterance.lang = "zh-CN";
       const voice = getLianVoice();
       if (voice) utterance.voice = voice;
@@ -3536,6 +4014,7 @@ function lianSilentNotice(text, options = {}) {
 function askForFinalAnswer() {
   if (!state.lecture.length || state.finalAnswerVerified) return;
   state.awaitingFinalAnswer = true;
+  state.pendingFinalAnswerText = "";
   setGuideState(GUIDE_STATES.INTERACTIVE);
   lianSpeak(
     pickPrompt("ask-final-answer", [
@@ -3558,7 +4037,8 @@ async function requestFinalAnswerCheck(answer) {
       boardImage: getBoardImageForGuide(),
       answer,
       lectureText: dom.transcriptInput.value.trim(),
-      latestHandwritingResult: state.latestHandwritingResult
+      latestHandwritingResult: state.latestHandwritingResult,
+      problemText: question.problemText || ""
     })
   });
   const result = await response.json().catch(() => ({}));
@@ -3566,12 +4046,60 @@ async function requestFinalAnswerCheck(answer) {
   return result;
 }
 
+async function verifyBoardAndCompleteQuestion(options = {}) {
+  const question = currentPageQuestion();
+  if (!question || !state.finalAnswerVerified || state.completionCheckInProgress) return false;
+
+  state.completionCheckInProgress = true;
+  dom.finishQuestionBtn.disabled = true;
+  setGuideState(GUIDE_STATES.INTERACTIVE);
+
+  try {
+    const boardCheck = await verifyCurrentBoardForCompletion(question);
+    if (boardCheck.stale || currentPageQuestion()?.id !== question.id) return false;
+    if (!boardCheck.verified) {
+      state.currentQuestionCompleted = false;
+      dom.finishQuestionBtn.disabled = false;
+      await lianSpeak(boardCheck.guidance);
+      return false;
+    }
+
+    if (!markCurrentQuestionComplete()) {
+      dom.finishQuestionBtn.disabled = false;
+      return false;
+    }
+
+    const feedback = String(options.feedback || boardCheck.result?.positiveFeedback || "").trim();
+    await lianSpeak(
+      feedback
+        ? `${feedback} 板书里也有正确的关键步骤，这道题可以结束。`
+        : "最终答案和板书里的关键步骤都核对好了，这道题可以结束。"
+    );
+    await saveCurrentQuestionAndContinue();
+    return true;
+  } catch (error) {
+    console.warn("Board completion check fallback:", error);
+    state.boardCompletionVerified = false;
+    state.currentQuestionCompleted = false;
+    dom.finishQuestionBtn.disabled = false;
+    await lianSpeak("答案已经核对过了，但这次还没能确认板书中的关键步骤。请保留板书，稍后再点一次我讲完了。");
+    return false;
+  } finally {
+    state.completionCheckInProgress = false;
+    setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
+  }
+}
+
 async function handleFinalAnswerSubmission(answer) {
   const question = currentPageQuestion();
   if (!question || !answer.trim()) return;
   const requestId = ++state.finalAnswerRequestId;
   state.awaitingFinalAnswer = false;
+  state.pendingFinalAnswerText = "";
   state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.boardCompletionVerified = false;
+  state.currentQuestionCompleted = false;
   dom.finishQuestionBtn.disabled = true;
   dom.recognitionPill.textContent = "正在核对最后答案";
   dom.recognitionPill.classList.remove("hidden");
@@ -3583,19 +4111,16 @@ async function handleFinalAnswerSubmission(answer) {
 
     if (result.correct) {
       state.finalAnswerVerified = true;
-      setGuideState(GUIDE_STATES.ARCHIVE);
-      await lianSpeak(
-        result.feedback ||
-          pickPrompt("final-answer-correct", [
-            "最后答案对上了，这道题讲得很完整。我们保存下来，再继续下一题。",
-            "答案核对正确，刚才的思路也串起来了。保存好这道题，我们接着看下一题。",
-            "这个结果和题目能对应上，讲解完成。记得保存错题，然后继续下一题。"
-          ])
-      );
-      await saveCurrentQuestionAndContinue();
+      state.verifiedFinalAnswerText = answer.trim();
+      state.awaitingFinalAnswer = false;
+      setGuideState(GUIDE_STATES.INTERACTIVE);
+      await verifyBoardAndCompleteQuestion({ feedback: result.feedback || "" });
       return;
     }
 
+    state.finalAnswerVerified = false;
+    state.verifiedFinalAnswerText = "";
+    state.boardCompletionVerified = false;
     state.awaitingFinalAnswer = true;
     dom.finishQuestionBtn.disabled = false;
     setGuideState(GUIDE_STATES.INTERACTIVE);
@@ -3611,6 +4136,9 @@ async function handleFinalAnswerSubmission(answer) {
     console.warn("Final answer check fallback:", error);
     if (requestId !== state.finalAnswerRequestId || currentPageQuestion()?.id !== question.id) return;
     state.awaitingFinalAnswer = true;
+    state.finalAnswerVerified = false;
+    state.verifiedFinalAnswerText = "";
+    state.boardCompletionVerified = false;
     dom.finishQuestionBtn.disabled = false;
     dom.recognitionPill.classList.add("hidden");
     await lianSpeak(
@@ -3625,9 +4153,20 @@ async function handleFinalAnswerSubmission(answer) {
   }
 }
 
-async function saveCurrentQuestionAndContinue() {
+async function saveCurrentQuestionAndContinue(options = {}) {
   const question = currentPageQuestion();
   if (!question) return;
+  if (!state.finalAnswerVerified || !state.boardCompletionVerified) {
+    state.currentQuestionCompleted = false;
+    dom.finishQuestionBtn.disabled = false;
+    setGuideState(GUIDE_STATES.INTERACTIVE);
+    lianSpeak(
+      !state.finalAnswerVerified
+        ? "这道题还不能结束，先把最终答案说清楚并核对正确。"
+        : "答案已经正确，但板书里还没有确认到正确的关键步骤。请写下一个关系式、公式或计算步骤。"
+    );
+    return;
+  }
   if (!confirmNotebookSave()) {
     dom.finishQuestionBtn.disabled = false;
     lianSpeak(
@@ -3645,6 +4184,9 @@ async function saveCurrentQuestionAndContinue() {
   state.completedThisSession.push(record);
   saveNotebook();
   state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.boardCompletionVerified = false;
+  state.currentQuestionCompleted = false;
 
   if (state.boardPageIndex < state.lecture.length - 1) {
     state.boardPageIndex += 1;
@@ -3655,23 +4197,42 @@ async function saveCurrentQuestionAndContinue() {
     dom.finishQuestionBtn.disabled = false;
     lianSpeak(
       pickPrompt("next-question-after-save", [
-        "这道题已经保存好了。我们继续看下一题，你先说说题目给了什么条件。",
-        "保存完成，接下来进入下一题。你按自己的思路慢慢讲。",
-        "这题先整理好了，我们看下一题。你准备从哪里开始？"
+        "答案核对正确，这道题完成了。我们看下一题，你先说说题目给了什么条件。",
+        "这道题已经讲完并保存好了。接下来进入下一题，你按自己的思路慢慢讲。",
+        "这题整理完成了，我们看下一题。你准备从哪里开始？"
       ])
     );
     return;
   }
 
   dom.finishQuestionBtn.disabled = true;
+  stopListeningAfterSessionCompletion();
   renderCompletion();
   showView("completeView");
+  lianSpeak(
+    pickPrompt("session-complete", [
+      "今天的错题讲解完成了。你把思路讲清楚了，记得及时复习今天整理的错题。",
+      "今天的任务完成了。刚才的错题已经整理好，之后记得及时复习巩固。",
+      "今天就讲到这里，错题都已经整理完成。记得按时复习，把这些思路真正变成自己的。"
+    ]),
+    { trackQuestion: false, dedupeKey: "session-complete" }
+  );
 }
 
 dom.finishQuestionBtn.addEventListener("click", () => {
   if (!state.lecture.length) return;
-  if (state.finalAnswerVerified) {
+  if (state.completionCheckInProgress) return;
+  if (state.currentQuestionCompleted && state.finalAnswerVerified && state.boardCompletionVerified) {
     void saveCurrentQuestionAndContinue();
+    return;
+  }
+  if (state.finalAnswerVerified) {
+    void verifyBoardAndCompleteQuestion();
+    return;
+  }
+  const answerCandidate = extractFinalAnswerCandidate(dom.transcriptInput.value);
+  if (answerCandidate) {
+    void handleFinalAnswerSubmission(answerCandidate);
     return;
   }
   if (state.awaitingFinalAnswer) return;
@@ -3793,7 +4354,7 @@ async function composeBoardSnapshot(strokesDataUrl, questionImageUrl, imageState
 
 function renderCompletion() {
   const count = state.completedThisSession.length;
-  dom.completeSummary.textContent = `本次保存 ${count} 道错题，只保留题图、笔迹和讲解文字。`;
+  dom.completeSummary.textContent = `今天的任务完成了，共整理 ${count} 道错题。记得及时复习，巩固今天讲过的思路。`;
   dom.completionReview.innerHTML = state.completedThisSession
     .map(
       (record) => `

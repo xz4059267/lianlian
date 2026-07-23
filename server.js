@@ -40,15 +40,26 @@ const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
 const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
 const PADDLE_OCR_SCRIPT = path.join(ROOT, "tools", "paddle_ocr.py");
+const PADDLE_LAYOUT_SCRIPT = path.join(ROOT, "tools", "paddle_layout.py");
 const OCR_MAX_SIDE = Number(process.env.OCR_MAX_SIDE || 1800);
+const OCR_FAST_MAX_SIDE = Number(process.env.OCR_FAST_MAX_SIDE || 1800);
+const LAYOUT_MAX_SIDE = Number(process.env.LAYOUT_MAX_SIDE || 1600);
+const LAYOUT_TIMEOUT_MS = Number(process.env.LAYOUT_TIMEOUT_MS || 45000);
+const LAYOUT_ENABLED = !["0", "false", "off"].includes(String(process.env.LAYOUT_ENABLED || "1").toLowerCase());
 const OCR_CACHE_LIMIT = Number(process.env.OCR_CACHE_LIMIT || 32);
 const SEGMENT_CACHE_LIMIT = Number(process.env.SEGMENT_CACHE_LIMIT || 32);
+const ANSWER_KEY_CACHE_LIMIT = Number(process.env.ANSWER_KEY_CACHE_LIMIT || 64);
+const ANSWER_KEY_MIN_CONFIDENCE = Number(process.env.ANSWER_KEY_MIN_CONFIDENCE || 0.86);
 const SEGMENT_FAST_MODE = !["0", "false", "off"].includes(String(process.env.SEGMENT_FAST_MODE || "1").toLowerCase());
 const SEGMENT_LLM_TIMEOUT_MS = Number(process.env.SEGMENT_LLM_TIMEOUT_MS || 15000);
 const ocrCache = new Map();
 const segmentCache = new Map();
+const answerKeyCache = new Map();
+const answerKeyInflight = new Map();
 let paddleOcrService = null;
 let paddleOcrRequestId = 0;
+let paddleLayoutService = null;
+let paddleLayoutRequestId = 0;
 
 const OCR_GROUPING_PROMPT =
   [
@@ -68,11 +79,11 @@ const LIAN_GUIDE_PROMPT = [
   "语气像温柔、耐心的女生学习伙伴：自然、短、轻一点，不要像 AI 播报，也不要像老师批改。",
   "必须遵守四个状态机：A heuristic_guidance=启发引导；B micro_hint=知识点微提示；C interactive_teaching=互动讲解；D archive_review=归档复习。",
   "A 启发引导：学生正在尝试讲题时，优先追问、提问或保持安静；不能主动给最终答案、中间完整算式或完整解题步骤。",
-  "B 知识点微提示：局部错误、跳步、笔迹可疑或普通沉默 2 分钟时，只点出检查位置或矛盾点，不给修正后的完整算式。",
-  "C 互动讲解：只有学生主动求助、连续 3 次答错/修正失败、错后 1 分钟无语音或无书写、或 2 分钟关怀询问后仍无法推进时才进入。",
+  "B 知识点微提示：局部错误、跳步、笔迹可疑或普通沉默 1 分钟时，只点出与学生最后思路相关的检查位置或下一切入点，不给修正后的完整算式。",
+  "C 互动讲解：只有学生主动求助、连续 3 次答错/修正失败、错后 1 分钟无语音或无书写、或 1 分钟关怀询问后仍无法推进时才进入。",
   "C 状态下可以讲知识点和步骤，但每次只讲一个逻辑节点或一个小步骤；每步后必须让学生确认、复述或写回黑板。",
   "学生在互动讲解中插话提问时，先回答疑问，再用“我们回到刚才这一步”恢复主线。",
-  "普通沉默超过 2 分钟时，第一次只关怀询问卡在哪一步；不要直接完整讲题。只有询问后继续沉默或学生确认不会，才分步讲解。",
+  "普通沉默达到 1 分钟时，第一次应结合学生最后讲到的内容给一个很小的切入提示；不要直接完整讲题。只有提示后继续沉默或学生确认不会，才分步讲解。",
   "学生讲得顺时，优先不说；需要回应时必须贴着学生内容做理解确认，不使用固定鼓励词。",
   "如果前端传入 lectureUnlocked=false，你只能输出 encourage 或 light 级别内容，不能输出 formula/worked_step/summary。",
   "如果前端传入 lectureUnlocked=true，你仍然不能一次性倒完整答案；只给一小步，并把话交还给学生。",
@@ -80,6 +91,13 @@ const LIAN_GUIDE_PROMPT = [
   "必须以当前传入的题目图片和当前黑板截图为准；不要沿用上一道题的变量、答案、比例式或知识点。",
   "如果当前题目图片和黑板里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
   "输出必须严格遵守 JSON schema；speech 用中文口语，通常不超过 60 个汉字。"
+].join("\n");
+
+const ORDERED_PROPORTION_RULES = [
+  "比例题必须遵守给定顺序：题目说‘a、b、c、d 成比例’时，标准含义是 a:b=c:d，也就是第一项比第二项等于第三项比第四项。",
+  "除非题目明确要求重新排列，否则禁止交换四个比例项，禁止声称‘没有规定顺序’，也禁止为了得到另一个结果而改成 a:b=d:c。",
+  "例如‘2、3、x、6 成比例’必须写成 2:3=x:6，交叉相乘得到 x=4；学生得到 4 时应判定正确，不能再引导其尝试 2:3=6:x。",
+  "判断学生比例式或答案前必须先按上述顺序实际代入验算。"
 ].join("\n");
 
 const LIAN_STYLE_RULES = [
@@ -108,7 +126,9 @@ const COMPANION_DIALOGUE_POLICY = [
 
 const LECTURE_COMPLETION_RULES = [
   "额外判断当前题是否已经讲解完成，并通过 lectureComplete 返回。默认必须为 false。",
-  "只有当学生已经说明当前题的关键条件/推理，并明确说出最终结果、答案或选项时，lectureComplete 才能为 true。",
+  "lectureComplete 只是对讲解内容的建议判断，不能单独结束题目。只有 answerVerified=true 且 boardCompletionVerified=true 时才允许为 true。",
+  "学生点击‘我讲完了’只表示请求检查，不表示题目已经结束。答案错误或板书不完整时必须继续引导。",
+  "只有当学生已经说明当前题的关键条件/推理、明确说出经核验正确的最终结果，并且板书已包含完整关键过程与结论时，lectureComplete 才能为 true。",
   "如果学生只完成了一个小问、只报出中间结果、只说了一个式子，或还在等待你追问，lectureComplete 必须为 false。",
   "lectureComplete=true 时，speech 只能做一次简短收束，不要再提出下一步、让学生复述、要求继续推导或重复已经说过的选项。",
   "如果 studentFinalAnswerEvidence=true，说明学生已经说过最终选项/答案；不要再次询问同一个答案。"
@@ -129,6 +149,9 @@ const HANDWRITING_PROMPT = [
   "如果核算正确，calculationStatus=\"correct\"，hasPossibleIssue=false，并在 positiveFeedback 写一句贴着内容的短鼓励，避免固定说“很好/很棒”。",
   "如果核算错误，calculationStatus=\"wrong\"，hasPossibleIssue=true，guidance 要转成恋恋可以说出口的温和检查提醒，不要直接说“你错了”。",
   "如果学生只是还没写完、只写出一部分比例/方程、缺少后续项，不能判为错误：hasPossibleIssue=false，guidance 置空或只说明继续观察。",
+  "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
+  "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；学生可以在口头讲解中给出最终答案。比如正确写出 2:3=x:6，即使没有继续写 3x=12 和 x=4，boardComplete 也应为 true。",
+  "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
   "guidance 应指出需要检查的位置或关系，并给一个很小的下一步，例如“圆周角/圆心角”“360 度乘几分之几”“等号后面的数”。",
   "输出必须严格遵守 JSON schema。"
@@ -359,6 +382,14 @@ const handwritingSchema = {
         type: "string",
         description: "Short Chinese feedback Lian can speak when calculationStatus is correct. Keep empty otherwise."
       },
+      boardComplete: {
+        type: "boolean",
+        description: "Whether the visible board contains at least one relevant, mathematically correct, reviewable key step with no unresolved obvious error. A full derivation or final answer is not required."
+      },
+      missingBoardContent: {
+        type: "string",
+        description: "Concise Chinese description of what is still missing from the board. Empty only when boardComplete is true."
+      },
       confidence: {
         type: "number",
         description: "0 to 1 confidence in this analysis."
@@ -376,6 +407,8 @@ const handwritingSchema = {
       "expectedNextStep",
       "guidance",
       "positiveFeedback",
+      "boardComplete",
+      "missingBoardContent",
       "confidence"
     ]
   }
@@ -485,11 +518,11 @@ function cloneOcrBlocks(blocks) {
   return blocks.map((block) => ({ ...block }));
 }
 
-function getOcrCacheKey(image) {
+function getOcrCacheKey(image, maxSide = OCR_MAX_SIDE) {
   return crypto
     .createHash("sha256")
     .update(image.buffer)
-    .update(`|maxSide:${OCR_MAX_SIDE}|ocr:v2`)
+    .update(`|maxSide:${maxSide}|ocr:v15`)
     .digest("hex");
 }
 
@@ -517,7 +550,7 @@ function getSegmentCacheKey(imageDataUrl, width, height, mode) {
   return crypto
     .createHash("sha256")
     .update(String(imageDataUrl || ""))
-    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|segment:v26`)
+    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|segment:v42`)
     .digest("hex");
 }
 
@@ -646,7 +679,7 @@ function getPaddleOcrService() {
   return service;
 }
 
-function requestPaddleOcr(imagePath) {
+function requestPaddleOcr(imagePath, maxSide = OCR_MAX_SIDE) {
   const service = getPaddleOcrService();
   if (!service) return Promise.resolve(null);
 
@@ -658,7 +691,7 @@ function requestPaddleOcr(imagePath) {
     }, 180000);
 
     service.pending.set(id, { resolve, reject, timer });
-    const payload = JSON.stringify({ id, imagePath, maxSide: OCR_MAX_SIDE }) + "\n";
+    const payload = JSON.stringify({ id, imagePath, maxSide }) + "\n";
     service.child.stdin.write(payload, "utf8", (error) => {
       if (!error) return;
       clearTimeout(timer);
@@ -668,22 +701,164 @@ function requestPaddleOcr(imagePath) {
   });
 }
 
-async function extractPaddleTextBlocks(imagePath) {
-  const data = await requestPaddleOcr(imagePath);
+async function extractPaddleTextBlocks(imagePath, maxSide = OCR_MAX_SIDE) {
+  const data = await requestPaddleOcr(imagePath, maxSide);
   if (!data) return { blocks: [], skipped: true };
   return {
     blocks: normalizeOcrBlocks(data.blocks),
     resized: Boolean(data.resized),
     originalSize: data.originalSize,
     ocrSize: data.ocrSize,
-    elapsedMs: data.elapsedMs
+    elapsedMs: data.elapsedMs,
+    detectionMs: data.detectionMs,
+    recognitionMs: data.recognitionMs,
+    detectedLineCount: data.detectedLineCount,
+    recognizedLineCount: data.recognizedLineCount,
+    refinedLineCount: data.refinedLineCount
   };
 }
 
-async function extractTextBlocks(imageDataUrl) {
+function rejectPendingLayoutRequests(service, error) {
+  for (const request of service.pending.values()) {
+    clearTimeout(request.timer);
+    request.reject(error);
+  }
+  service.pending.clear();
+}
+
+function getPaddleLayoutService() {
+  if (!LAYOUT_ENABLED || !fs.existsSync(OCR_PYTHON) || !fs.existsSync(PADDLE_LAYOUT_SCRIPT)) return null;
+  if (paddleLayoutService && !paddleLayoutService.exited) return paddleLayoutService;
+
+  const child = spawn(OCR_PYTHON, [PADDLE_LAYOUT_SCRIPT, "--server"], {
+    cwd: ROOT,
+    stdio: ["pipe", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: "utf-8",
+      LAYOUT_MAX_SIDE: String(LAYOUT_MAX_SIDE)
+    }
+  });
+  const service = {
+    child,
+    buffer: "",
+    pending: new Map(),
+    exited: false,
+    ready: false,
+    startedAt: Date.now()
+  };
+
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    service.buffer += chunk;
+    const lines = service.buffer.split(/\r?\n/);
+    service.buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        console.warn("[layout] Paddle layout service returned non-JSON output:", line.slice(0, 300));
+        continue;
+      }
+      if (message?.ready === true) {
+        service.ready = true;
+        console.log(`[layout] service ready, startup=${Date.now() - service.startedAt}ms`);
+        continue;
+      }
+      const request = service.pending.get(message.id);
+      if (!request) continue;
+      clearTimeout(request.timer);
+      service.pending.delete(message.id);
+      if (message.error) request.reject(new Error(message.error));
+      else request.resolve(message);
+    }
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => {
+    const output = chunk.trim();
+    if (output) console.warn(`[paddle-layout] ${output.slice(0, 1200)}`);
+  });
+  child.on("error", (error) => {
+    service.exited = true;
+    rejectPendingLayoutRequests(service, error);
+    if (paddleLayoutService === service) paddleLayoutService = null;
+  });
+  child.on("exit", (code, signal) => {
+    service.exited = true;
+    rejectPendingLayoutRequests(service, new Error(`Paddle layout service exited: code=${code}, signal=${signal}`));
+    if (paddleLayoutService === service) paddleLayoutService = null;
+  });
+
+  paddleLayoutService = service;
+  console.log(`[layout] service started, model=${process.env.LAYOUT_MODEL || "PP-DocLayoutV2"}, maxSide=${LAYOUT_MAX_SIDE}`);
+  return service;
+}
+
+function requestPaddleLayout(imagePath, maxSide = LAYOUT_MAX_SIDE) {
+  const service = getPaddleLayoutService();
+  if (!service) return Promise.resolve(null);
+  return new Promise((resolve, reject) => {
+    const id = ++paddleLayoutRequestId;
+    const timer = setTimeout(() => {
+      service.pending.delete(id);
+      reject(new Error("Paddle layout service timed out"));
+    }, LAYOUT_TIMEOUT_MS);
+    service.pending.set(id, { resolve, reject, timer });
+    service.child.stdin.write(`${JSON.stringify({ id, imagePath, maxSide })}\n`, "utf8", (error) => {
+      if (!error) return;
+      clearTimeout(timer);
+      service.pending.delete(id);
+      reject(error);
+    });
+  });
+}
+
+function normalizeLayoutRegions(regions) {
+  return (Array.isArray(regions) ? regions : [])
+    .map((region) => ({
+      label: String(region?.label || "unknown").trim().toLowerCase(),
+      score: Number(region?.score) || 0,
+      x: Math.max(0, Math.round(Number(region?.x) || 0)),
+      y: Math.max(0, Math.round(Number(region?.y) || 0)),
+      w: Math.max(1, Math.round(Number(region?.w) || 1)),
+      h: Math.max(1, Math.round(Number(region?.h) || 1)),
+      source: "paddle-layout"
+    }))
+    .filter((region) => region.score >= 0.18 && region.w > 1 && region.h > 1);
+}
+
+async function extractLayoutRegions(imageDataUrl, options = {}) {
+  const image = decodeDataImage(imageDataUrl);
+  if (!image || !LAYOUT_ENABLED) return [];
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "lian-layout-"));
+  const imagePath = path.join(tempDir, `source${image.ext}`);
+  fs.writeFileSync(imagePath, image.buffer);
+  try {
+    const result = await requestPaddleLayout(
+      imagePath,
+      Number(options.maxSide) > 0 ? Number(options.maxSide) : LAYOUT_MAX_SIDE
+    );
+    const regions = normalizeLayoutRegions(result?.regions);
+    console.log(
+      `[layout] region count=${regions.length}, inference=${result?.inferenceMs || 0}ms, elapsed=${result?.elapsedMs || 0}ms`
+    );
+    return regions;
+  } catch (error) {
+    console.warn("[layout] local layout detection unavailable, continuing with OCR:", error.message || error);
+    return [];
+  } finally {
+    fs.rm(tempDir, { recursive: true, force: true }, () => {});
+  }
+}
+
+async function extractTextBlocks(imageDataUrl, options = {}) {
   const image = decodeDataImage(imageDataUrl);
   if (!image) return [];
-  const cacheKey = getOcrCacheKey(image);
+  const maxSide = Number(options.maxSide) > 0 ? Number(options.maxSide) : OCR_MAX_SIDE;
+  const cacheKey = getOcrCacheKey(image, maxSide);
   const cachedBlocks = getCachedOcrBlocks(cacheKey);
   if (cachedBlocks) {
     console.log(`[segment] OCR cache hit: ${cachedBlocks.length} blocks`);
@@ -696,11 +871,16 @@ async function extractTextBlocks(imageDataUrl) {
   let paddleBlocks = null;
 
   try {
-    const paddleResult = await extractPaddleTextBlocks(imagePath);
+    const paddleResult = await extractPaddleTextBlocks(imagePath, maxSide);
     paddleBlocks = paddleResult.blocks;
     if (paddleBlocks.length) {
       const resizeNote = paddleResult.resized ? `, resized to ${paddleResult.ocrSize?.width}x${paddleResult.ocrSize?.height}` : "";
-      console.log(`[segment] PaddleOCR block count: ${paddleBlocks.length}${resizeNote}, elapsed=${paddleResult.elapsedMs || 0}ms`);
+      console.log(
+        `[segment] PaddleOCR block count: ${paddleBlocks.length}${resizeNote}, ` +
+        `detected=${paddleResult.detectedLineCount || paddleBlocks.length}, recognized=${paddleResult.recognizedLineCount || 0}, ` +
+        `refined=${paddleResult.refinedLineCount || 0}, ` +
+        `detection=${paddleResult.detectionMs || 0}ms, recognition=${paddleResult.recognitionMs || 0}ms, elapsed=${paddleResult.elapsedMs || 0}ms`
+      );
       setCachedOcrBlocks(cacheKey, paddleBlocks);
       return cloneOcrBlocks(paddleBlocks);
     }
@@ -1253,6 +1433,18 @@ function hasQuestionStemEvidence(text) {
   return (chineseCount >= 2 && hasMathExpression) || (chineseCount >= 4 && hasMathTopic);
 }
 
+function hasStandaloneMathQuestionStem(text) {
+  const compact = String(text || "").replace(/\s+/g, "");
+  if (compact.length < 5) return false;
+  const variableCount = (compact.match(/[a-zA-Z]/g) || []).length;
+  const operatorCount = (compact.match(/[=<>+\-*/:^：]/g) || []).length;
+  const digitCount = (compact.match(/\d/g) || []).length;
+  return variableCount >= 1 &&
+    operatorCount >= 1 &&
+    digitCount >= 1 &&
+    /[=<>:：]/.test(compact);
+}
+
 function isFigureOrTableLabel(text) {
   return /^\s*(?:图|表|步骤|条件|方案)\s*(?:[（(]?\s*(?:\d{1,3}|[①②③④⑤⑥⑦⑧⑨⑩])\s*[）)]?)/u.test(String(text || ""));
 }
@@ -1551,6 +1743,8 @@ function recoverDiscontinuousQuestionAnchors(ocrLines, anchors, visionQuestions,
   const lines = (Array.isArray(ocrLines) ? ocrLines : []).slice().sort((a, b) => a.y - b.y || a.x - b.x);
   const result = (Array.isArray(anchors) ? anchors : []).slice().sort((a, b) => a.startY - b.startY);
   const existingNumbers = new Set(result.map((anchor) => String(anchor.sourceQuestionNumber)));
+  const numberContext = createQuestionNumberContext(lines, width, height);
+  const usedLocalStemLines = new Set();
   const visionRegions = normalizeVisualQuestionRegions(visionQuestions, width, height);
   const candidatesByNumber = new Map();
   visionRegions.forEach((candidate) => {
@@ -1632,6 +1826,40 @@ function recoverDiscontinuousQuestionAnchors(ocrLines, anchors, visionQuestions,
               : "sequence-gap-review+vision-structure"
         };
         break;
+      }
+
+      if (!recovered) {
+        const localStemLine = lines.find((line) => {
+          if (usedLocalStemLines.has(line)) return false;
+          const centerY = Number(line.y) + Number(line.h) / 2;
+          if (centerY <= gapTop + Math.max(4, Number(line.h) * 0.5) || centerY >= gapBottom) return false;
+          if (Number(line.x) > numberContext.pageContentLeft + numberContext.allowedOffset) return false;
+          const text = String(line.text || "").trim();
+          if (!hasQuestionSentence(text) || looksLikeChoiceText(text) || isTableOrFigureBlock(line)) return false;
+          if (isSubQuestionNumber(text) || isFigureOrTableLabel(text)) return false;
+          return !getQuestionNumberStartInfo(text, line, numberContext);
+        });
+        if (localStemLine) {
+          usedLocalStemLines.add(localStemLine);
+          const syntheticText = `${normalizedNumber}. ${String(localStemLine.text || "").trim()}`;
+          recovered = {
+            questionNumber: normalizedNumber,
+            sourceQuestionNumber: normalizedNumber,
+            top: Number(localStemLine.y),
+            startY: Number(localStemLine.y),
+            left: Number(localStemLine.x) || 0,
+            text: syntheticText,
+            line: { ...localStemLine, text: syntheticText },
+            startInfo: {
+              number: normalizedNumber,
+              kind: "sequence-gap-local-ocr-stem",
+              matchIndex: 0,
+              textLength: syntheticText.length,
+              bodyText: String(localStemLine.text || "").trim()
+            },
+            evidenceSource: "sequence-gap-review+local-ocr-stem"
+          };
+        }
       }
 
       if (recovered) {
@@ -1730,8 +1958,11 @@ function getQuestionNumberStartInfo(text, block = null, context = {}) {
     if (!Number.isFinite(blockX) || blockX > context.pageContentLeft + Number(context.allowedOffset || 0)) return null;
   }
   const bodyText = String(match[2] || "").trim() || getAdjacentQuestionSentence(block, context);
-  if (!hasQuestionStemEvidence(bodyText)) return null;
-  if (isTableOrFigureBlock({ ...(block || {}), text: value })) return null;
+  const shortStemChineseCount = (bodyText.match(/[\u4e00-\u9fff]/gu) || []).length;
+  const hasShortExplicitStem = shortStemChineseCount >= 3 && bodyText.length >= 4;
+  const hasMathStem = hasStandaloneMathQuestionStem(bodyText);
+  if (!hasQuestionStemEvidence(bodyText) && !hasShortExplicitStem && !hasMathStem) return null;
+  if (isTableOrFigureBlock({ ...(block || {}), text: value }) && !hasMathStem) return null;
   return {
     number: String(number),
     kind: "explicit",
@@ -2511,6 +2742,27 @@ function normalizeQuestionRegions(visionQuestions, ocrBands, blocks, width, heig
       candidate.questionRole = "mainQuestion";
       candidate.parentQuestionNumber = "";
       candidate.sourceQuestionNumber = mainInfo.number;
+      return;
+    }
+
+    const hasVisionQuestionEvidence = Boolean(
+      candidate.sourceQuestionNumber &&
+      candidate.rawModelBoxes.length &&
+      (
+        hasQuestionStemEvidence(candidate.summary || candidate.text) ||
+        hasStandaloneMathQuestionStem(candidate.summary || candidate.text) ||
+        candidate.type !== "未知"
+      )
+    );
+    if (hasVisionQuestionEvidence) {
+      candidate.questionRole = "mainQuestion";
+      candidate.parentQuestionNumber = "";
+      candidate.uncertain = true;
+      candidate.evidenceSource = "qwen-structure-low-confidence-fallback";
+      candidate.mergeReasons.push("OCR 题号证据不足，保留 Qwen 返回的完整题目结构");
+      console.log(
+        `[vision-fallback] preserve Q${candidate.sourceQuestionNumber} from Qwen structure`
+      );
       return;
     }
 
@@ -3331,6 +3583,11 @@ function validateCropContainsContent(question, details) {
 }
 
 function enforceHardQuestionBoundaries(questions, anchors, context = {}) {
+  const width = Number(context.width) || Math.max(
+    1,
+    ...(Array.isArray(questions) ? questions : []).map((question) => Number(question?.finalBox?.x || 0) + Number(question?.finalBox?.w || 0)),
+    ...(Array.isArray(context.blocks) ? context.blocks : []).map((block) => Number(block?.x || 0) + Number(block?.w ?? block?.width ?? 0))
+  );
   const height = Number(context.height) || Math.max(
     1,
     ...(Array.isArray(questions) ? questions : []).map((question) => Number(question?.finalBox?.y || 0) + Number(question?.finalBox?.h || 0)),
@@ -3364,6 +3621,17 @@ function enforceHardQuestionBoundaries(questions, anchors, context = {}) {
     const number = String(question.sourceQuestionNumber || "");
     if (number && question.questionRole !== "subQuestion" && !byNumber.has(number)) byNumber.set(number, question);
   });
+  const primaryBoxes = result
+    .filter((question) => question?.questionRole !== "subQuestion" && question?.finalBox)
+    .map((question) => question.finalBox)
+    .filter((box) => [box.x, box.w].every((value) => Number.isFinite(Number(value))));
+  const stableContentLeft = primaryBoxes.length >= 2
+    ? median(primaryBoxes.map((box) => Number(box.x)))
+    : Number.NaN;
+  const stableContentRight = primaryBoxes.length >= 2
+    ? median(primaryBoxes.map((box) => Number(box.x) + Number(box.w)))
+    : Number.NaN;
+  const stableContentWidth = stableContentRight - stableContentLeft;
 
   sortedAnchors.forEach((anchor, index) => {
     const number = String(anchor.sourceQuestionNumber);
@@ -3461,6 +3729,12 @@ function enforceHardQuestionBoundaries(questions, anchors, context = {}) {
           Number.isFinite(Number(nextAnchor?.cropTop)) ? Math.floor(Number(nextAnchor.cropTop) - 1) : height
         )
       : height;
+    if (Number.isFinite(nextAnchorTop)) {
+      // OCR can miss option rows, formulas and figures. Preserve the complete
+      // interval up to the next main-question anchor instead of ending at the
+      // last detected text box.
+      desiredBottom = Math.max(desiredBottom, standardHardBottom);
+    }
     const unresolvedFollowingNumbers = Array.isArray(anchor.unresolvedFollowingNumbers)
       ? anchor.unresolvedFollowingNumbers.map(String).filter(Boolean)
       : [];
@@ -3512,8 +3786,27 @@ function enforceHardQuestionBoundaries(questions, anchors, context = {}) {
       });
     }
     finalBottom = Math.max(finalTop + 1, Math.min(Math.ceil(finalBottom), Math.floor(hardBottom)));
-    const finalLeft = Math.max(0, Math.floor(Number(originalBox.x) || 0));
-    const finalRight = Math.max(finalLeft + 1, Math.ceil(Number(originalBox.x || 0) + Number(originalBox.w || 1)));
+    const originalLeft = Number(originalBox.x) || 0;
+    const originalRight = originalLeft + Number(originalBox.w || 1);
+    const shouldRecoverHorizontalBounds = Number.isFinite(stableContentWidth) &&
+      stableContentWidth > 0 &&
+      Number(originalBox.w || 0) < stableContentWidth * 0.72;
+    const finalLeft = Math.max(
+      0,
+      Math.floor(shouldRecoverHorizontalBounds ? Math.min(originalLeft, stableContentLeft) : originalLeft)
+    );
+    const finalRight = Math.min(
+      width,
+      Math.max(
+        finalLeft + 1,
+        Math.ceil(shouldRecoverHorizontalBounds ? Math.max(originalRight, stableContentRight) : originalRight)
+      )
+    );
+    if (shouldRecoverHorizontalBounds) {
+      console.log(
+        `[horizontal-recovery] Q${question.sourceQuestionNumber} left=${Math.round(originalLeft)} right=${Math.round(originalRight)} expandedLeft=${finalLeft} expandedRight=${finalRight}`
+      );
+    }
     question.finalBox = {
       x: finalLeft,
       y: finalTop,
@@ -3769,6 +4062,124 @@ function deduplicateNestedQuestionBoxes(questions, blocks, width, height) {
   return { questions: finalQuestions, removed };
 }
 
+const LAYOUT_IGNORED_LABELS = new Set([
+  "header",
+  "footer",
+  "page_number",
+  "header_image",
+  "footer_image",
+  "seal"
+]);
+
+function isRelevantLayoutRegion(region) {
+  const label = String(region?.label || "").toLowerCase();
+  return Boolean(label) && !LAYOUT_IGNORED_LABELS.has(label) && Number(region?.w) > 1 && Number(region?.h) > 1;
+}
+
+function buildLayoutContentBlocks(layoutRegions, anchors, width, height) {
+  const regions = (Array.isArray(layoutRegions) ? layoutRegions : []).filter(isRelevantLayoutRegion);
+  const orderedAnchors = (Array.isArray(anchors) ? anchors : [])
+    .filter((anchor) => Number.isFinite(Number(anchor?.startY ?? anchor?.top)))
+    .slice()
+    .sort((a, b) => Number(a.startY ?? a.top) - Number(b.startY ?? b.top));
+  const blocks = [];
+
+  for (const region of regions) {
+    const regionTop = Math.max(0, Number(region.y));
+    const regionBottom = Math.min(height, regionTop + Number(region.h));
+    if (!orderedAnchors.length) {
+      blocks.push({
+        text: `[layout:${region.label}]`,
+        contentType: region.label,
+        score: region.score,
+        source: "paddle-layout",
+        x: region.x,
+        y: region.y,
+        w: region.w,
+        h: region.h
+      });
+      continue;
+    }
+
+    orderedAnchors.forEach((anchor, index) => {
+      const bandTop = Math.max(0, Number(anchor.startY ?? anchor.top));
+      const nextAnchor = orderedAnchors[index + 1];
+      const bandBottom = nextAnchor
+        ? Math.min(height, Number(nextAnchor.startY ?? nextAnchor.top))
+        : height;
+      const clippedTop = Math.max(regionTop, bandTop);
+      const clippedBottom = Math.min(regionBottom, bandBottom);
+      if (clippedBottom - clippedTop < 2) return;
+      blocks.push({
+        text: `[layout:${region.label}]`,
+        contentType: region.label,
+        score: region.score,
+        source: "paddle-layout",
+        parentQuestionNumber: String(anchor.sourceQuestionNumber || anchor.questionNumber || ""),
+        x: Math.max(0, Math.round(region.x)),
+        y: Math.max(0, Math.floor(clippedTop)),
+        w: Math.max(1, Math.min(width - Math.max(0, Math.round(region.x)), Math.round(region.w))),
+        h: Math.max(1, Math.ceil(clippedBottom) - Math.floor(clippedTop))
+      });
+    });
+  }
+  return blocks.sort((a, b) => a.y - b.y || a.x - b.x);
+}
+
+function assessLocalSegmentationConfidence({ anchors, ocrLines, layoutRegions, width, height }) {
+  const orderedAnchors = (Array.isArray(anchors) ? anchors : [])
+    .filter((anchor) => anchor?.sourceQuestionNumber && Number.isFinite(Number(anchor?.startY ?? anchor?.top)))
+    .slice()
+    .sort((a, b) => Number(a.startY ?? a.top) - Number(b.startY ?? b.top));
+  const lines = Array.isArray(ocrLines) ? ocrLines : [];
+  const regions = (Array.isArray(layoutRegions) ? layoutRegions : []).filter(isRelevantLayoutRegion);
+  const reasons = [];
+  let score = 0;
+
+  if (orderedAnchors.length >= 2) score += 0.68;
+  else if (orderedAnchors.length === 1) score += 0.38;
+  else reasons.push("没有可靠主问题号锚点");
+
+  if (lines.length >= 3) score += 0.12;
+  else reasons.push("文字行过少");
+  if (regions.length >= 1) score += 0.12;
+  else reasons.push("版面检测未返回内容区域");
+
+  const anchorNumbers = orderedAnchors.map((anchor) => Number(anchor.sourceQuestionNumber)).filter(Number.isFinite);
+  const discontinuities = anchorNumbers.slice(1).filter((number, index) => number - anchorNumbers[index] > 1);
+  if (discontinuities.length) {
+    score -= 0.18;
+    reasons.push("题号序列存在缺口");
+  }
+
+  const firstTop = orderedAnchors.length ? Number(orderedAnchors[0].startY ?? orderedAnchors[0].top) : height;
+  const lastTop = orderedAnchors.length ? Number(orderedAnchors.at(-1).startY ?? orderedAnchors.at(-1).top) : 0;
+  const anchorCoverage = orderedAnchors.length >= 2 ? (lastTop - firstTop) / Math.max(1, height) : 0;
+  if (orderedAnchors.length >= 2 && anchorCoverage >= 0.12) score += 0.08;
+
+  const looksLikeDensePage = lines.length >= 9 || regions.some((region) => region.h >= height * 0.45);
+  if (looksLikeDensePage && orderedAnchors.length < 2) {
+    score -= 0.25;
+    reasons.push("整页内容密集但题号不足");
+  }
+
+  const uniqueNumbers = new Set(anchorNumbers);
+  if (uniqueNumbers.size !== anchorNumbers.length) {
+    score -= 0.2;
+    reasons.push("题号锚点重复");
+  }
+
+  score = Math.max(0, Math.min(1, score));
+  const threshold = Number(process.env.SEGMENT_LOCAL_CONFIDENCE_THRESHOLD || 0.72);
+  const needsVisionReview = score < threshold;
+  console.log(
+    `[segment-confidence] score=${score.toFixed(2)} threshold=${threshold.toFixed(2)} ` +
+    `anchors=[${anchorNumbers.join(",")}] lines=${lines.length} layout=${regions.length} ` +
+    `visionReview=${needsVisionReview} reasons=${reasons.join(" | ") || "local evidence sufficient"}`
+  );
+  return { score, threshold, needsVisionReview, reasons, looksLikeDensePage, width, height };
+}
+
 async function handleSegmentV2(req, res) {
   const requestStartedAt = Date.now();
   const timings = {};
@@ -3783,8 +4194,13 @@ async function handleSegmentV2(req, res) {
   const width = Number(body.width);
   const height = Number(body.height);
   const mode = String(body.mode || "initial");
+  const forceVisionModel = !SEGMENT_FAST_MODE || mode === "strict_structure";
+  const recognitionStrategy = forceVisionModel
+    ? "layout-ocr-vision-forced-v4"
+    : "layout-ocr-adaptive-v4";
+  const ocrMaxSide = forceVisionModel ? OCR_MAX_SIDE : OCR_FAST_MAX_SIDE;
   const cacheLookupStartedAt = Date.now();
-  const cacheKey = getSegmentCacheKey(body.image, width, height, `${mode}:vision-ocr-v2`);
+  const cacheKey = getSegmentCacheKey(body.image, width, height, `${mode}:${recognitionStrategy}`);
   const cachedSegment = getCachedSegmentResult(cacheKey);
   timings.cacheLookupMs = Date.now() - cacheLookupStartedAt;
   if (cachedSegment) {
@@ -3798,30 +4214,53 @@ async function handleSegmentV2(req, res) {
   }
 
   const recognitionStartedAt = Date.now();
-  const [ocrResult, visionResult] = await Promise.allSettled([
-    (async () => {
-      const startedAt = Date.now();
-      try {
-        return await extractTextBlocks(body.image);
-      } finally {
-        timings.ocrMs = Date.now() - startedAt;
-      }
-    })(),
-    (async () => {
-      const startedAt = Date.now();
-      try {
-        return await callVisionQuestionStructure(body.image);
-      } finally {
-        timings.visionModelMs = Date.now() - startedAt;
-      }
-    })()
+  const ocrTask = (async () => {
+    const startedAt = Date.now();
+    try {
+      return await extractTextBlocks(body.image, { maxSide: ocrMaxSide });
+    } finally {
+      timings.ocrMs = Date.now() - startedAt;
+    }
+  })();
+  const layoutTask = (async () => {
+    const startedAt = Date.now();
+    try {
+      return await extractLayoutRegions(body.image, { maxSide: LAYOUT_MAX_SIDE });
+    } finally {
+      timings.layoutMs = Date.now() - startedAt;
+    }
+  })();
+  const eagerVisionTask = forceVisionModel
+    ? (async () => {
+        const startedAt = Date.now();
+        try {
+          return await callVisionQuestionStructure(body.image);
+        } finally {
+          timings.visionModelMs = Date.now() - startedAt;
+        }
+      })()
+    : Promise.resolve(null);
+  if (!forceVisionModel) {
+    timings.visionDeferred = true;
+    timings.visionModelMs = 0;
+  }
+  const [ocrResult, layoutResult, eagerVisionResult] = await Promise.allSettled([
+    ocrTask,
+    layoutTask,
+    eagerVisionTask
   ]);
   timings.parallelRecognitionMs = Date.now() - recognitionStartedAt;
+  timings.recognitionStrategy = recognitionStrategy;
+  timings.ocrMaxSide = ocrMaxSide;
   const textBlocks = ocrResult.status === "fulfilled" ? ocrResult.value : [];
-  const visionQuestions = visionResult.status === "fulfilled" ? visionResult.value?.questions || [] : [];
+  const layoutRegions = layoutResult.status === "fulfilled" ? layoutResult.value : [];
+  let visionQuestions = eagerVisionResult.status === "fulfilled"
+    ? eagerVisionResult.value?.questions || []
+    : [];
+  let visionUsed = forceVisionModel && visionQuestions.length > 0;
   if (ocrResult.status === "rejected") console.warn("[segment-v2] OCR failed:", ocrResult.reason?.message || ocrResult.reason);
-  if (visionResult.status === "rejected") console.warn("[segment-v2] vision failed:", visionResult.reason?.message || visionResult.reason);
-  console.log(`[segment-v2] raw vision=${visionQuestions.length}, OCR lines=${textBlocks.length}`);
+  if (layoutResult.status === "rejected") console.warn("[segment-v2] layout failed:", layoutResult.reason?.message || layoutResult.reason);
+  if (eagerVisionResult.status === "rejected") console.warn("[segment-v2] vision failed:", eagerVisionResult.reason?.message || eagerVisionResult.reason);
 
   const anchorStageStartedAt = Date.now();
   const groupedOcrLines = groupOcrBlocksIntoLines(textBlocks, width, height);
@@ -3841,6 +4280,62 @@ async function handleSegmentV2(req, res) {
     width,
     height
   );
+  let localConfidence = assessLocalSegmentationConfidence({
+    anchors: mainQuestionAnchors,
+    ocrLines,
+    layoutRegions,
+    width,
+    height
+  });
+  timings.localConfidence = localConfidence.score;
+  if (!forceVisionModel && localConfidence.needsVisionReview) {
+    const visionStartedAt = Date.now();
+    try {
+      const review = await callVisionQuestionStructure(body.image);
+      visionQuestions = review?.questions || [];
+      visionUsed = visionQuestions.length > 0;
+      timings.visionFallbackTriggered = true;
+      timings.visionDeferred = false;
+    } catch (error) {
+      timings.visionFallbackTriggered = true;
+      timings.visionFallbackFailed = true;
+      console.warn("[segment-v2] low-confidence Qwen review failed:", error.message || error);
+    } finally {
+      timings.visionModelMs = Date.now() - visionStartedAt;
+    }
+  }
+  if (visionQuestions.length) {
+    mainQuestionAnchors = extractMainQuestionAnchors(ocrLines, width, height);
+    mainQuestionAnchors = recoverNumberMarkerAnchors(
+      ocrLines,
+      mainQuestionAnchors,
+      visionQuestions,
+      width,
+      height
+    );
+    mainQuestionAnchors = recoverDiscontinuousQuestionAnchors(
+      ocrLines,
+      mainQuestionAnchors,
+      visionQuestions,
+      width,
+      height
+    );
+  }
+  localConfidence = assessLocalSegmentationConfidence({
+    anchors: mainQuestionAnchors,
+    ocrLines,
+    layoutRegions,
+    width,
+    height
+  });
+  timings.localConfidence = localConfidence.score;
+  const layoutContentBlocks = buildLayoutContentBlocks(
+    layoutRegions,
+    mainQuestionAnchors,
+    width,
+    height
+  );
+  const contentBlocks = [...textBlocks, ...layoutContentBlocks];
   mainQuestionAnchors.forEach((anchor) => {
     console.log(`[Q${anchor.sourceQuestionNumber}][anchor] top=${Math.round(anchor.startY)}`);
   });
@@ -3849,6 +4344,10 @@ async function handleSegmentV2(req, res) {
     anchors: mainQuestionAnchors
   });
   timings.ocrLineAndAnchorMs = Date.now() - anchorStageStartedAt;
+  console.log(
+    `[segment-v2] strategy=${recognitionStrategy}, raw vision=${visionQuestions.length}, ` +
+    `OCR lines=${textBlocks.length}, layout regions=${layoutRegions.length}, content blocks=${contentBlocks.length}`
+  );
   console.log(`[ai] AI questions=[${visionQuestions.map((question) => normalizeSourceQuestionNumber(question.questionNumber)).filter(Boolean).join(",")}]`);
   logQuestionCoordinateStage("ai", normalizeVisualQuestionRegions(visionQuestions, width, height), "box");
   const regionStageStartedAt = Date.now();
@@ -3858,7 +4357,7 @@ async function handleSegmentV2(req, res) {
   const deduplicated = deduplicateQuestions(merged, width, height);
   logQuestionCoordinateStage("after-dedupe", deduplicated.questions, "box");
   let validated = deduplicated.questions.map((question, index, list) =>
-    validateQuestionCrop(question, list[index + 1], textBlocks, width, height)
+    validateQuestionCrop(question, list[index + 1], contentBlocks, width, height)
   );
   timings.regionMergeAndInitialValidationMs = Date.now() - regionStageStartedAt;
   logQuestionCoordinateStage("after-initial-boundary", validated);
@@ -3886,15 +4385,15 @@ async function handleSegmentV2(req, res) {
   questions = splitQuestionCandidatesByMainQuestionAnchors(
     questions,
     ocrBands,
-    { blocks: textBlocks, width, height }
+    { blocks: contentBlocks, width, height }
   );
-  questions = reconcileQuestionsWithOcrAnchors(questions, ocrBands, textBlocks, width, height);
+  questions = reconcileQuestionsWithOcrAnchors(questions, ocrBands, contentBlocks, width, height);
   questions = attachSupportingContentResults(questions, width, height);
-  questions = reconcileQuestionsWithOcrAnchors(questions, ocrBands, textBlocks, width, height);
+  questions = reconcileQuestionsWithOcrAnchors(questions, ocrBands, contentBlocks, width, height);
   questions = validateNonOverlappingQuestions(questions, width, height);
   const nestedDedupe = deduplicateNestedQuestionBoxes(questions, textBlocks, width, height);
   logQuestionCoordinateStage("after-nested-dedupe", nestedDedupe.questions);
-  questions = validateQuestionSequence(nestedDedupe.questions, ocrBands, textBlocks, width, height);
+  questions = validateQuestionSequence(nestedDedupe.questions, ocrBands, contentBlocks, width, height);
   if (!questions.length) {
     const wholePage = buildWholePageQuestion(width, height, "视觉模型和 OCR 均未可靠识别，保留整页");
     questions = [{
@@ -3915,11 +4414,11 @@ async function handleSegmentV2(req, res) {
   timings.reconciliationAndDedupeMs = Date.now() - reconciliationStageStartedAt;
 
   const finalBoundaryStageStartedAt = Date.now();
-  questions = enforceHardQuestionBoundaries(questions, ocrBands, { blocks: textBlocks, width, height });
+  questions = enforceHardQuestionBoundaries(questions, ocrBands, { blocks: contentBlocks, width, height });
   questions = splitQuestionsUntilSingleMainQuestion(
     questions,
     ocrBands,
-    { blocks: textBlocks, width, height }
+    { blocks: contentBlocks, width, height }
   );
   validateFinalQuestionBoxes(questions, ocrBands);
   validateSingleMainQuestionPerCrop(questions, ocrBands);
@@ -3930,6 +4429,7 @@ async function handleSegmentV2(req, res) {
   const debug = {
     rawModelBoxes: normalizeVisualQuestionRegions(visionQuestions, width, height).flatMap((question) => question.rawModelBoxes),
     ocrLineBoxes: textBlocks.map((block, index) => ({ index, ...block })),
+    layoutBoxes: layoutRegions.map((region, index) => ({ index, ...region })),
     finalBoxes: questions.map((question) => ({
       sourceQuestionNumber: question.sourceQuestionNumber,
       needsReview: question.needsReview,
@@ -3977,10 +4477,16 @@ async function handleSegmentV2(req, res) {
   sendSegmentResult(res, cacheKey, {
     questions,
     fallbackToWholePage: questions.length === 1 && questions[0].generatedBy === "whole-page-review-fallback",
-    note: "视觉模型粗定位 + OCR 行边界修正 + 题目级合并去重",
-    model: QWEN_VL_MODEL,
-    provider: "qwen-vision-paddleocr-hybrid",
+    note: visionUsed
+      ? "本地版面检测与 OCR 置信度不足，已由 Qwen 复核题目结构。"
+      : "本地版面检测与 OCR 已并行完成题目切分。",
+    model: visionUsed ? QWEN_VL_MODEL : (LAYOUT_ENABLED ? "PP-DocLayoutV2 + PaddleOCR" : "PaddleOCR"),
+    provider: visionUsed ? "qwen-vision-paddle-layout-ocr-hybrid" : "paddle-layout-ocr-local",
+    recognitionStrategy,
     ocrBlockCount: textBlocks.length,
+    layoutRegionCount: layoutRegions.length,
+    localConfidence,
+    visionUsed,
     timings,
     debug
   });
@@ -4218,6 +4724,346 @@ const finalAnswerSchema = {
   }
 };
 
+const answerKeySolverSchema = {
+  name: "verified_question_solution",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      status: { type: "string", enum: ["solved", "ambiguous", "unreadable"] },
+      problemText: { type: "string" },
+      questionType: { type: "string" },
+      canonicalAnswer: { type: "string" },
+      acceptedAnswers: { type: "array", items: { type: "string" } },
+      solutionOutline: { type: "array", items: { type: "string" } },
+      verificationChecks: { type: "array", items: { type: "string" } },
+      confidence: { type: "number" },
+      uncertainty: { type: "string" }
+    },
+    required: [
+      "status",
+      "problemText",
+      "questionType",
+      "canonicalAnswer",
+      "acceptedAnswers",
+      "solutionOutline",
+      "verificationChecks",
+      "confidence",
+      "uncertainty"
+    ]
+  }
+};
+
+const answerKeyVerifierSchema = {
+  name: "independent_solution_verification",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      verified: { type: "boolean" },
+      independentlySolvedAnswer: { type: "string" },
+      acceptedAnswers: { type: "array", items: { type: "string" } },
+      confidence: { type: "number" },
+      contradiction: { type: "string" },
+      verificationSummary: { type: "string" }
+    },
+    required: [
+      "verified",
+      "independentlySolvedAnswer",
+      "acceptedAnswers",
+      "confidence",
+      "contradiction",
+      "verificationSummary"
+    ]
+  }
+};
+
+const guideMathAuditSchema = {
+  name: "guide_math_audit",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      safe: { type: "boolean" },
+      confidence: { type: "number" },
+      issue: { type: "string" }
+    },
+    required: ["safe", "confidence", "issue"]
+  }
+};
+
+const ANSWER_KEY_SOLVER_PROMPT = [
+  "你是初中数学题的独立解题与标准答案生成器。正确性优先于速度。",
+  "完整读取题目图片，只解决图片中的当前这一道主问题；若包含小问，需要分别给出答案。",
+  "必须自己根据题目条件计算，不得把图片里学生手写答案、红笔批改、勾叉或已填答案当成正确依据。",
+  "先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核最终答案。",
+  "canonicalAnswer 只写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
+  "solutionOutline 和 verificationChecks 只写简洁、可核验的关键步骤，不写冗长推理。",
+  "如果题图不完整、题意存在多解或无法可靠读取，status 必须为 ambiguous 或 unreadable，不能猜答案。",
+  ORDERED_PROPORTION_RULES
+].join("\n");
+
+const ANSWER_KEY_VERIFIER_PROMPT = [
+  "你是第二位独立的初中数学答案复核员。候选答案可能是错的，不能顺着候选答案解释。",
+  "你会收到从题图清洗出的完整题目文本。请只根据这份题目文本独立计算，然后再与候选答案比较。",
+  "必须检查题目顺序、正负号、单位、选项、定义域、是否漏解以及题目实际问法。",
+  "不要采用候选答案的计算过程，也不要自行补充题目文本中不存在的条件。",
+  "如果题目依赖图形或表格，而清洗后的题目文本没有包含关键关系，verified 必须为 false，不能猜。",
+  "只有独立结果与候选标准答案数学等价时 verified 才能为 true；有任何冲突或题图不清都返回 false。",
+  ORDERED_PROPORTION_RULES
+].join("\n");
+
+const GUIDE_MATH_AUDIT_PROMPT = [
+  "你是恋恋数学引导语的独立事实审校员。",
+  "根据已双重核验的标准答案和简要验算，检查候选引导中明确说出的每个数学判断、算式、正负号、选项和结论。",
+  "标准答案已经完成视觉解题和独立复核，你不得重新质疑或改写这份基线；候选话术确认同一答案时应判 safe=true。",
+  "只检查候选话术实际表达的内容，不能因为它没有讨论某个错误答案、可能暗示其他含义或省略完整过程而判不安全。",
+  "候选引导只要包含一个错误、无依据的肯定或与标准答案冲突的内容，safe 必须为 false。",
+  "只审校事实，不改写话术；无法确定也返回 safe=false。"
+].join("\n");
+
+function normalizeAnswerForComparison(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[−﹣－]/g, "-")
+    .replace(/(?:最终|最后|标准)?(?:答案|结果|选项)(?:是|为|等于)?/g, "")
+    .replace(/([a-z])(?:=|等于|为)/g, "")
+    .replace(/[\s，,。；;：:、（）()【】\[\]]+/g, "")
+    .replace(/选项|项/g, "")
+    .trim();
+}
+
+function answerValuesEquivalent(left, right) {
+  const a = normalizeAnswerForComparison(left);
+  const b = normalizeAnswerForComparison(right);
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  const fractionValue = (value) => {
+    const fraction = value.match(/^(-?\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)$/);
+    if (fraction && Number(fraction[2])) return Number(fraction[1]) / Number(fraction[2]);
+    return /^-?\d+(?:\.\d+)?$/.test(value) ? Number(value) : NaN;
+  };
+  const numberA = fractionValue(a);
+  const numberB = fractionValue(b);
+  return Number.isFinite(numberA) && Number.isFinite(numberB) && Math.abs(numberA - numberB) < 1e-9;
+}
+
+function answerKeyCandidates(value) {
+  return [value?.canonicalAnswer, ...(Array.isArray(value?.acceptedAnswers) ? value.acceptedAnswers : [])]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+}
+
+function answerKeyResultsAgree(solver, verifier) {
+  const solverAnswers = answerKeyCandidates(solver);
+  const verifierAnswers = [verifier?.independentlySolvedAnswer, ...(Array.isArray(verifier?.acceptedAnswers) ? verifier.acceptedAnswers : [])]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  return solverAnswers.some((left) => verifierAnswers.some((right) => answerValuesEquivalent(left, right)));
+}
+
+function getAnswerKeyCacheKey(questionImage, context = {}) {
+  return crypto
+    .createHash("sha256")
+    .update(String(questionImage || ""))
+    .update(`|problem:${String(context.problemText || "").replace(/\s+/g, " ").trim()}`)
+    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v5`)
+    .digest("hex");
+}
+
+function setCachedAnswerKey(key, value) {
+  answerKeyCache.set(key, cloneJson(value));
+  while (answerKeyCache.size > ANSWER_KEY_CACHE_LIMIT) {
+    answerKeyCache.delete(answerKeyCache.keys().next().value);
+  }
+}
+
+async function solveAndVerifyAnswerKey(questionImage, context = {}) {
+  const startedAt = Date.now();
+  const solver = await callQwenMultimodalJson({
+    model: QWEN_GUIDE_MODEL,
+    schema: answerKeySolverSchema,
+    instructions: ANSWER_KEY_SOLVER_PROMPT,
+    content: [
+      {
+        type: "input_text",
+        text: JSON.stringify({
+          knownProblemText: context.problemText || "",
+          instruction: "独立求解并生成标准答案。不要采用图片中的学生作答或批改结论。"
+        })
+      },
+      { type: "input_image", label: "当前题目图片", image_url: questionImage, detail: "high" }
+    ],
+    maxOutputTokens: 1400
+  });
+
+  if (solver.status !== "solved" || Number(solver.confidence) < ANSWER_KEY_MIN_CONFIDENCE || !solver.canonicalAnswer) {
+    return {
+      trusted: false,
+      status: solver.status || "unverified",
+      confidence: Number(solver.confidence) || 0,
+      reason: solver.uncertainty || "独立解题未达到可信阈值",
+      elapsedMs: Date.now() - startedAt
+    };
+  }
+
+  const verifier = await callQwenMultimodalJson({
+    model: QWEN_GUIDE_MODEL,
+    schema: answerKeyVerifierSchema,
+    instructions: ANSWER_KEY_VERIFIER_PROMPT,
+    content: [
+      {
+        type: "input_text",
+        text: JSON.stringify({
+          cleanedProblemText: solver.problemText,
+          questionType: solver.questionType,
+          candidateAnswer: solver.canonicalAnswer,
+          candidateAcceptedAnswers: solver.acceptedAnswers,
+          instruction: "只用 cleanedProblemText 独立解题；算完后再看 candidateAnswer 是否一致。"
+        })
+      }
+    ],
+    maxOutputTokens: 900
+  });
+
+  const confidence = Math.min(Number(solver.confidence) || 0, Number(verifier.confidence) || 0);
+  const trusted =
+    verifier.verified === true &&
+    confidence >= ANSWER_KEY_MIN_CONFIDENCE &&
+    answerKeyResultsAgree(solver, verifier);
+
+  if (!trusted) {
+    console.warn(
+      `[answer-key] verification conflict solver=${JSON.stringify(solver.canonicalAnswer)} verifier=${JSON.stringify(
+        verifier.independentlySolvedAnswer
+      )} solverConfidence=${solver.confidence} verifierConfidence=${verifier.confidence} verified=${verifier.verified}`
+    );
+  }
+
+  return {
+    trusted,
+    status: trusted ? "verified" : "conflict",
+    canonicalAnswer: trusted ? String(solver.canonicalAnswer).trim() : "",
+    acceptedAnswers: trusted ? answerKeyCandidates(solver) : [],
+    problemText: String(solver.problemText || context.problemText || "").trim(),
+    questionType: String(solver.questionType || "").trim(),
+    solutionOutline: trusted && Array.isArray(solver.solutionOutline) ? solver.solutionOutline.slice(0, 8) : [],
+    verificationChecks: trusted && Array.isArray(solver.verificationChecks) ? solver.verificationChecks.slice(0, 8) : [],
+    confidence,
+    reason: trusted ? verifier.verificationSummary || "双重核验通过" : verifier.contradiction || "两次独立结果不一致",
+    elapsedMs: Date.now() - startedAt
+  };
+}
+
+async function getVerifiedAnswerKey(questionImage, context = {}) {
+  const cacheKey = getAnswerKeyCacheKey(questionImage, context);
+  const cached = answerKeyCache.get(cacheKey);
+  if (cached) {
+    console.log(`[answer-key] cache hit trusted=${cached.trusted} confidence=${cached.confidence}`);
+    return cloneJson(cached);
+  }
+  if (answerKeyInflight.has(cacheKey)) return cloneJson(await answerKeyInflight.get(cacheKey));
+
+  const request = solveAndVerifyAnswerKey(questionImage, context)
+    .then((result) => {
+      if (result.trusted) setCachedAnswerKey(cacheKey, result);
+      console.log(
+        `[answer-key] resolved trusted=${result.trusted} status=${result.status} confidence=${result.confidence} elapsed=${result.elapsedMs}ms`
+      );
+      return result;
+    })
+    .finally(() => answerKeyInflight.delete(cacheKey));
+  answerKeyInflight.set(cacheKey, request);
+  return cloneJson(await request);
+}
+
+function privateAnswerReference(answerKey) {
+  if (!answerKey?.trusted) {
+    return {
+      trusted: false,
+      instruction: "标准答案尚未通过双重核验。禁止判断学生对错，禁止输出确定答案或确定算式。"
+    };
+  }
+  return {
+    trusted: true,
+    canonicalAnswer: answerKey.canonicalAnswer,
+    acceptedAnswers: answerKey.acceptedAnswers,
+    solutionOutline: answerKey.solutionOutline,
+    verificationChecks: answerKey.verificationChecks,
+    confidence: answerKey.confidence,
+    instruction: "这是服务端私有核验基线。所有数学判断必须与它一致；未解锁讲解时不得把最终答案直接告诉学生。"
+  };
+}
+
+function guideHasCheckableMathClaim(result) {
+  const value = [result?.speech, result?.formulaOrStep, result?.studentAction].filter(Boolean).join(" ");
+  return /(?:正确|对的|成立|不成立|算错|结果|答案|选项|等于|推出|应该是|不是|[=＝]|\d\s*[:：/]\s*\d)/.test(value);
+}
+
+function makeUnverifiedGuideSafe(result) {
+  if (!guideHasCheckableMathClaim(result)) return { ...(result || {}), lectureComplete: false };
+  return {
+    ...(result || {}),
+    shouldSpeak: true,
+    speech: "这一步我还需要重新核对，先别把它当成最终结论。我们按题目条件再检查一下。",
+    hintLevel: "light",
+    formulaOrStep: "",
+    askStudentToRepeat: false,
+    studentAction: "重新读题目条件并说明这一步的依据。",
+    lectureComplete: false
+  };
+}
+
+async function auditGuideMath(result, answerKey, body) {
+  if (!answerKey?.trusted) return makeUnverifiedGuideSafe(result);
+  if (!guideHasCheckableMathClaim(result)) return result;
+  try {
+    const audit = await callQwenMultimodalJson({
+      model: QWEN_GUIDE_MODEL,
+      schema: guideMathAuditSchema,
+      instructions: GUIDE_MATH_AUDIT_PROMPT,
+      content: [
+        {
+          type: "input_text",
+          text: JSON.stringify({
+            verifiedAnswerReference: privateAnswerReference(answerKey),
+            candidateGuide: result,
+            studentTranscript: body.transcript || "",
+            latestStudentSpeech: body.latestStudentSpeech || ""
+          })
+        }
+      ],
+      maxOutputTokens: 450
+    });
+    if (audit.safe === true && Number(audit.confidence) >= ANSWER_KEY_MIN_CONFIDENCE) return result;
+    console.warn(`[guide-audit] blocked unsafe guidance: ${audit.issue || "unverified math claim"}`);
+    return makeUnverifiedGuideSafe(result);
+  } catch (error) {
+    console.warn(`[guide-audit] failed closed: ${error.message}`);
+    return makeUnverifiedGuideSafe(result);
+  }
+}
+
+function studentAnswerMatchesVerifiedKey(studentAnswer, answerKey) {
+  const normalizedStudent = normalizeAnswerForComparison(studentAnswer);
+  if (!normalizedStudent || !answerKey?.trusted) return false;
+  return answerKeyCandidates(answerKey).some((candidate) => {
+    if (answerValuesEquivalent(normalizedStudent, candidate)) return true;
+    const normalizedCandidate = normalizeAnswerForComparison(candidate);
+    if (!normalizedCandidate) return false;
+    if (/^-?\d+(?:\.\d+)?$/.test(normalizedCandidate)) {
+      const escaped = normalizedCandidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`(?:^|[^\\d.\\-])${escaped}(?:$|[^\\d.])`).test(normalizedStudent);
+    }
+    return normalizedStudent.endsWith(normalizedCandidate);
+  });
+}
+
 const FINAL_ANSWER_PROMPT = [
   "你是初中数学错题讲解的收尾核对助手。",
   "请结合当前题目图片、学生讲解文字、黑板图片和学生刚说出的最后答案，判断最后答案是否正确。",
@@ -4234,17 +5080,37 @@ async function handleFinalAnswerCheck(req, res) {
     return;
   }
 
+  const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  if (!answerKey.trusted) {
+    sendJson(res, 200, {
+      correct: false,
+      finalAnswer: String(body.answer).trim(),
+      feedback: "",
+      hint: "这道题的标准答案还没有可靠核准，我先不判断对错。请确认题目图片完整清晰后再核对。",
+      confidence: 0,
+      verificationStatus: answerKey.status,
+      model: QWEN_GUIDE_MODEL,
+      provider: "qwen-double-verified-final-answer"
+    });
+    return;
+  }
+
   const result = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: finalAnswerSchema,
-    instructions: FINAL_ANSWER_PROMPT,
+    instructions: [
+      FINAL_ANSWER_PROMPT,
+      ORDERED_PROPORTION_RULES,
+      "服务端已提供经过两次独立求解一致确认的私有标准答案。必须以该基线比较学生答案，不能重新猜测或被学生语气影响。"
+    ].join("\n\n"),
     content: [
       {
         type: "input_text",
         text: JSON.stringify({
           studentAnswer: String(body.answer).trim(),
           lectureText: body.lectureText || "",
-          latestHandwritingResult: body.latestHandwritingResult || null
+          latestHandwritingResult: body.latestHandwritingResult || null,
+          verifiedAnswerReference: privateAnswerReference(answerKey)
         })
       },
       { type: "input_image", label: "当前题目图片", image_url: body.questionImage, detail: "high" },
@@ -4253,7 +5119,70 @@ async function handleFinalAnswerCheck(req, res) {
     maxOutputTokens: 700
   });
 
-  sendJson(res, 200, { ...result, model: QWEN_GUIDE_MODEL, provider: "qwen-multimodal-final-answer" });
+  const locallyCompatible = studentAnswerMatchesVerifiedKey(body.answer, answerKey);
+  const correct = result.correct === true && Number(result.confidence) >= ANSWER_KEY_MIN_CONFIDENCE && locallyCompatible;
+  sendJson(res, 200, {
+    ...result,
+    correct,
+    feedback: correct ? result.feedback : "",
+    hint: correct
+      ? ""
+      : result.hint || "最后答案还没有和核验结果对上，请根据题目条件再检查一次。",
+    confidence: correct ? Math.min(Number(result.confidence) || 0, answerKey.confidence) : Number(result.confidence) || 0,
+    verificationStatus: "double-verified",
+    model: QWEN_GUIDE_MODEL,
+    provider: "qwen-double-verified-final-answer"
+  });
+}
+
+function enforceOrderedProportionConvention(result, context = {}) {
+  const output = { ...(result || {}) };
+  const currentQuestionContext = [
+    context.problemText,
+    context.transcript,
+    context.latestStudentSpeech,
+    ...(Array.isArray(context.knowledgePoints) ? context.knowledgePoints : [])
+  ].filter(Boolean).join(" ");
+  const hasCurrentProportionEvidence =
+    /(?:成比例|比例式|比例关系|比值)/.test(currentQuestionContext) ||
+    /[\dA-Za-z]+\s*[:：]\s*[\dA-Za-z]+\s*(?:=|＝|等于)\s*[\dA-Za-z]+\s*[:：]\s*[\dA-Za-z]+/.test(
+      currentQuestionContext
+    );
+  if (!hasCurrentProportionEvidence) return output;
+  const combined = [
+    output.speech,
+    output.formulaOrStep,
+    output.studentAction,
+    context.transcript,
+    context.latestStudentSpeech,
+    context.problemText
+  ].filter(Boolean).join(" ");
+  const compact = combined.replace(/\s+/g, "");
+  const claimsOrderIsOptional =
+    /(?:成比例|比例).{0,24}(?:没有|未|不).{0,10}(?:规定)?(?:顺序|对应)/.test(compact) ||
+    /(?:任意|随意).{0,10}(?:交换|调换|排列).{0,10}(?:顺序|位置|比例项)/.test(compact) ||
+    /(?:换|调换).{0,8}(?:顺序|位置).{0,16}(?:另一个|其他|多个)(?:答案|解)/.test(compact) ||
+    /(?:另一个|其他|多个)(?:答案|解).{0,16}(?:顺序|位置|排列)/.test(compact);
+
+  if (!claimsOrderIsOptional) return output;
+
+  const hasTwoThreeXSixEquation =
+    /2(?:比|:|：|\/|分之)3(?:=|＝|等于)x(?:比|:|：|\/|分之)6/i.test(compact) ||
+    /2(?:比|:|：|\/|分之)3(?:=|＝|等于)6(?:比|:|：|\/|分之)x/i.test(compact);
+  const studentReachedFour =
+    /x(?:=|＝|等于)4(?!\d)/i.test(compact) ||
+    /(?:答案|结果|算出|得到)(?:是|为|了)?4(?!\d)/.test(compact);
+
+  output.shouldSpeak = true;
+  output.speech = hasTwoThreeXSixEquation && studentReachedFour
+    ? "这里要按题目给出的顺序列成二比三等于 x 比六，所以 x 等于四。你刚才算出的四是正确的。"
+    : "四个数成比例要按题目给出的顺序对应，不能任意换位置。请按第一项比第二项等于第三项比第四项核对。";
+  output.hintLevel = hasTwoThreeXSixEquation && studentReachedFour ? "encourage" : "light";
+  output.formulaOrStep = hasTwoThreeXSixEquation ? "2:3=x:6，x=4" : "第一项/第二项=第三项/第四项";
+  output.askStudentToRepeat = false;
+  output.studentAction = "按题目给出的顺序继续讲解。";
+  console.warn("[guide-safety] corrected unsupported proportion reordering claim");
+  return output;
 }
 
 async function handleGuide(req, res) {
@@ -4267,8 +5196,8 @@ async function handleGuide(req, res) {
     answer_to_lian_question: "学生正在回答恋恋刚才主动提出的问题。请及时回应这个回答，不要沉默，也不要当作普通连续讲解忽略。",
     active_help: "学生主动求助、提问或明确表示不会。",
     stuck: "学生明确表示不会、没思路或卡住。",
-    silence: "学生讲解过程中普通沉默超过 2 分钟，当前只适合关怀询问。",
-    silence_followup: "2 分钟关怀询问后，学生仍沉默或无法推进，可以进入互动讲解。",
+    silence: "学生讲解过程中已经沉默 1 分钟。请及时结合当前题目和学生最后的思路，给一个很小、可继续开口的切入提示。",
+    silence_followup: "1 分钟提示后，学生仍沉默或无法推进，可以进入互动讲解。",
     error_silence: "局部错误或笔迹可疑后，学生 1 分钟没有新的语音或书写，可以进入互动讲解。",
     repeat_wrong: "学生连续答错或修正失败达到 3 次，可以进入互动讲解。",
     next_step: "学生在互动讲解中要求听下一小步。",
@@ -4280,11 +5209,12 @@ async function handleGuide(req, res) {
 
   const guideState = body.guideState || "heuristic_guidance";
   const lectureUnlocked = Boolean(body.lectureUnlocked);
+  const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
 
-  const guideResult = await callQwenMultimodalJson({
+  let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
-    instructions: [LIAN_GUIDE_PROMPT, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
+    instructions: [LIAN_GUIDE_PROMPT, ORDERED_PROPORTION_RULES, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
     content: [
       {
         type: "input_text",
@@ -4307,10 +5237,13 @@ async function handleGuide(req, res) {
           hasConclusion: Boolean(body.hasConclusion),
           hasMathStep: Boolean(body.hasMathStep),
           studentFinalAnswerEvidence: Boolean(body.studentFinalAnswerEvidence),
+          answerVerified: Boolean(body.answerVerified),
+          boardCompletionVerified: Boolean(body.boardCompletionVerified),
           transcript: body.transcript || "",
           latestStudentSpeech: body.latestStudentSpeech || "",
           knownProblemText: body.problemText || "",
           knownKnowledgePoints: body.knowledgePoints || [],
+          verifiedAnswerReference: privateAnswerReference(answerKey),
           boundaryRules: [
             "如果 eventType=answer_to_lian_question，必须优先回应 lianQuestion 和 latestStudentSpeech 的对应关系，shouldSpeak=true，通常一句话确认后再给一个很小的下一步。",
             "如果学生回答的是要讲哪一道题、哪一步或哪种方式，先接受这个选择，不要根据黑板截图另行改成别的题号。",
@@ -4318,10 +5251,12 @@ async function handleGuide(req, res) {
             "lectureUnlocked=false 时 speech 不得包含最终答案、中间完整算式或完整解题步骤。",
             "lectureUnlocked=true 时只讲一个小步骤，不得一次性讲完整题。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
-            "如果只是普通 2 分钟沉默且 awaitingSilenceFollowup=false，只做关怀询问，不给公式。",
+            "如果 eventType=active_help，学生已经明确提问或表示不会，必须 shouldSpeak=true，并直接回应这个问题；只给当前最需要的一个小步骤，不要先泛泛鼓励。",
+            "如果只是普通 1 分钟沉默且 awaitingSilenceFollowup=false，必须 shouldSpeak=true，并贴着学生最后讲到的内容给一个小切入点；不直接给完整公式或完整答案。",
             "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
-            "lectureComplete 默认必须为 false；只有学生已经讲完关键思路并明确说出最终答案/选项时才设为 true。",
+            "lectureComplete 默认必须为 false；只有 answerVerified=true、boardCompletionVerified=true，且学生已经讲完关键思路时才设为 true。点击‘我讲完了’本身不是完成证据。",
             "lectureComplete=true 后 speech 只做一次收束，不得继续追问、要求复述或重复已经说过的选项。",
+            "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致。trusted=false 时禁止判断对错或输出确定数学结论。",
             "禁止使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。"
           ],
           styleRules: LIAN_STYLE_RULES
@@ -4333,10 +5268,19 @@ async function handleGuide(req, res) {
     maxOutputTokens: 1200
   });
 
+  guideResult = enforceOrderedProportionConvention(guideResult, {
+    transcript: body.transcript || "",
+    latestStudentSpeech: body.latestStudentSpeech || "",
+    problemText: body.problemText || "",
+    knowledgePoints: body.knowledgePoints || []
+  });
+  guideResult = await auditGuideMath(guideResult, answerKey, body);
+
   sendJson(res, 200, {
     ...guideResult,
     model: QWEN_GUIDE_MODEL,
-    provider: "qwen-multimodal",
+    answerVerification: answerKey.trusted ? "double-verified" : answerKey.status,
+    provider: "qwen-double-verified-guidance",
     fallbackFrom: ""
   });
 }
@@ -4349,11 +5293,12 @@ async function handleHandwriting(req, res) {
   }
 
   const boardForOcr = body.boardOnlyImage || body.boardImage;
+  const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
 
-  const result = await callQwenMultimodalJson({
+  let result = await callQwenMultimodalJson({
     model: QWEN_HANDWRITING_MODEL,
     schema: handwritingSchema,
-    instructions: HANDWRITING_PROMPT,
+    instructions: [HANDWRITING_PROMPT, ORDERED_PROPORTION_RULES].join("\n\n"),
     content: [
       {
         type: "input_text",
@@ -4362,8 +5307,9 @@ async function handleHandwriting(req, res) {
           transcript: body.transcript || "",
           knownProblemText: body.problemText || "",
           knownKnowledgePoints: body.knowledgePoints || [],
+          verifiedAnswerReference: privateAnswerReference(answerKey),
           instruction:
-            "请直接观察题目图片、纯板书截图、包含题目区域的板书截图。纯板书截图用来判断学生真正写了什么；题目图片和包含题目区域的截图用于理解题意、确认题目条件和板书所在位置。不要把题目原图里的印刷答案、红叉、批改痕迹当成学生板书。然后根据题目条件实际计算/验算。若关键公式和最后结论都正确，返回 calculationStatus=correct；若公式对但最后结论算错，也必须返回 calculationStatus=wrong；若明显不符合题意，给温和检查提醒；若只是字迹不清或还没写完，不要轻易判错。"
+            "请直接观察题目图片、纯板书截图、包含题目区域的板书截图。纯板书截图用来判断学生真正写了什么；题目图片和包含题目区域的截图用于理解题意、确认题目条件和板书所在位置。不要把题目原图里的印刷答案、红叉、批改痕迹当成学生板书。然后根据题目条件实际计算/验算。若 verifiedAnswerReference.trusted=true，所有对错判断必须与这份双重核验基线一致；若 trusted=false，只能返回 unclear 或 incomplete，禁止判 correct/wrong。若可见关键步骤数学上成立，即使后续推导和最终答案没有写在板书上，也可返回 calculationStatus=correct；若可见步骤或最后结论算错，必须返回 calculationStatus=wrong；若明显不符合题意，给温和检查提醒；若只是字迹不清，不要轻易判错。若 trigger 表示完成讲解前检查，boardComplete 只判断是否至少存在一个与本题相关、可复核且正确的关键步骤，不要求完整推导或板书最终答案。"
         })
       },
       { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high" },
@@ -4373,7 +5319,67 @@ async function handleHandwriting(req, res) {
     maxOutputTokens: 1000
   });
 
-  sendJson(res, 200, { ...result, model: QWEN_HANDWRITING_MODEL, provider: "qwen-multimodal" });
+  if (!answerKey.trusted && ["correct", "wrong"].includes(result.calculationStatus)) {
+    result = {
+      ...result,
+      calculationStatus: "unclear",
+      calculationCheck: "标准答案尚未通过双重核验，暂不判断板书对错。",
+      hasPossibleIssue: false,
+      issueType: "unclear",
+      issueSummary: "",
+      expectedNextStep: "",
+      guidance: "",
+      positiveFeedback: "",
+      boardComplete: false,
+      missingBoardContent: result.missingBoardContent || "标准答案尚未通过双重核验，暂时不能确认板书完整。"
+    };
+  }
+
+  if (
+    /完成讲解前检查/.test(String(body.reason || "")) &&
+    result.boardComplete === true &&
+    isOnlyDirectAnswerWriting(result.detectedWriting || result.mathExpression)
+  ) {
+    result = {
+      ...result,
+      boardComplete: false,
+      missingBoardContent: "目前只有最终答案，请再写一个关键关系式、公式或计算步骤。"
+    };
+  }
+
+  sendJson(res, 200, {
+    ...result,
+    answerVerification: answerKey.trusted ? "double-verified" : answerKey.status,
+    model: QWEN_HANDWRITING_MODEL,
+    provider: "qwen-double-verified-handwriting"
+  });
+}
+
+function isOnlyDirectAnswerWriting(value) {
+  const text = String(value || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, "")
+    .replace(/[。；;，,]/g, "")
+    .replace(/^(?:最终答案|答案|结果)(?:是|为)?/, "")
+    .replace(/(?:厘米|米|千米|平方厘米|平方米|立方厘米|立方米|度|°|cm|m|km)\d*$/i, "");
+  if (!text) return true;
+  if (/^(?:选)?[A-D](?:选项)?$/i.test(text)) return true;
+  return /^(?:[a-zA-Z]|[A-Za-z][A-Za-z0-9_]*)=(?:[-+]?\d+(?:\.\d+)?|[-+]?\d+\/[-+]?\d+)$/.test(text);
+}
+
+async function handleAnswerKeyPrefetch(req, res) {
+  const body = await readJsonBody(req);
+  if (!body.questionImage) {
+    sendJson(res, 400, { error: "缺少 questionImage" });
+    return;
+  }
+  const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  sendJson(res, 200, {
+    ready: answerKey.trusted,
+    status: answerKey.status,
+    confidence: answerKey.trusted ? answerKey.confidence : 0,
+    provider: "qwen-double-verified-answer-key"
+  });
 }
 
 function serveStatic(req, res) {
@@ -4404,6 +5410,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "POST" && pathname === "/api/segment") return await handleSegmentV2(req, res);
     if (req.method === "POST" && pathname === "/api/transcript-correct") return await handleTranscriptCorrection(req, res);
+    if (req.method === "POST" && pathname === "/api/answer-key") return await handleAnswerKeyPrefetch(req, res);
     if (req.method === "POST" && pathname === "/api/final-answer") return await handleFinalAnswerCheck(req, res);
     if (req.method === "POST" && pathname === "/api/guide") return await handleGuide(req, res);
     if (req.method === "POST" && pathname === "/api/handwriting") return await handleHandwriting(req, res);
@@ -4421,7 +5428,7 @@ if (require.main === module) {
   server.listen(PORT, () => {
     console.log(`恋恋错题本服务已启动：http://127.0.0.1:${PORT}`);
     console.log(
-      `题目视觉分割：${QWEN_VL_MODEL}（Qwen 多模态）；旧版 OCR 文本分组：${SEGMENT_MODEL}（DeepSeek，当前未路由）`
+      `题目分割：PP-DocLayoutV2 + PaddleOCR 本地并行；低置信度页面使用 ${QWEN_VL_MODEL} 复核`
     );
     console.log(
       `Qwen 多模态 API：${QWEN_BASE_URL}；讲解引导模型：${QWEN_GUIDE_MODEL}；板书识别模型：${QWEN_HANDWRITING_MODEL}`
@@ -4429,6 +5436,10 @@ if (require.main === module) {
     const ocrService = getPaddleOcrService();
     if (ocrService) {
       console.log("[segment] PaddleOCR service prewarming in background");
+    }
+    const layoutService = getPaddleLayoutService();
+    if (layoutService) {
+      console.log("[layout] PP-DocLayoutV2 service prewarming in background");
     }
   });
 }
@@ -4446,5 +5457,13 @@ module.exports = {
   validateFinalQuestionBoxes,
   validateSingleMainQuestionPerCrop,
   splitQuestionCandidatesByMainQuestionAnchors,
-  splitQuestionsUntilSingleMainQuestion
+  splitQuestionsUntilSingleMainQuestion,
+  buildLayoutContentBlocks,
+  assessLocalSegmentationConfidence,
+  enforceOrderedProportionConvention,
+  answerValuesEquivalent,
+  answerKeyResultsAgree,
+  makeUnverifiedGuideSafe,
+  studentAnswerMatchesVerifiedKey,
+  isOnlyDirectAnswerWriting
 };

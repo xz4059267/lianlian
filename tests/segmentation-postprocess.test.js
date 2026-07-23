@@ -14,8 +14,131 @@ const {
   validateFinalQuestionBoxes,
   validateSingleMainQuestionPerCrop,
   splitQuestionCandidatesByMainQuestionAnchors,
-  splitQuestionsUntilSingleMainQuestion
+  splitQuestionsUntilSingleMainQuestion,
+  buildLayoutContentBlocks,
+  assessLocalSegmentationConfidence,
+  enforceOrderedProportionConvention,
+  answerValuesEquivalent,
+  answerKeyResultsAgree,
+  makeUnverifiedGuideSafe,
+  studentAnswerMatchesVerifiedKey,
+  isOnlyDirectAnswerWriting
 } = require("../server.js");
+
+test("clips layout regions to OCR question-number intervals", () => {
+  const anchors = [
+    { sourceQuestionNumber: "11", startY: 100 },
+    { sourceQuestionNumber: "12", startY: 260 },
+    { sourceQuestionNumber: "13", startY: 420 }
+  ];
+  const regions = [
+    { label: "text", score: 0.95, x: 40, y: 80, w: 700, h: 380 },
+    { label: "table", score: 0.91, x: 90, y: 300, w: 500, h: 90 },
+    { label: "page_number", score: 0.99, x: 380, y: 760, w: 30, h: 20 }
+  ];
+
+  const blocks = buildLayoutContentBlocks(regions, anchors, 800, 800);
+  const q11 = blocks.filter((block) => block.parentQuestionNumber === "11");
+  const q12 = blocks.filter((block) => block.parentQuestionNumber === "12");
+  const q13 = blocks.filter((block) => block.parentQuestionNumber === "13");
+
+  assert.ok(q11.length >= 1);
+  assert.ok(q12.length >= 2);
+  assert.ok(q13.length >= 1);
+  assert.ok(q11.every((block) => block.y + block.h <= 260));
+  assert.ok(q12.every((block) => block.y >= 260 && block.y + block.h <= 420));
+  assert.ok(q13.every((block) => block.y >= 420));
+  assert.equal(blocks.some((block) => block.contentType === "page_number"), false);
+});
+
+test("routes a dense page with too few OCR anchors to vision review", () => {
+  const confidence = assessLocalSegmentationConfidence({
+    anchors: [{ sourceQuestionNumber: "11", startY: 120 }],
+    ocrLines: Array.from({ length: 14 }, (_, index) => ({
+      text: `line ${index}`,
+      x: 40,
+      y: 80 + index * 35,
+      w: 600,
+      h: 20
+    })),
+    layoutRegions: [{ label: "text", score: 0.9, x: 30, y: 70, w: 720, h: 520 }],
+    width: 800,
+    height: 700
+  });
+
+  assert.equal(confidence.needsVisionReview, true);
+  assert.ok(confidence.reasons.includes("整页内容密集但题号不足"));
+});
+
+test("keeps a well-anchored local page on the fast path", () => {
+  const confidence = assessLocalSegmentationConfidence({
+    anchors: [
+      { sourceQuestionNumber: "11", startY: 100 },
+      { sourceQuestionNumber: "12", startY: 260 },
+      { sourceQuestionNumber: "13", startY: 430 }
+    ],
+    ocrLines: Array.from({ length: 12 }, (_, index) => ({
+      text: `line ${index}`,
+      x: 40,
+      y: 80 + index * 40,
+      w: 600,
+      h: 20
+    })),
+    layoutRegions: [
+      { label: "text", score: 0.92, x: 30, y: 80, w: 720, h: 480 },
+      { label: "table", score: 0.88, x: 100, y: 300, w: 450, h: 80 }
+    ],
+    width: 800,
+    height: 700
+  });
+
+  assert.equal(confidence.needsVisionReview, false);
+  assert.ok(confidence.score >= confidence.threshold);
+});
+
+test("accepts a formula-led main question when it has a legal numbered prefix", () => {
+  const anchors = extractMainQuestionAnchors(
+    [
+      { text: "11. 已知关于 x、y 的方程", x: 40, y: 100, w: 620, h: 24 },
+      { text: "12. a:b=1/5:1/3，b:c=2:7", x: 40, y: 180, w: 620, h: 24 },
+      { text: "13. 如图，某条河遭受暴雨袭击", x: 40, y: 260, w: 620, h: 24 }
+    ],
+    800,
+    600
+  );
+
+  assert.deepEqual(anchors.map((anchor) => anchor.sourceQuestionNumber), ["11", "12", "13"]);
+});
+
+test("keeps Qwen question structures when local OCR has no reliable anchors", () => {
+  const candidates = normalizeQuestionRegions(
+    [
+      {
+        questionNumber: "21",
+        stemBoxes: [{ x: 0.08, y: 0.12, w: 0.84, h: 0.1 }],
+        optionBoxes: [{ x: 0.1, y: 0.23, w: 0.8, h: 0.14 }],
+        otherBoxes: [],
+        summary: "已知两个数的关系，选择正确答案",
+        type: "选择题"
+      },
+      {
+        questionNumber: "22",
+        stemBoxes: [{ x: 0.08, y: 0.45, w: 0.84, h: 0.1 }],
+        optionBoxes: [{ x: 0.1, y: 0.56, w: 0.8, h: 0.14 }],
+        otherBoxes: [],
+        summary: "根据图形中的条件计算面积",
+        type: "计算题"
+      }
+    ],
+    [],
+    [],
+    1000,
+    1200
+  );
+
+  assert.deepEqual(candidates.map((candidate) => candidate.sourceQuestionNumber), ["21", "22"]);
+  assert.ok(candidates.every((candidate) => candidate.questionRole === "mainQuestion"));
+});
 
 function makeQuestion(number, y, h = 90) {
   return {
@@ -196,6 +319,20 @@ test("rechecks a numbering gap and recovers a real intermediate question from ex
 
   assert.deepEqual(recovered.map((anchor) => anchor.sourceQuestionNumber), ["11", "12", "13"]);
   assert.equal(recovered[1].evidenceSource, "sequence-gap-review+ocr-content+vision");
+});
+
+test("recovers a blurred intermediate number from an existing local OCR stem", () => {
+  const lines = [
+    { text: "2. 已知两个数成比例，请选择正确答案", x: 40, y: 100, w: 620, h: 24, blockIndexes: [0], blocks: [] },
+    { text: "有编号为一到十的篮球，请判断下列说法", x: 42, y: 220, w: 600, h: 24, blockIndexes: [1], blocks: [] },
+    { text: "4. 如图，请根据图形关系选择正确答案", x: 40, y: 340, w: 620, h: 24, blockIndexes: [2], blocks: [] }
+  ];
+  const anchors = extractMainQuestionAnchors(lines, 800, 500);
+  const recovered = recoverDiscontinuousQuestionAnchors(lines, anchors, [], 800, 500);
+
+  assert.deepEqual(recovered.map((anchor) => anchor.sourceQuestionNumber), ["2", "3", "4"]);
+  assert.equal(recovered[1].evidenceSource, "sequence-gap-review+local-ocr-stem");
+  assert.equal(recovered[1].startY, 220);
 });
 
 test("keeps discontinuous numbering when the missing number has no existing visual evidence", () => {
@@ -464,6 +601,47 @@ test("adds bottom safety padding for Q17 formula content without crossing Q18", 
   assert.ok(finalQ17.bottomPadding >= 12);
 });
 
+test("keeps a non-final question through the full interval before the next anchor", () => {
+  const anchors = [
+    { questionNumber: 13, top: 100 },
+    { questionNumber: 14, top: 220 }
+  ];
+  const q13 = {
+    ...makeQuestion(13, 100, 40),
+    ocrLineBoxes: [{ text: "13. 题干", x: 40, y: 100, w: 500, h: 24 }]
+  };
+  const q14 = makeQuestion(14, 220, 80);
+  const finalQuestions = enforceHardQuestionBoundaries([q13, q14], anchors, {
+    height: 400,
+    width: 800,
+    boundaryGap: 5,
+    topPadding: 4
+  });
+  const finalQ13 = finalQuestions.find((question) => String(question.sourceQuestionNumber) === "13");
+
+  assert.equal(finalQ13.finalBox.y + finalQ13.finalBox.h, 215);
+});
+
+test("recovers a suspiciously narrow crop from stable neighboring question widths", () => {
+  const anchors = [
+    { questionNumber: 13, top: 100 },
+    { questionNumber: 14, top: 220 },
+    { questionNumber: 15, top: 340 }
+  ];
+  const q13 = { ...makeQuestion(13, 100, 80), finalBox: { x: 100, y: 100, w: 900, h: 80 } };
+  const q14 = { ...makeQuestion(14, 220, 60), finalBox: { x: 110, y: 220, w: 390, h: 60 } };
+  const q15 = { ...makeQuestion(15, 340, 100), finalBox: { x: 105, y: 340, w: 910, h: 100 } };
+  const finalQuestions = enforceHardQuestionBoundaries([q13, q14, q15], anchors, {
+    height: 600,
+    width: 1200,
+    boundaryGap: 5,
+    topPadding: 4
+  });
+  const finalQ14 = finalQuestions.find((question) => String(question.sourceQuestionNumber) === "14");
+
+  assert.ok(finalQ14.finalBox.w >= 890);
+});
+
 test("ignores a vision box that crosses Q18 and keeps the full Q17 bottom at the anchor edge", () => {
   const anchors = [
     { questionNumber: 17, top: 1130 },
@@ -500,4 +678,86 @@ test("ignores a vision box that crosses Q18 and keeps the full Q17 bottom at the
   assert.equal(finalQ17.contentBottom, 1285);
   assert.equal(finalQ17.finalBox.y + finalQ17.finalBox.h, 1285);
   assert.equal(finalQ18.finalBox.y, 1285);
+});
+
+test("corrects guidance that illegally reorders four proportional terms", () => {
+  const corrected = enforceOrderedProportionConvention(
+    {
+      shouldSpeak: true,
+      speech: "题目没有规定这四个数的顺序，把6放在分子写成2:3=6:x，还能得到另一个答案。",
+      hintLevel: "light",
+      formulaOrStep: "2:3=6:x",
+      askStudentToRepeat: true,
+      studentAction: "再试一种顺序。",
+      lectureComplete: false
+    },
+    {
+      transcript: "我按2:3=x:6算出x=4。",
+      latestStudentSpeech: "答案是4"
+    }
+  );
+
+  assert.match(corrected.speech, /题目给出的顺序|二比三等于 x 比六/);
+  assert.match(corrected.speech, /四是正确的/);
+  assert.equal(corrected.formulaOrStep, "2:3=x:6，x=4");
+  assert.equal(corrected.askStudentToRepeat, false);
+  assert.doesNotMatch(corrected.speech, /没有规定|另一个答案/);
+});
+
+test("accepts only equivalent answers from the independent solver and verifier", () => {
+  assert.equal(answerValuesEquivalent("x=4", "答案是4"), true);
+  assert.equal(answerValuesEquivalent("1/2", "0.5"), true);
+  assert.equal(answerValuesEquivalent("4", "-4"), false);
+
+  assert.equal(
+    answerKeyResultsAgree(
+      { canonicalAnswer: "x=4", acceptedAnswers: ["4"] },
+      { independentlySolvedAnswer: "4", acceptedAnswers: ["x=4"] }
+    ),
+    true
+  );
+  assert.equal(
+    answerKeyResultsAgree(
+      { canonicalAnswer: "x=4", acceptedAnswers: [] },
+      { independentlySolvedAnswer: "x=-4", acceptedAnswers: [] }
+    ),
+    false
+  );
+});
+
+test("fails closed when a math judgment has no verified answer key", () => {
+  const safe = makeUnverifiedGuideSafe({
+    shouldSpeak: true,
+    speech: "你算出的4是正确的。",
+    hintLevel: "encourage",
+    formulaOrStep: "x=4",
+    askStudentToRepeat: false,
+    studentAction: "继续。",
+    lectureComplete: true
+  });
+
+  assert.match(safe.speech, /重新核对|再检查/);
+  assert.equal(safe.formulaOrStep, "");
+  assert.equal(safe.lectureComplete, false);
+  assert.doesNotMatch(safe.speech, /正确/);
+});
+
+test("allows a correct verdict only when the student answer matches the verified key", () => {
+  const key = {
+    trusted: true,
+    canonicalAnswer: "x=4",
+    acceptedAnswers: ["4", "x等于4"]
+  };
+  assert.equal(studentAnswerMatchesVerifiedKey("最后答案是4", key), true);
+  assert.equal(studentAnswerMatchesVerifiedKey("最后答案是-4", key), false);
+  assert.equal(studentAnswerMatchesVerifiedKey("最后答案是5", key), false);
+  assert.equal(studentAnswerMatchesVerifiedKey("最后答案是4", { ...key, trusted: false }), false);
+});
+
+test("accepts a real board step but rejects an isolated final answer", () => {
+  assert.equal(isOnlyDirectAnswerWriting("x = 4"), true);
+  assert.equal(isOnlyDirectAnswerWriting("答案是 C"), true);
+  assert.equal(isOnlyDirectAnswerWriting("2:3=x:6"), false);
+  assert.equal(isOnlyDirectAnswerWriting("3x=12"), false);
+  assert.equal(isOnlyDirectAnswerWriting("S=πr²"), false);
 });
