@@ -724,6 +724,18 @@ main {
   gap: 2px;
 }
 
+.start-row > .start-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.start-actions .text-btn {
+  min-height: 40px;
+  white-space: nowrap;
+}
+
 .primary-btn {
   min-width: 126px;
   padding: 0 16px;
@@ -1255,8 +1267,16 @@ main {
 .detail-main-image img,
 .board-snapshot img {
   width: 100%;
-  height: 100%;
   object-fit: contain;
+}
+
+.detail-main-image img {
+  height: 100%;
+}
+
+.board-snapshot img {
+  height: auto;
+  display: block;
 }
 
 .detail-main-image {
@@ -1264,7 +1284,6 @@ main {
 }
 
 .board-snapshot {
-  aspect-ratio: 16 / 9;
   background: #183d35;
 }
 
@@ -1369,12 +1388,14 @@ main {
   }
 
   .lecture-actions,
-  .complete-actions {
+  .complete-actions,
+  .start-actions {
     width: 100%;
   }
 
   .lecture-actions > *,
-  .complete-actions > * {
+  .complete-actions > *,
+  .start-actions > * {
     flex: 1;
   }
 

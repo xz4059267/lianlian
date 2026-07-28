@@ -67,6 +67,7 @@ const dom = {
   questionList: $("#questionList"),
   selectedSummary: $("#selectedSummary"),
   selectedHint: $("#selectedHint"),
+  clearSelectionBtn: $("#clearSelectionBtn"),
   startLectureBtn: $("#startLectureBtn"),
   replaceImageBtn: $("#replaceImageBtn"),
   clearImageBtn: $("#clearImageBtn"),
@@ -126,7 +127,7 @@ const SILENCE_CARE_MS = 60000;
 const SILENCE_AFTER_CARE_MS = 60000;
 const ERROR_SILENCE_MS = 60000;
 const BOARD_RECOGNITION_DELAY_MS = 6500;
-const THOUGHT_PAUSE_MS = 2600;
+const THOUGHT_PAUSE_MS = 8000;
 const SPEECH_QUIET_BEFORE_BOARD_MS = 2600;
 const THOUGHT_REVIEW_COOLDOWN_MS = 18000;
 const LISTENING_START_PROMPTS = [
@@ -138,6 +139,9 @@ const LISTENING_START_PROMPTS = [
 const BOARD_EXPAND_EDGE_PX = 96;
 const BOARD_MAX_PAGES = 6;
 const REPEATED_GUIDANCE_COOLDOWN_MS = 90000;
+const LIAN_VOICE_RATE = 0.92;
+const LIAN_VOICE_PITCH = 1.01;
+const LIAN_VOICE_VOLUME = 0.82;
 const ACTIVE_HELP_PATTERN = /为什么|不懂|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下|怎么(?:来|来的|求|算|做|解|得到|列|消元|化简)|如何(?:求|算|做|解|得到|列|消元|化简)|该(?:怎么|如何)|能不能(?:提示|讲|告诉)|可以怎么/;
 
 function isDirectHelpRequest(text) {
@@ -161,6 +165,7 @@ const state = {
   lecture: [],
   currentLectureIndex: 0,
   completedThisSession: [],
+  completedLectureQuestionIds: new Set(),
   boardPageIndex: 0,
   boardPages: {},
   boardInkByQuestion: {},
@@ -199,8 +204,12 @@ const state = {
   verifiedFinalAnswerText: "",
   boardCompletionVerified: false,
   completionCheckInProgress: false,
+  autoSavePromptedQuestionId: "",
   finalAnswerRequestId: 0,
   answerKeyStatusByQuestion: {},
+  answerKeyPrefetchQueue: [],
+  answerKeyPrefetchQueuedIds: new Set(),
+  answerKeyPrefetchActive: 0,
   currentQuestionCompleted: false,
   hasExplicitFinalAnswer: false,
   pendingLianQuestion: null,
@@ -211,6 +220,10 @@ const state = {
   isListening: false,
   isMuted: false,
   lianVoice: null,
+  currentLianUtterance: null,
+  lianVoiceIdentity: "",
+  lianVoiceSelectionLocked: false,
+  lianSpeechRequestId: 0,
   micPermissionGranted: false,
   micPermissionPending: false,
   silenceTimer: null,
@@ -228,6 +241,7 @@ const state = {
   pendingThoughtHasMathStep: false,
   pendingThoughtTimer: null,
   boardResizeRaf: 0,
+  boardDrawRequestId: 0,
   normalSpeechCount: 0,
   stuckCount: 0,
   wrongAttemptCount: 0,
@@ -474,6 +488,18 @@ function markUserInput(type) {
   }
 
   if (state.isListening) resetSilenceTimer(false);
+}
+
+function interruptGuideForStudentSpeech() {
+  if (state.currentQuestionCompleted) return;
+  clearTimeout(state.pendingThoughtTimer);
+  state.pendingThoughtTimer = null;
+  state.activeGuideRequestId += 1;
+  state.lianSpeechRequestId += 1;
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  dom.lianAvatar.classList.remove("speaking");
+  dom.lianAvatar.classList.add("listening");
+  dom.lianState.textContent = "安静听你讲";
 }
 
 function clearIssueSilenceTimer() {
@@ -781,6 +807,7 @@ async function runAutoSegment(options = {}) {
 
   state.questions = questions;
   state.selectedIds = questions.map((question) => question.id);
+  scheduleVerifiedAnswerKeyPrefetch(questions);
   dom.processingBox.classList.add("hidden");
   const statusMessage = usedWholePageFallback
       ? "AI 没有可靠拆成单题，已先保留整页，可手动框选细分"
@@ -928,13 +955,15 @@ function normalizeSegmentResult(result, sourceSize = state.source) {
           );
           return null;
         }
+        const sourceNumber = String(item.sourceQuestionNumber || item.questionNumber || item.number || "").trim();
         const receivedBox = item.finalBox && typeof item.finalBox === "object" ? item.finalBox : item;
-        const finalBox = clampSegmentBox(receivedBox, sourceSize.width, sourceSize.height);
+        const finalBox = clampSegmentBox(receivedBox, sourceSize.width, sourceSize.height, {
+          hasVerifiedQuestionNumber: Boolean(sourceNumber)
+        });
         if (!finalBox) {
           console.warn("[segment-normalize] invalid finalBox; question skipped", item);
           return null;
         }
-        const sourceNumber = String(item.sourceQuestionNumber || item.questionNumber || item.number || "").trim();
         console.log(
           `[Q${sourceNumber || "?"}][frontend-received] top=${finalBox.y} bottom=${finalBox.y + finalBox.h} x=${finalBox.x} w=${finalBox.w}`
         );
@@ -965,9 +994,11 @@ function normalizeSegmentResult(result, sourceSize = state.source) {
         };
       } catch (error) {
         console.error("[segment-normalize] question metadata failed; preserving remaining questions", error, item);
-        const fallbackBox = clampSegmentBox(item?.finalBox || item || {}, sourceSize.width, sourceSize.height);
-        if (!fallbackBox) return null;
         const sourceNumber = String(item?.sourceQuestionNumber || item?.questionNumber || item?.number || "").trim();
+        const fallbackBox = clampSegmentBox(item?.finalBox || item || {}, sourceSize.width, sourceSize.height, {
+          hasVerifiedQuestionNumber: Boolean(sourceNumber)
+        });
+        if (!fallbackBox) return null;
         return {
           finalBox: fallbackBox,
           meta: {
@@ -1125,7 +1156,7 @@ function segmentOverlapRatio(a, b) {
   return smaller ? overlap / smaller : 0;
 }
 
-function clampSegmentBox(item, width, height) {
+function clampSegmentBox(item, width, height, options = {}) {
   const x = Number(item.x);
   const y = Number(item.y);
   const w = Number(item.w);
@@ -1138,7 +1169,10 @@ function clampSegmentBox(item, width, height) {
   const safeBottom = Math.max(safeY + 1, Math.min(height, Math.ceil(y + h)));
   const safeW = safeRight - safeX;
   const safeH = safeBottom - safeY;
-  if (safeW < width * 0.05 || safeH < height * 0.035) return null;
+  const minimumHeight = options.hasVerifiedQuestionNumber
+    ? Math.max(8, height * 0.008)
+    : height * 0.035;
+  if (safeW < width * 0.05 || safeH < minimumHeight) return null;
   return {
     x: safeX,
     y: safeY,
@@ -1539,6 +1573,7 @@ function renderQuestions() {
   const count = state.selectedIds.length;
   dom.selectedSummary.textContent = count ? `已选择 ${count} 道题` : "未选择题目";
   dom.selectedHint.textContent = count ? "将按卡片上的数字依次讲解" : "可多选，按选择顺序讲解";
+  dom.clearSelectionBtn.disabled = count === 0;
   dom.startLectureBtn.disabled = count === 0;
 }
 
@@ -1567,6 +1602,13 @@ function moveQuestion(index, direction) {
   renderQuestions();
 }
 
+dom.clearSelectionBtn.addEventListener("click", () => {
+  if (!state.selectedIds.length) return;
+  state.selectedIds = [];
+  renderQuestions();
+  setStatus(dom.segmentState, "已取消全部选择，可重新选择要讲解的题目");
+});
+
 dom.startLectureBtn.addEventListener("click", () => {
   const queue = state.selectedIds
     .map((id) => state.questions.find((question) => question.id === id))
@@ -1582,6 +1624,7 @@ function startLecture(queue) {
   }));
   state.currentLectureIndex = 0;
   state.completedThisSession = [];
+  state.completedLectureQuestionIds = new Set();
   state.boardPageIndex = 0;
   state.boardPages = {};
   state.boardInkByQuestion = {};
@@ -1601,6 +1644,7 @@ function startLecture(queue) {
   state.hasExplicitFinalAnswer = false;
   state.pendingLianQuestion = null;
   dom.finishQuestionBtn.disabled = false;
+  scheduleVerifiedAnswerKeyPrefetch(state.lecture);
   initCurrentQuestion();
   showView("teachView");
 }
@@ -1690,10 +1734,25 @@ function resizeBoardCanvas(options = {}) {
   const previousRect = dom.canvas.getBoundingClientRect();
   const rect = dom.blackboard.getBoundingClientRect();
   if (!rect.width || !rect.height) return;
-  const oldImage = options.existingImage ?? (dom.canvas.width ? dom.canvas.toDataURL("image/png") : "");
   const ratio = window.devicePixelRatio || 1;
-  dom.canvas.width = Math.round(rect.width * ratio);
-  dom.canvas.height = Math.round(rect.height * ratio);
+  const nextPixelWidth = Math.round(rect.width * ratio);
+  const nextPixelHeight = Math.round(rect.height * ratio);
+  const sameCanvasSize = dom.canvas.width === nextPixelWidth && dom.canvas.height === nextPixelHeight;
+  if (sameCanvasSize && options.existingImage === undefined && !options.force) {
+    applyBoardImageState();
+    return;
+  }
+  const oldPixelWidth = dom.canvas.width;
+  const oldPixelHeight = dom.canvas.height;
+  const oldImage = options.existingImage ?? (oldPixelWidth ? dom.canvas.toDataURL("image/png") : "");
+  const oldRatio = previousRect.width ? oldPixelWidth / previousRect.width : ratio;
+  const oldCssSize = {
+    width: oldPixelWidth && oldRatio ? oldPixelWidth / oldRatio : previousRect.width || rect.width,
+    height: oldPixelHeight && oldRatio ? oldPixelHeight / oldRatio : previousRect.height || rect.height
+  };
+  state.boardDrawRequestId += 1;
+  dom.canvas.width = nextPixelWidth;
+  dom.canvas.height = nextPixelHeight;
   dom.canvas.style.width = "100%";
   dom.canvas.style.height = "100%";
   ctx = dom.canvas.getContext("2d");
@@ -1702,15 +1761,15 @@ function resizeBoardCanvas(options = {}) {
   ctx.lineJoin = "round";
   clearCanvasOnly();
   if (oldImage) {
-    drawDataUrlToCanvas(
-      oldImage,
-      options.preserveExistingSize
-        ? {
-            width: Math.min(rect.width, previousRect.width || rect.width),
-            height: Math.min(rect.height, previousRect.height || rect.height)
-          }
-        : {}
-    );
+    const question = currentPageQuestion();
+    drawDataUrlToCanvas(oldImage, {
+      ...(options.preserveExistingSize ? oldCssSize : {}),
+      questionId: question?.id || "",
+      pageIndex: state.boardPageIndex,
+      onDraw: options.onRestored
+    });
+  } else if (typeof options.onRestored === "function") {
+    options.onRestored();
   }
   applyBoardImageState();
 }
@@ -1752,13 +1811,19 @@ function clearCanvasOnly() {
 
 function drawDataUrlToCanvas(dataUrl, options = {}) {
   if (!dataUrl) return;
+  const drawRequestId = ++state.boardDrawRequestId;
   const image = new Image();
   image.onload = () => {
+    if (drawRequestId !== state.boardDrawRequestId) return;
+    if (options.questionId && currentPageQuestion()?.id !== options.questionId) return;
+    if (Number.isFinite(options.pageIndex) && state.boardPageIndex !== options.pageIndex) return;
     const rect = dom.canvas.getBoundingClientRect();
-    const width = options.width || rect.width;
-    const height = options.height || rect.height;
+    const ratio = window.devicePixelRatio || 1;
+    const width = options.width || Math.min(rect.width, image.naturalWidth / ratio || rect.width);
+    const height = options.height || Math.min(rect.height, image.naturalHeight / ratio || rect.height);
     clearCanvasOnly();
     ctx.drawImage(image, 0, 0, width, height);
+    if (typeof options.onDraw === "function") options.onDraw();
   };
   image.src = dataUrl;
 }
@@ -1815,10 +1880,13 @@ function loadCurrentPage() {
   if (!question) return;
   dom.transcriptInput.value = state.transcriptsByQuestion[question.id] || "";
   dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
-  prefetchVerifiedAnswerKey(question);
+  scheduleVerifiedAnswerKeyPrefetch([question]);
   if (dom.boardQuestionImage.src !== question.image) dom.boardQuestionImage.src = question.image;
   const pages = pagesForQuestion(question.id);
-  drawDataUrlToCanvas(pages[0] || "");
+  drawDataUrlToCanvas(pages[0] || "", {
+    questionId: question.id,
+    pageIndex: state.boardPageIndex
+  });
   applyBoardImageState();
 }
 
@@ -1840,6 +1908,30 @@ async function prefetchVerifiedAnswerKey(question) {
     state.answerKeyStatusByQuestion[question.id] = response.ok && result.ready ? "ready" : "unverified";
   } catch {
     state.answerKeyStatusByQuestion[question.id] = "unverified";
+  }
+}
+
+function scheduleVerifiedAnswerKeyPrefetch(questions) {
+  (Array.isArray(questions) ? questions : []).forEach((question) => {
+    if (!question?.id || !question.image) return;
+    if (["loading", "ready"].includes(state.answerKeyStatusByQuestion[question.id])) return;
+    if (state.answerKeyPrefetchQueuedIds.has(question.id)) return;
+    state.answerKeyPrefetchQueuedIds.add(question.id);
+    state.answerKeyPrefetchQueue.push(question);
+  });
+  drainVerifiedAnswerKeyPrefetchQueue();
+}
+
+function drainVerifiedAnswerKeyPrefetchQueue() {
+  while (state.answerKeyPrefetchActive < 2 && state.answerKeyPrefetchQueue.length) {
+    const question = state.answerKeyPrefetchQueue.shift();
+    state.answerKeyPrefetchQueuedIds.delete(question.id);
+    if (["loading", "ready"].includes(state.answerKeyStatusByQuestion[question.id])) continue;
+    state.answerKeyPrefetchActive += 1;
+    void prefetchVerifiedAnswerKey(question).finally(() => {
+      state.answerKeyPrefetchActive = Math.max(0, state.answerKeyPrefetchActive - 1);
+      drainVerifiedAnswerKeyPrefetchQueue();
+    });
   }
 }
 
@@ -1866,9 +1958,9 @@ function expandCurrentBoardPage() {
   applyBoardHeight(question);
   resizeBoardCanvas({
     existingImage: currentImage,
-    preserveExistingSize: true
+    preserveExistingSize: true,
+    onRestored: saveCurrentPage
   });
-  saveCurrentPage();
   showBoardStatusPill("已增加一页黑板");
   return true;
 }
@@ -2154,7 +2246,11 @@ dom.undoBtn.addEventListener("click", () => {
   const stack = state.boardHistories[key] || [];
   if (!stack.length) return;
   const previous = stack.pop();
-  drawDataUrlToCanvas(previous);
+  const question = currentPageQuestion();
+  drawDataUrlToCanvas(previous, {
+    questionId: question?.id || "",
+    pageIndex: state.boardPageIndex
+  });
   setTimeout(saveCurrentPage, 60);
   markUserInput("board");
 });
@@ -2202,12 +2298,18 @@ function resetQuestionGuideState() {
   clearIssueTracking();
   clearSilenceFollowup();
   state.activeGuideRequestId += 1;
+  state.lianSpeechRequestId += 1;
+  state.transcriptCorrectionRequestId += 1;
   state.handwritingRequestId += 1;
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  dom.lianAvatar.classList.remove("speaking");
+  dom.lianAvatar.classList.add("listening");
   state.awaitingFinalAnswer = false;
   state.finalAnswerVerified = false;
   state.verifiedFinalAnswerText = "";
   state.boardCompletionVerified = false;
   state.completionCheckInProgress = false;
+  state.autoSavePromptedQuestionId = "";
   state.finalAnswerRequestId += 1;
   state.silenceGuidePending = false;
   state.latestHandwritingResult = null;
@@ -2333,6 +2435,8 @@ async function runHandwritingRecognition(reason) {
     state.handwritingResults[question.id] = result;
     state.boardCompletionVerified = isBoardCompletionVerified(result);
 
+    if (await maybePromptSaveFromHandwriting(result)) return;
+
     if (isIncompleteHandwritingIssue(result)) {
       dom.recognitionPill.textContent = "等你写完";
       maybeSpeakHandwritingGuidance(result);
@@ -2420,7 +2524,7 @@ async function verifyCurrentBoardForCompletion(question) {
 
   state.latestHandwritingResult = result;
   state.handwritingResults[question.id] = result;
-  const verified = isBoardCompletionVerified(result);
+  const verified = shouldPromptSaveFromHandwriting(result);
   state.boardCompletionVerified = verified;
   dom.recognitionPill.textContent = verified ? "板书步骤已确认" : "板书还需一个正确步骤";
   return {
@@ -2631,6 +2735,65 @@ function isBoardCompletionVerified(result) {
     !hasAssignmentConflict(result) &&
     !hasContradictoryCorrectSignal(result)
   );
+}
+
+function extractAnswerTextFromHandwriting(result) {
+  return String(result?.mathExpression || result?.detectedWriting || result?.calculationCheck || "").trim();
+}
+
+function normalizeBoardMathText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, "")
+    .replace(/[，,。；;！!？?、]/g, "");
+}
+
+function hasReviewableBoardStep(result) {
+  if (result?.boardComplete === true && !isIncompleteHandwritingIssue(result)) return true;
+  const boardText = normalizeBoardMathText([result?.detectedWriting, result?.mathExpression].filter(Boolean).join(" "));
+  if (!boardText) return false;
+
+  const withoutAnswerLead = boardText.replace(/^(?:最后|最终)?(?:答案|结果)(?:是|为|等于|=|＝)?/g, "");
+  const bareAnswerPattern = /^(?:[A-D](?:选项|项)?|[-+]?\d+(?:\.\d+)?(?:度|°|厘米|cm|米|m|千米|km|平方厘米|平方米|立方厘米|cm3|cm³|元|克|千克|分钟|分|%)?|[a-zA-Z]\s*(?:=|＝|等于)\s*[-+]?\d+(?:\.\d+)?)$/i;
+  if (bareAnswerPattern.test(withoutAnswerLead)) return false;
+
+  const numberCount = (boardText.match(/[-+]?\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万]+/g) || []).length;
+  const variableCount = (boardText.match(/[a-zA-Z]/g) || []).length;
+  const hasRelation = /(?:=|＝|等于|:|：|成比例|比例|方程|关系式)/.test(boardText);
+  const hasOperation = /(?:\+|-|−|×|x|X|\*|÷|\/|乘|除|加|减|分之|平方|开方)/.test(boardText);
+
+  return Boolean(
+    hasRelation && hasOperation && numberCount >= 2 ||
+      hasRelation && variableCount >= 1 && numberCount >= 1 ||
+      /(?:360|180).*(?:分之|\/|乘|×|x|X|\*).*(?:度|°|圆心角)/.test(boardText)
+  );
+}
+
+function shouldPromptSaveFromHandwriting(result) {
+  return Boolean(
+    result?.answerVerification === "double-verified" &&
+    result?.isRelevant === true &&
+    isHandwritingCalculationCorrect(result) &&
+    hasReviewableBoardStep(result)
+  );
+}
+
+async function maybePromptSaveFromHandwriting(result) {
+  const question = currentPageQuestion();
+  if (!question || state.currentQuestionCompleted || state.completionCheckInProgress) return false;
+  if (!shouldPromptSaveFromHandwriting(result)) return false;
+  if (state.autoSavePromptedQuestionId === question.id) return false;
+
+  state.autoSavePromptedQuestionId = question.id;
+  state.finalAnswerVerified = true;
+  state.verifiedFinalAnswerText = extractAnswerTextFromHandwriting(result);
+  state.awaitingFinalAnswer = false;
+  state.pendingFinalAnswerText = "";
+  state.boardCompletionVerified = true;
+  dom.finishQuestionBtn.disabled = false;
+
+  await saveCurrentQuestionAndContinue({ feedback: result.positiveFeedback || "" });
+  return true;
 }
 
 function getBoardCompletionGuidance(result) {
@@ -2854,6 +3017,7 @@ function getSpeechRecognition() {
   recognition.onspeechstart = () => {
     if (state.teachSessionPaused) return;
     clearTimeout(state.recognitionTimer);
+    interruptGuideForStudentSpeech();
     dom.studentAvatar.classList.add("speaking");
     dom.studentState.textContent = "正在讲题";
   };
@@ -2873,6 +3037,7 @@ function getSpeechRecognition() {
       state.lastSpeechAt = Date.now();
     }
     if (interimText) {
+      interruptGuideForStudentSpeech();
       dom.studentAvatar.classList.add("speaking");
       dom.studentState.textContent = "正在讲题";
       showSpeechDraft(interimText);
@@ -3198,8 +3363,14 @@ async function handleRecognizedSpeech(text) {
   if (!immediateText) return;
   appendTranscript(immediateText);
 
-  // A direct question must not wait for the optional transcript-correction request.
-  if (isDirectHelpRequest(immediateText) || state.awaitingFinalAnswer) {
+  // Direct questions and explicit final answers must not wait for the optional
+  // transcript-correction request.
+  if (
+    isDirectHelpRequest(immediateText) ||
+    state.awaitingFinalAnswer ||
+    isExplicitFinalAnswerStatement(immediateText) ||
+    extractDirectFinalAnswerCandidate(immediateText)
+  ) {
     handleStudentSpeech(immediateText);
     void correctLatestTranscript(immediateText);
     return;
@@ -3294,6 +3465,25 @@ function handleStudentSpeech(text) {
   if (!text) return;
   const normalized = text.replace(/\s/g, "");
   markUserInput("speech");
+  const directFinalAnswer = extractDirectFinalAnswerCandidate(text);
+  const isExplicitFinalAnswer = isExplicitFinalAnswerStatement(text) || Boolean(directFinalAnswer);
+
+  if (isExplicitFinalAnswer && hasConcreteFinalAnswer(directFinalAnswer || text)) {
+    const answerText = directFinalAnswer || text;
+    recordFinalAnswerEvidence(answerText);
+    state.activeGuideRequestId += 1;
+    state.lianSpeechRequestId += 1;
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+    clearPendingThought();
+    clearSilenceFollowup();
+    state.pendingLianQuestion = null;
+    state.awaitingFinalAnswer = false;
+    state.pendingFinalAnswerText = "";
+    dom.lianState.textContent = "正在核对最后答案";
+    void handleFinalAnswerSubmission(answerText);
+    return;
+  }
+
   if (state.awaitingFinalAnswer) {
     if (isDirectHelpRequest(normalized)) {
       lianSpeak(
@@ -3443,6 +3633,52 @@ function recordFinalAnswerEvidence(text) {
   return hasEvidence;
 }
 
+function isExplicitFinalAnswerStatement(text) {
+  const normalized = String(text || "")
+    .replace(/\s/g, "")
+    .toUpperCase();
+  if (!normalized) return false;
+  return Boolean(
+    /(?:最后|最终)(?:的)?(?:答案|结果)(?:是|为|等于|选)?/.test(normalized) ||
+      /(?:正确)?答案(?:是|为|等于)/.test(normalized) ||
+      /(?:结果)(?:是|为|等于)/.test(normalized) ||
+      /(?:所以|因此|故)(?:最后|最终)?(?:答案|结果)(?:是|为|等于)/.test(normalized) ||
+      /^(?:我)?(?:选|选择)[A-D](?:选项|项)?$/.test(normalized)
+  );
+}
+
+function extractDirectFinalAnswerCandidate(text) {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  const segments = value
+    .split(/[\n。！？!?；;]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const latest = segments.at(-1) || value;
+  if (isStandaloneFinalAnswerCandidate(latest)) return latest;
+
+  const trailing = value.match(/(?:^|[\s，,。；;：:])([A-D](?:选项|项)?|[a-zA-Z]\s*(?:=|＝|等于|为)\s*[负-]?(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万]+)(?:\s*(?:度|°|厘米|cm|米|m|千米|km|平方厘米|平方分米|平方米|立方厘米|cm³|cm3|元|克|千克|分钟|分|%|π))?|[负-]?(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万]+)\s*(?:度|°|厘米|cm|米|m|千米|km|平方厘米|平方分米|平方米|立方厘米|cm³|cm3|元|克|千克|分钟|分|%|π))\s*$/i);
+  const candidate = trailing?.[1]?.trim() || "";
+  return isStandaloneFinalAnswerCandidate(candidate) ? candidate : "";
+}
+
+function isStandaloneFinalAnswerCandidate(text) {
+  const normalized = String(text || "")
+    .normalize("NFKC")
+    .replace(/\s/g, "")
+    .replace(/[。！？!?；;，,、]+$/g, "")
+    .toUpperCase();
+  if (!normalized || normalized.length > 24) return false;
+  const number = "[负-]?(?:\\d+(?:\\.\\d+)?|[零〇一二两三四五六七八九十百千万]+)";
+  const unit = "(?:度|°|厘米|CM|米|M|千米|KM|平方厘米|平方分米|平方米|立方厘米|CM³|CM3|元|克|千克|分钟|分|%|π)";
+  return Boolean(
+    /^[A-D](?:选项|项)?$/i.test(normalized) ||
+      new RegExp(`^[A-Z](?:=|＝|等于|为)${number}(?:${unit})?$`, "i").test(normalized) ||
+      new RegExp(`^${number}${unit}$`, "i").test(normalized) ||
+      /^(?:无解|无数解|不存在|无法确定)$/.test(normalized)
+  );
+}
+
 function extractFinalAnswerCandidate(text) {
   const value = String(text || "").trim();
   if (!value) return "";
@@ -3453,6 +3689,7 @@ function extractFinalAnswerCandidate(text) {
   const explicitPattern = /(?:最后|最终)?(?:答案|结果)|(?:所以|因此|故).*(?:=|等于|是|为)|(?:最后|最终).*(?:=|等于|是|为)|[A-D](?:选项|项)/i;
   for (let index = segments.length - 1; index >= 0; index -= 1) {
     if (explicitPattern.test(segments[index])) return segments[index].slice(-240);
+    if (isStandaloneFinalAnswerCandidate(segments[index])) return segments[index].slice(-80);
   }
   return state.hasExplicitFinalAnswer ? value.slice(-240) : "";
 }
@@ -3631,6 +3868,13 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     }
 
     await lianSpeak(speech);
+    if (
+      state.teachSessionPaused ||
+      requestId !== state.activeGuideRequestId ||
+      currentPageQuestion()?.id !== questionId
+    ) {
+      return false;
+    }
     if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
     if (isSilenceGuide && state.isListening) resetSilenceTimer();
     return true;
@@ -3721,6 +3965,31 @@ function getBoardImageForGuide() {
   }
 }
 
+function trimGuideSpeech(text, eventType) {
+  let value = String(text || "").replace(/\s+/g, " ").trim();
+  if (!value) return "";
+
+  const maxLength = /active_help|repeat_wrong|error_silence|silence_followup|next_step/.test(eventType)
+    ? 76
+    : 46;
+  const maxSentences = /active_help|repeat_wrong|error_silence|silence_followup|next_step/.test(eventType)
+    ? 2
+    : 1;
+
+  const sentences = value.match(/[^。！？!?]+[。！？!?]?/g) || [value];
+  value = sentences.slice(0, maxSentences).join("").trim();
+  if (value.length <= maxLength) return value;
+
+  const clipped = value.slice(0, maxLength);
+  const softBreak = Math.max(
+    clipped.lastIndexOf("，"),
+    clipped.lastIndexOf("；"),
+    clipped.lastIndexOf("、"),
+    clipped.lastIndexOf(" ")
+  );
+  return `${(softBreak > 18 ? clipped.slice(0, softBreak) : clipped).trim()}。`;
+}
+
 function formatGuideSpeech(eventType, result, fallbackText) {
   let speech = String(result?.speech || "").trim() || fallbackText;
   const formulaOrStep = String(result?.formulaOrStep || "").trim();
@@ -3746,7 +4015,7 @@ function formatGuideSpeech(eventType, result, fallbackText) {
     ]);
   }
 
-  return speech.replace(/\s+/g, " ").trim();
+  return trimGuideSpeech(speech, eventType);
 }
 
 function buildFallbackGuide(eventType, question) {
@@ -3801,28 +4070,16 @@ function maybeGuide(text, reason = "guide", cooldown = 15000) {
 }
 
 function chooseLianVoice(voices = []) {
-  const gentleFemaleHints = [
-    "xiaoxiao",
-    "xiaoyi",
-    "yaoyao",
-    "huihui",
-    "xiaohan",
-    "hanhan",
-    "tingting",
-    "ting-ting",
-    "meijia",
-    "mei-jia",
-    "晓晓",
-    "晓伊",
-    "瑶瑶",
-    "慧慧",
-    "晓涵",
-    "婷婷",
-    "美佳",
-    "female",
-    "woman",
-    "girl",
-    "女"
+  const gentleFemalePriorities = [
+    ["xiaoxiao", "晓晓"],
+    ["xiaoyi", "晓伊"],
+    ["yaoyao", "瑶瑶"],
+    ["xiaohan", "晓涵"],
+    ["huihui", "慧慧"],
+    ["tingting", "ting-ting", "婷婷"],
+    ["meijia", "mei-jia", "美佳"],
+    ["hanhan"],
+    ["female", "woman", "girl", "女"]
   ];
   const maleHints = ["kangkang", "yunxi", "yunjian", "male", "man", "boy", "男"];
 
@@ -3840,28 +4097,90 @@ function chooseLianVoice(voices = []) {
       const isChinese = /^(zh|cmn)/.test(lang) || /chinese|中文|普通话|mandarin/.test(name);
       let score = isChinese ? 80 : 0;
       if (/zh-cn|cmn-hans-cn/.test(lang)) score += 30;
-      if (gentleFemaleHints.some((hint) => name.includes(hint.toLowerCase()))) score += 160;
-      if (/natural|online|neural/.test(name)) score += 18;
+      gentleFemalePriorities.forEach((hints, index) => {
+        if (hints.some((hint) => name.includes(hint.toLowerCase()))) {
+          score += Math.max(120, 320 - index * 24);
+        }
+      });
+      if (/natural/.test(name)) score += 70;
+      if (/online|neural/.test(name)) score += 35;
+      if (/xiaoxiao|晓晓/.test(name) && /natural|online|neural/.test(name)) score += 120;
+      if (/desktop|standard/.test(name)) score -= 12;
       if (maleHints.some((hint) => name.includes(hint))) score -= 240;
       return { voice, score };
     })
-    .sort((a, b) => b.score - a.score)[0]?.voice || null;
+    .sort((a, b) =>
+      b.score - a.score ||
+      String(a.voice.name || "").localeCompare(String(b.voice.name || ""), "zh-CN")
+    )[0]?.voice || null;
 }
 
-function refreshLianVoice() {
+function getVoiceIdentity(voice) {
+  if (!voice) return "";
+  return [
+    String(voice.voiceURI || ""),
+    String(voice.name || ""),
+    String(voice.lang || "")
+  ].join("|");
+}
+
+function refreshLianVoice({ force = false } = {}) {
   if (!("speechSynthesis" in window)) return null;
-  state.lianVoice = chooseLianVoice(window.speechSynthesis.getVoices());
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices.length || state.lianVoiceSelectionLocked && !force) return state.lianVoice;
+
+  if (!force && state.lianVoiceIdentity) {
+    const lockedVoice = voices.find((voice) => getVoiceIdentity(voice) === state.lianVoiceIdentity);
+    if (lockedVoice) {
+      state.lianVoice = lockedVoice;
+      return lockedVoice;
+    }
+  }
+
+  state.lianVoice = chooseLianVoice(voices);
+  state.lianVoiceIdentity = getVoiceIdentity(state.lianVoice);
   return state.lianVoice;
 }
 
 function getLianVoice() {
   if (!("speechSynthesis" in window)) return null;
-  return refreshLianVoice() || state.lianVoice;
+  return state.lianVoice || refreshLianVoice();
+}
+
+function waitForLianVoice(timeoutMs = 1200) {
+  const existing = getLianVoice();
+  if (existing || !("speechSynthesis" in window)) {
+    state.lianVoiceSelectionLocked = true;
+    return Promise.resolve(existing);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const deadline = Date.now() + timeoutMs;
+    let checkTimer = null;
+    let timeoutTimer = null;
+    const finish = () => {
+      if (settled) return;
+      const voice = refreshLianVoice();
+      if (!voice && Date.now() < deadline) return;
+      settled = true;
+      clearInterval(checkTimer);
+      clearTimeout(timeoutTimer);
+      window.speechSynthesis.removeEventListener?.("voiceschanged", handleVoicesChanged);
+      state.lianVoiceSelectionLocked = true;
+      resolve(voice || null);
+    };
+    const handleVoicesChanged = () => finish();
+    checkTimer = setInterval(finish, 80);
+    timeoutTimer = setTimeout(finish, timeoutMs);
+    window.speechSynthesis.addEventListener?.("voiceschanged", handleVoicesChanged);
+    finish();
+  });
 }
 
 if ("speechSynthesis" in window) {
   refreshLianVoice();
-  window.speechSynthesis.addEventListener?.("voiceschanged", refreshLianVoice);
+  window.speechSynthesis.addEventListener?.("voiceschanged", () => refreshLianVoice());
 }
 
 function normalizeGuidanceFingerprint(text) {
@@ -3957,38 +4276,67 @@ function lianSpeak(text, options = {}) {
   if (options.log !== false) addLog("恋恋", text, { key: options.logKey || (dedupeKey ? `lian:${dedupeKey}` : "") });
 
   if (options.trackQuestion !== false) rememberLianQuestion(text);
+  const speechRequestId = ++state.lianSpeechRequestId;
 
   return new Promise((resolve) => {
     let finished = false;
+    let fallbackTimer = null;
     const finishSpeaking = () => {
       if (finished) return;
       finished = true;
-      clearTimeout(fallbackTimer);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      state.currentLianUtterance = null;
       dom.lianAvatar.classList.remove("speaking");
       dom.lianAvatar.classList.add("listening");
       dom.lianState.textContent = guideIdleText();
       resolve();
     };
 
-    const fallbackTimer = setTimeout(finishSpeaking, Math.min(2200, 850 + text.length * 34));
-
     if (!state.isMuted && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
-      const speechText = prepareLianSpeechText(text);
-      const utterance = new SpeechSynthesisUtterance(speechText);
-      utterance.lang = "zh-CN";
-      const voice = getLianVoice();
-      if (voice) utterance.voice = voice;
-      utterance.rate = 0.89;
-      utterance.pitch = 1.05;
-      utterance.volume = 0.86;
-      utterance.onend = finishSpeaking;
-      utterance.onerror = finishSpeaking;
-      window.speechSynthesis.speak(utterance);
+      if (speechRequestId !== state.lianSpeechRequestId) {
+        finishSpeaking();
+        return;
+      }
+      try {
+        refreshLianVoice();
+        const speechText = prepareLianSpeechText(text);
+        const startSpeech = (voice, retried = false) => {
+          if (finished || speechRequestId !== state.lianSpeechRequestId) {
+            finishSpeaking();
+            return;
+          }
+          const utterance = new SpeechSynthesisUtterance(speechText);
+          utterance.lang = "zh-CN";
+          if (voice) utterance.voice = voice;
+          utterance.rate = LIAN_VOICE_RATE;
+          utterance.pitch = LIAN_VOICE_PITCH;
+          utterance.volume = LIAN_VOICE_VOLUME;
+          utterance.onend = finishSpeaking;
+          utterance.onerror = (event) => {
+            console.warn("Lian speech failed:", event?.error || event);
+            if (!retried && voice) {
+              window.speechSynthesis.cancel();
+              startSpeech(null, true);
+              return;
+            }
+            finishSpeaking();
+          };
+          state.currentLianUtterance = utterance;
+          window.speechSynthesis.resume?.();
+          window.speechSynthesis.speak(utterance);
+          setTimeout(() => window.speechSynthesis.resume?.(), 80);
+        };
+        fallbackTimer = setTimeout(finishSpeaking, Math.max(2400, 900 + text.length * 70));
+        startSpeech(getLianVoice());
+      } catch (error) {
+        console.warn("Lian speech fallback:", error);
+        finishSpeaking();
+      }
       return;
     }
 
-    setTimeout(finishSpeaking, 260);
+    fallbackTimer = setTimeout(finishSpeaking, 260);
   });
 }
 
@@ -4113,8 +4461,21 @@ async function handleFinalAnswerSubmission(answer) {
       state.finalAnswerVerified = true;
       state.verifiedFinalAnswerText = answer.trim();
       state.awaitingFinalAnswer = false;
+      state.boardCompletionVerified = false;
+      state.currentQuestionCompleted = false;
+      dom.finishQuestionBtn.disabled = false;
       setGuideState(GUIDE_STATES.INTERACTIVE);
-      await verifyBoardAndCompleteQuestion({ feedback: result.feedback || "" });
+      const feedback = String(result.feedback || "").trim();
+      await lianSpeak(
+        `${
+          feedback || "最后答案正确。"
+        } 点击右上角“我讲完了”，我会核对板书，并提醒你保存到错题本。`,
+        {
+          dedupeKey: `final-answer-correct:${question.id}:${answer.trim()}`,
+          cooldownMs: 0,
+          allowRepeat: true
+        }
+      );
       return;
     }
 
@@ -4127,9 +4488,9 @@ async function handleFinalAnswerSubmission(answer) {
     await lianSpeak(
       result.hint ||
         pickPrompt("final-answer-check", [
-          "我们一起再核一下最后一步，你把答案和前面的关系式对照一下。",
-          "最后结果还需要再确认一下，看看代回题目条件后是否成立。",
-          "先别急着保存，把最后的数值和单位再检查一遍。"
+          "这个答案和题目条件没有对上。请检查最后一步的运算、符号或单位。",
+          "最后结果不正确。把它代回题目条件，会发现等式不能成立。",
+          "这个答案还不能通过核验。请重新检查得到它的那一步计算。"
         ])
     );
   } catch (error) {
@@ -4179,23 +4540,26 @@ async function saveCurrentQuestionAndContinue(options = {}) {
     return;
   }
 
-  const record = await buildNotebookRecord(question);
-  state.notebook.unshift(record);
-  state.completedThisSession.push(record);
-  saveNotebook();
-  state.finalAnswerVerified = false;
-  state.verifiedFinalAnswerText = "";
-  state.boardCompletionVerified = false;
-  state.currentQuestionCompleted = false;
-
-  if (state.boardPageIndex < state.lecture.length - 1) {
-    state.boardPageIndex += 1;
-    state.currentLectureIndex = state.boardPageIndex;
-    resetQuestionGuideState();
-    loadCurrentPage();
-    updatePageLabel();
+  let record = null;
+  try {
+    record = await buildNotebookRecord(question);
+    state.notebook.unshift(record);
+    state.completedThisSession.push(record);
+    state.completedLectureQuestionIds.add(question.id);
+    saveNotebook();
+  } catch (error) {
+    console.warn("Notebook save failed:", error);
+    if (record) state.completedThisSession = state.completedThisSession.filter((item) => item.id !== record.id);
+    if (record) state.notebook = state.notebook.filter((item) => item.id !== record.id);
     dom.finishQuestionBtn.disabled = false;
-    lianSpeak(
+    await lianSpeak("保存错题时遇到问题，页面没有继续跳转。你可以先返回错题本清理一下空间，再点我讲完了重试。");
+    return;
+  }
+
+  const nextIndex = findNextUncompletedLectureIndex(state.boardPageIndex);
+  if (nextIndex !== -1) {
+    goToLectureQuestion(
+      nextIndex,
       pickPrompt("next-question-after-save", [
         "答案核对正确，这道题完成了。我们看下一题，你先说说题目给了什么条件。",
         "这道题已经讲完并保存好了。接下来进入下一题，你按自己的思路慢慢讲。",
@@ -4205,6 +4569,10 @@ async function saveCurrentQuestionAndContinue(options = {}) {
     return;
   }
 
+  state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.boardCompletionVerified = false;
+  state.currentQuestionCompleted = false;
   dom.finishQuestionBtn.disabled = true;
   stopListeningAfterSessionCompletion();
   renderCompletion();
@@ -4217,6 +4585,37 @@ async function saveCurrentQuestionAndContinue(options = {}) {
     ]),
     { trackQuestion: false, dedupeKey: "session-complete" }
   );
+}
+
+function findNextUncompletedLectureIndex(fromIndex = state.boardPageIndex) {
+  const total = state.lecture.length;
+  if (!total) return -1;
+  for (let offset = 1; offset <= total; offset += 1) {
+    const index = (fromIndex + offset) % total;
+    const question = state.lecture[index];
+    if (question && !state.completedLectureQuestionIds.has(question.id)) return index;
+  }
+  return -1;
+}
+
+function goToLectureQuestion(index, openingText = "") {
+  if (index < 0 || index >= state.lecture.length) return false;
+  state.boardPageIndex = index;
+  state.currentLectureIndex = index;
+  resetQuestionGuideState();
+  loadCurrentPage();
+  updatePageLabel();
+  dom.finishQuestionBtn.disabled = false;
+  dom.studentState.textContent = state.isListening ? "正在收听" : "准备讲题";
+  dom.lianAvatar.classList.remove("speaking");
+  dom.lianAvatar.classList.add("listening");
+  if (openingText) {
+    void lianSpeak(openingText, {
+      allowRepeat: true,
+      cooldownMs: 0
+    });
+  }
+  return true;
 }
 
 dom.finishQuestionBtn.addEventListener("click", () => {
@@ -4240,11 +4639,7 @@ dom.finishQuestionBtn.addEventListener("click", () => {
 });
 
 function confirmNotebookSave() {
-  const lectureText = getNotebookLectureText();
-  const textState = lectureText ? "包含最后的讲解文字" : "讲解文字为空，仅保存题图和笔迹";
-  return window.confirm(
-    `是否保存到错题本？\n\n将只保存：\n1. 黑板里的错题图片\n2. 黑板笔迹内容\n3. ${textState}\n\n不再保存额外合成大图和 AI 摘要，以减少本地存储占用。`
-  );
+  return window.confirm("是否保存到错题本？");
 }
 
 function getNotebookLectureText() {
@@ -4260,6 +4655,7 @@ async function buildNotebookRecord(question) {
 
   return {
     id: safeNowId("note"),
+    sourceQuestionId: question.id,
     title: `错题 ${state.notebook.length + 1}`,
     questionImage: question.image,
     strokeImages,
@@ -4275,7 +4671,8 @@ async function compactStrokePages(pages) {
   const nonEmptyPages = pages.filter(Boolean);
   const results = [];
   for (const page of nonEmptyPages) {
-    results.push(await compactStrokeImage(page));
+    const compacted = await compactStrokeImage(page);
+    if (compacted) results.push(compacted);
   }
   return results;
 }
@@ -4287,11 +4684,65 @@ async function compactStrokeImage(dataUrl) {
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
   canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-  const compactCtx = canvas.getContext("2d");
+  const compactCtx = canvas.getContext("2d", { willReadFrequently: true });
   compactCtx.clearRect(0, 0, canvas.width, canvas.height);
   compactCtx.drawImage(image, 0, 0, canvas.width, canvas.height);
-  const webp = canvas.toDataURL("image/webp", 0.72);
-  return webp.startsWith("data:image/webp") ? webp : canvas.toDataURL("image/png");
+  const inkBounds = getStrokeInkBounds(compactCtx, canvas.width, canvas.height);
+  if (!inkBounds) return "";
+
+  const croppedCanvas = document.createElement("canvas");
+  croppedCanvas.width = inkBounds.w;
+  croppedCanvas.height = inkBounds.h;
+  const croppedCtx = croppedCanvas.getContext("2d");
+  croppedCtx.clearRect(0, 0, croppedCanvas.width, croppedCanvas.height);
+  croppedCtx.drawImage(
+    canvas,
+    inkBounds.x,
+    inkBounds.y,
+    inkBounds.w,
+    inkBounds.h,
+    0,
+    0,
+    croppedCanvas.width,
+    croppedCanvas.height
+  );
+
+  const webp = croppedCanvas.toDataURL("image/webp", 0.72);
+  return webp.startsWith("data:image/webp") ? webp : croppedCanvas.toDataURL("image/png");
+}
+
+function getStrokeInkBounds(context, width, height) {
+  const imageData = context.getImageData(0, 0, width, height);
+  const data = imageData.data;
+  let left = width;
+  let top = height;
+  let right = -1;
+  let bottom = -1;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width + x) * 4;
+      const alpha = data[index + 3];
+      if (alpha <= 18) continue;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x);
+      bottom = Math.max(bottom, y);
+    }
+  }
+
+  if (right < left || bottom < top) return null;
+  const padding = Math.max(18, Math.min(42, Math.round(Math.min(width, height) * 0.035)));
+  const safeLeft = Math.max(0, left - padding);
+  const safeTop = Math.max(0, top - padding);
+  const safeRight = Math.min(width, right + padding + 1);
+  const safeBottom = Math.min(height, bottom + padding + 1);
+  return {
+    x: safeLeft,
+    y: safeTop,
+    w: Math.max(1, safeRight - safeLeft),
+    h: Math.max(1, safeBottom - safeTop)
+  };
 }
 
 function getSnapshotImageState(questionId) {

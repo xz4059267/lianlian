@@ -35,7 +35,7 @@ const QWEN_VL_MODEL =
   process.env.Qwen_model ||
   process.env.qwen_model ||
   process.env.DASHSCOPE_MODEL ||
-  "qwen3.5-omni-plus-2026-03-15";
+  "qwen3.5-omni-plus";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
 const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
@@ -90,7 +90,7 @@ const LIAN_GUIDE_PROMPT = [
   "不要直接说“你错了”，要转成检查提醒或启发式问题。",
   "必须以当前传入的题目图片和当前黑板截图为准；不要沿用上一道题的变量、答案、比例式或知识点。",
   "如果当前题目图片和黑板里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
-  "输出必须严格遵守 JSON schema；speech 用中文口语，通常不超过 60 个汉字。"
+  "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
 ].join("\n");
 
 const ORDERED_PROPORTION_RULES = [
@@ -121,7 +121,7 @@ const COMPANION_DIALOGUE_POLICY = [
   "不要频繁使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。不要为了回应而回应。",
   "不要泛泛评价学生本人；要针对内容反馈，例如“你是在把未知量表示出来”“你已经开始找数量关系了”。",
   "学生讲错时不要说“不对”或“你错了”，改成一起检查：例如“我们一起检查一下这里，面积通常和哪两个量有关？”",
-  "每次回应尽量不超过两句话。"
+  "每次回应尽量不超过两句话；eventType=thought_complete 时最多一句短话，不要输出成段讲解。"
 ].join("\n");
 
 const LECTURE_COMPLETION_RULES = [
@@ -550,7 +550,7 @@ function getSegmentCacheKey(imageDataUrl, width, height, mode) {
   return crypto
     .createHash("sha256")
     .update(String(imageDataUrl || ""))
-    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|segment:v42`)
+    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|segment:v43`)
     .digest("hex");
 }
 
@@ -1183,10 +1183,13 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true) {
         ...(useJsonFormat ? { response_format: { type: "json_object" } } : {})
       })
     });
-  } catch {
+  } catch (fetchError) {
+    const causeCode = fetchError?.cause?.code || fetchError?.code || "";
     const error = new Error("Qwen 多模态 API 网络连接失败");
     error.statusCode = 502;
     error.code = "network_error";
+    error.causeCode = causeCode;
+    console.warn(`[qwen] network failed code=${causeCode || "unknown"} message=${fetchError?.message || ""}`);
     throw error;
   }
 
@@ -1736,6 +1739,278 @@ function recoverNumberMarkerAnchors(ocrLines, anchors, visionQuestions, width = 
     console.log(`[anchor] Q${number} found=true evidence=${evidenceSource} y=${Math.round(line.y)}`);
   }
 
+  return result.sort((a, b) => a.startY - b.startY || a.left - b.left);
+}
+
+function parseExplicitQuestionMarker(text, { allowBareNumber = false } = {}) {
+  const value = String(text || "").normalize("NFKC").trim();
+  if (!value || isSubQuestionNumber(value) || isFigureOrTableLabel(value)) return null;
+  if (/^\s*(?:图|表|步骤|条件|方案)\s*\d/iu.test(value)) return null;
+  const explicitMatch = /^\s*(?:第\s*)?(\d{1,3})(?:\s*题|[.、。:：])\s*(.*)$/u.exec(value);
+  const bareMatch = allowBareNumber ? /^\s*(\d{1,3})\s*$/u.exec(value) : null;
+  const match = explicitMatch || bareMatch;
+  if (!match) return null;
+  const number = Number(match[1]);
+  if (!Number.isInteger(number) || number <= 0 || number > 200) return null;
+  return {
+    number: String(number),
+    bodyText: String(match[2] || "").trim(),
+    hasExplicitPunctuation: Boolean(explicitMatch)
+  };
+}
+
+function hasRecoverableQuestionBody(text) {
+  const value = String(text || "").normalize("NFKC").trim();
+  if (!value || isSubQuestionNumber(value) || isFigureOrTableLabel(value)) return false;
+  if (/^\s*[A-DＡ-Ｄ]\s*[.．、:：)]/iu.test(value)) return false;
+  if (hasQuestionStemEvidence(value) || hasStandaloneMathQuestionStem(value)) return true;
+  const chineseCount = (value.match(/[\u4e00-\u9fff]/gu) || []).length;
+  return chineseCount >= 2 && value.length >= 4;
+}
+
+function collectExplicitQuestionMarkerCandidates(ocrLines, width = 0, height = 0) {
+  const lines = (Array.isArray(ocrLines) ? ocrLines : [])
+    .slice()
+    .sort((a, b) => Number(a.y || 0) - Number(b.y || 0) || Number(a.x || 0) - Number(b.x || 0));
+  if (!lines.length) return [];
+  const context = createQuestionNumberContext(lines, width, height);
+  const pageWidth = width || context.width || Math.max(...lines.map((line) => Number(line.x || 0) + Number(line.w || 0)));
+  const segments = [
+    ...lines.map((line) => ({ ...line, parentLine: line, segmentKind: "line" })),
+    ...lines.flatMap((line) => (line.blocks || []).map((block) => ({
+      ...block,
+      parentLine: line,
+      segmentKind: "raw-block"
+    })))
+  ];
+  const candidates = [];
+
+  for (const segment of segments) {
+    const text = String(segment.text || "").trim();
+    const parsed = parseExplicitQuestionMarker(text, { allowBareNumber: true });
+    if (!parsed) continue;
+    const x = Number(segment.x || 0);
+    const y = Number(segment.y || 0);
+    const w = Math.max(1, Number(segment.w || 1));
+    const h = Math.max(1, Number(segment.h || 1));
+    if (x > Number(context.pageContentLeft) + Math.max(Number(context.allowedOffset || 0), pageWidth * 0.02)) {
+      continue;
+    }
+
+    const centerY = y + h / 2;
+    const right = x + w;
+    const sameRowCompanion = segments
+      .filter((candidate) => candidate !== segment && candidate.parentLine !== segment.parentLine)
+      .filter((candidate) => Number(candidate.x || 0) >= right - Math.max(4, h * 0.4))
+      .filter((candidate) => {
+        const candidateCenter = Number(candidate.y || 0) + Number(candidate.h || 0) / 2;
+        return Math.abs(candidateCenter - centerY) <= Math.max(h, Number(candidate.h || 0)) * 0.95;
+      })
+      .filter((candidate) => Number(candidate.x || 0) - right <= Math.max(pageWidth * 0.1, h * 5))
+      .filter((candidate) => hasRecoverableQuestionBody(candidate.text))
+      .sort((a, b) => Number(a.x || 0) - Number(b.x || 0))[0];
+    const parentParsed = segment.parentLine && segment.parentLine !== segment
+      ? parseExplicitQuestionMarker(segment.parentLine.text)
+      : null;
+    const nearbyStem = lines
+      .filter((line) => line !== segment.parentLine)
+      .filter((line) => Number(line.y || 0) >= y - h * 0.3)
+      .filter((line) => Number(line.y || 0) - y <= Math.max(height * 0.055, h * 4))
+      .filter((line) => Number(line.x || 0) <= x + Math.max(pageWidth * 0.12, h * 6))
+      .filter((line) => !parseExplicitQuestionMarker(line.text, { allowBareNumber: true }))
+      .find((line) => hasRecoverableQuestionBody(line.text));
+    const bodyText =
+      parsed.bodyText ||
+      String(parentParsed?.bodyText || "").trim() ||
+      String(sameRowCompanion?.text || "").trim() ||
+      String(nearbyStem?.text || "").trim();
+    const hasBodyEvidence = hasRecoverableQuestionBody(bodyText);
+
+    // A bare number is accepted only as an OCR punctuation-loss candidate when
+    // the same row still contains clear question text.
+    if (!parsed.hasExplicitPunctuation && !sameRowCompanion && !parentParsed?.hasExplicitPunctuation) {
+      continue;
+    }
+    candidates.push({
+      number: parsed.number,
+      text,
+      bodyText,
+      hasBodyEvidence,
+      hasExplicitPunctuation: parsed.hasExplicitPunctuation || Boolean(parentParsed?.hasExplicitPunctuation),
+      x,
+      y,
+      w,
+      h,
+      line: segment.parentLine || segment,
+      segmentKind: segment.segmentKind
+    });
+  }
+
+  const deduped = [];
+  candidates
+    .sort((a, b) => a.y - b.y || a.x - b.x || Number(b.hasBodyEvidence) - Number(a.hasBodyEvidence))
+    .forEach((candidate) => {
+      const existing = deduped.find((item) =>
+        item.number === candidate.number &&
+        Math.abs(item.y - candidate.y) <= Math.max(item.h, candidate.h)
+      );
+      if (!existing) {
+        deduped.push(candidate);
+      } else if ((!existing.hasBodyEvidence && candidate.hasBodyEvidence) || candidate.text.length > existing.text.length) {
+        Object.assign(existing, candidate);
+      }
+    });
+  return deduped;
+}
+
+function recoverSequentialExplicitQuestionAnchors(ocrLines, anchors, width = 0, height = 0) {
+  const result = (Array.isArray(anchors) ? anchors : [])
+    .slice()
+    .sort((a, b) => Number(a.startY ?? a.top) - Number(b.startY ?? b.top));
+  const candidates = collectExplicitQuestionMarkerCandidates(ocrLines, width, height);
+  const existingNumbers = new Set(result.map((anchor) => String(anchor.sourceQuestionNumber)));
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    for (const candidate of candidates) {
+      if (existingNumbers.has(candidate.number)) continue;
+      const previous = result
+        .filter((anchor) => Number(anchor.startY ?? anchor.top) < candidate.y)
+        .sort((a, b) => Number(b.startY ?? b.top) - Number(a.startY ?? a.top))[0];
+      if (!previous) continue;
+      const previousNumber = Number(previous.sourceQuestionNumber);
+      const candidateNumber = Number(candidate.number);
+      if (!Number.isInteger(previousNumber) || candidateNumber !== previousNumber + 1) continue;
+      const previousLeft = Number(previous.left ?? previous.line?.x ?? 0);
+      if (Math.abs(candidate.x - previousLeft) > Math.max(90, width * 0.1)) continue;
+
+      const followingCandidate = candidates.find((item) =>
+        item.y > candidate.y &&
+        Number(item.number) === candidateNumber + 1
+      );
+      const hasSequentialMarkerEvidence = Boolean(followingCandidate);
+      if (!candidate.hasBodyEvidence && !hasSequentialMarkerEvidence) continue;
+
+      const bodyText = candidate.bodyText || candidate.text;
+      result.push({
+        questionNumber: candidate.number,
+        sourceQuestionNumber: candidate.number,
+        top: candidate.y,
+        startY: candidate.y,
+        left: candidate.x,
+        text: candidate.bodyText
+          ? `${candidate.number}. ${candidate.bodyText}`.trim()
+          : candidate.text,
+        line: candidate.line,
+        startInfo: {
+          number: candidate.number,
+          kind: "sequential-explicit-marker-recovery",
+          matchIndex: 0,
+          textLength: Math.max(1, candidate.text.length),
+          bodyText
+        },
+        evidenceSource: candidate.hasExplicitPunctuation
+          ? "ocr-explicit-marker+sequential-number"
+          : "ocr-punctuation-loss+sequential-number"
+      });
+      existingNumbers.add(candidate.number);
+      result.sort((a, b) => Number(a.startY ?? a.top) - Number(b.startY ?? b.top));
+      changed = true;
+      console.log(
+        `[anchor-recovery] Q${candidate.number} found=true evidence=explicit-marker+sequential-number ` +
+        `after=Q${previousNumber} y=${Math.round(candidate.y)}`
+      );
+    }
+  }
+  return result;
+}
+
+function findUnresolvedSequentialMarkerCandidates(ocrLines, anchors, width = 0, height = 0) {
+  const orderedAnchors = (Array.isArray(anchors) ? anchors : [])
+    .slice()
+    .sort((a, b) => Number(a.startY ?? a.top) - Number(b.startY ?? b.top));
+  const existingNumbers = new Set(orderedAnchors.map((anchor) => String(anchor.sourceQuestionNumber)));
+  const candidates = collectExplicitQuestionMarkerCandidates(ocrLines, width, height);
+  return candidates.filter((candidate) => {
+    if (existingNumbers.has(candidate.number)) return false;
+    const previous = orderedAnchors
+      .filter((anchor) => Number(anchor.startY ?? anchor.top) < candidate.y)
+      .sort((a, b) => Number(b.startY ?? b.top) - Number(a.startY ?? a.top))[0];
+    if (!previous) return false;
+    return Number(candidate.number) === Number(previous.sourceQuestionNumber) + 1;
+  });
+}
+
+function recoverLeadingMalformedQuestionAnchor(ocrLines, anchors, width = 0, height = 0) {
+  const lines = (Array.isArray(ocrLines) ? ocrLines : []).slice().sort((a, b) => a.y - b.y || a.x - b.x);
+  const result = (Array.isArray(anchors) ? anchors : []).slice().sort((a, b) => a.startY - b.startY);
+  const firstAnchor = result[0];
+  const secondAnchor = result[1];
+  const firstNumber = Number(firstAnchor?.sourceQuestionNumber);
+  const secondNumber = Number(secondAnchor?.sourceQuestionNumber);
+  if (
+    !Number.isInteger(firstNumber) ||
+    !Number.isInteger(secondNumber) ||
+    firstNumber <= 1 ||
+    secondNumber !== firstNumber + 1
+  ) {
+    return result;
+  }
+
+  const expectedNumber = String(firstNumber - 1);
+  const firstTop = Number(firstAnchor.startY ?? firstAnchor.top);
+  const context = createQuestionNumberContext(lines, width, height);
+  const candidate = lines
+    .filter((line) => Number(line.y) < firstTop - Math.max(8, Number(line.h || 0) * 0.35))
+    .filter((line) => Number(line.x) <= Number(context.pageContentLeft) + Number(context.allowedOffset || 0))
+    .map((line) => {
+      const text = String(line.text || "").trim();
+      const match = /^\s*(?:第\s*)?(\d{1,5})(?:\s*题|[.．、。:：])\s*(.*)$/u.exec(text);
+      if (!match || isSubQuestionNumber(text) || isFigureOrTableLabel(text)) return null;
+      const rawNumber = String(match[1]);
+      const bodyText = String(match[2] || "").trim();
+      const exactExpected = rawNumber === expectedNumber;
+      const gluedExpected =
+        rawNumber.length > expectedNumber.length &&
+        rawNumber.length <= expectedNumber.length + 2 &&
+        rawNumber.startsWith(expectedNumber);
+      if (!exactExpected && !gluedExpected) return null;
+      const chineseCount = (bodyText.match(/[\u4e00-\u9fff]/gu) || []).length;
+      if (!hasQuestionStemEvidence(bodyText) && chineseCount < 4 && bodyText.length < 8) return null;
+      return { line, text, bodyText, rawNumber, exactExpected, gluedExpected };
+    })
+    .filter(Boolean)
+    .sort((left, right) => Number(right.line.y) - Number(left.line.y))[0];
+
+  if (!candidate) return result;
+  const evidenceSource = candidate.gluedExpected
+    ? "ocr-leading-number-glue-correction"
+    : "ocr-leading-sequence-recovery";
+  result.push({
+    questionNumber: expectedNumber,
+    sourceQuestionNumber: expectedNumber,
+    top: candidate.line.y,
+    startY: candidate.line.y,
+    left: candidate.line.x,
+    text: candidate.text.replace(
+      new RegExp(`^\\s*(?:第\\s*)?${candidate.rawNumber}`),
+      expectedNumber
+    ),
+    line: candidate.line,
+    startInfo: {
+      number: expectedNumber,
+      kind: "recovered-leading-marker",
+      matchIndex: 0,
+      textLength: Math.max(1, candidate.text.length),
+      bodyText: candidate.bodyText
+    },
+    evidenceSource
+  });
+  console.log(
+    `[anchor-recovery] raw="${candidate.rawNumber}" corrected=Q${expectedNumber} ` +
+    `before=Q${firstNumber} evidence=${evidenceSource} y=${Math.round(candidate.line.y)}`
+  );
   return result.sort((a, b) => a.startY - b.startY || a.left - b.left);
 }
 
@@ -4151,11 +4426,61 @@ function assessLocalSegmentationConfidence({ anchors, ocrLines, layoutRegions, w
     score -= 0.18;
     reasons.push("题号序列存在缺口");
   }
+  const unresolvedSequentialMarkers = findUnresolvedSequentialMarkerCandidates(
+    lines,
+    orderedAnchors,
+    width,
+    height
+  );
+  if (unresolvedSequentialMarkers.length) {
+    score -= 0.46;
+    reasons.push(
+      `存在未恢复的连续显式题号:${unresolvedSequentialMarkers.map((candidate) => candidate.number).join(",")}`
+    );
+    unresolvedSequentialMarkers.forEach((candidate) => {
+      console.log(
+        `[anchor-review] Q${candidate.number} explicit=true recovered=false ` +
+        `text="${candidate.text.slice(0, 60)}" x=${Math.round(candidate.x)} y=${Math.round(candidate.y)}`
+      );
+    });
+  }
 
   const firstTop = orderedAnchors.length ? Number(orderedAnchors[0].startY ?? orderedAnchors[0].top) : height;
   const lastTop = orderedAnchors.length ? Number(orderedAnchors.at(-1).startY ?? orderedAnchors.at(-1).top) : 0;
   const anchorCoverage = orderedAnchors.length >= 2 ? (lastTop - firstTop) / Math.max(1, height) : 0;
   if (orderedAnchors.length >= 2 && anchorCoverage >= 0.12) score += 0.08;
+
+  const leadingLines = lines.filter((line) => {
+    const lineBottom = Number(line.y || 0) + Number(line.h || 0);
+    if (lineBottom >= firstTop - Math.max(8, height * 0.006)) return false;
+    const text = String(line.text || "").trim();
+    if (!text || isFigureOrTableLabel(text)) return false;
+    return hasQuestionStemEvidence(text) ||
+      (text.match(/[\u4e00-\u9fff]/gu) || []).length >= 4;
+  });
+  const leadingRegions = regions.filter((region) => {
+    const regionTop = Number(region.y || 0);
+    const regionBottom = regionTop + Number(region.h || 0);
+    return regionTop < firstTop - height * 0.025 &&
+      regionBottom <= firstTop + height * 0.01;
+  });
+  const leadingTopCandidates = [
+    ...leadingLines.map((line) => Number(line.y || 0)),
+    ...leadingRegions.map((region) => Number(region.y || 0))
+  ].filter(Number.isFinite);
+  const leadingTop = leadingTopCandidates.length ? Math.min(...leadingTopCandidates) : firstTop;
+  const hasSubstantiveUnassignedLeadingContent =
+    orderedAnchors.length > 0 &&
+    firstTop >= Math.max(72, height * 0.12) &&
+    (
+      leadingLines.length >= 2 ||
+      leadingRegions.some((region) => Number(region.h || 0) >= height * 0.045)
+    ) &&
+    firstTop - leadingTop >= height * 0.045;
+  if (hasSubstantiveUnassignedLeadingContent) {
+    score -= 0.46;
+    reasons.push("首个题号上方存在大量未归属正文");
+  }
 
   const looksLikeDensePage = lines.length >= 9 || regions.some((region) => region.h >= height * 0.45);
   if (looksLikeDensePage && orderedAnchors.length < 2) {
@@ -4273,6 +4598,18 @@ async function handleSegmentV2(req, res) {
     width,
     height
   );
+  mainQuestionAnchors = recoverSequentialExplicitQuestionAnchors(
+    ocrLines,
+    mainQuestionAnchors,
+    width,
+    height
+  );
+  mainQuestionAnchors = recoverLeadingMalformedQuestionAnchor(
+    ocrLines,
+    mainQuestionAnchors,
+    width,
+    height
+  );
   mainQuestionAnchors = recoverDiscontinuousQuestionAnchors(
     ocrLines,
     mainQuestionAnchors,
@@ -4310,6 +4647,18 @@ async function handleSegmentV2(req, res) {
       ocrLines,
       mainQuestionAnchors,
       visionQuestions,
+      width,
+      height
+    );
+    mainQuestionAnchors = recoverSequentialExplicitQuestionAnchors(
+      ocrLines,
+      mainQuestionAnchors,
+      width,
+      height
+    );
+    mainQuestionAnchors = recoverLeadingMalformedQuestionAnchor(
+      ocrLines,
+      mainQuestionAnchors,
       width,
       height
     );
@@ -4826,15 +5175,53 @@ const GUIDE_MATH_AUDIT_PROMPT = [
 ].join("\n");
 
 function normalizeAnswerForComparison(value) {
-  return String(value || "")
+  const normalized = String(value || "")
     .normalize("NFKC")
     .toLowerCase()
     .replace(/[−﹣－]/g, "-")
+    .replace(/(?:角)?度/g, "°")
     .replace(/(?:最终|最后|标准)?(?:答案|结果|选项)(?:是|为|等于)?/g, "")
     .replace(/([a-z])(?:=|等于|为)/g, "")
     .replace(/[\s，,。；;：:、（）()【】\[\]]+/g, "")
     .replace(/选项|项/g, "")
     .trim();
+  return normalizeStandaloneChineseInteger(normalized);
+}
+
+function normalizeStandaloneChineseInteger(value) {
+  const text = String(value || "").trim();
+  const match = /^([负-]?)([零〇一二两三四五六七八九十百千万]+)$/.exec(text);
+  if (!match) return text;
+  const sign = match[1] ? -1 : 1;
+  const body = match[2];
+  const digits = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (!/[十百千万]/.test(body)) {
+    return String(sign * Number([...body].map((character) => digits[character]).join("")));
+  }
+
+  const units = { 十: 10, 百: 100, 千: 1000 };
+  let total = 0;
+  let section = 0;
+  let current = 0;
+  for (const character of body) {
+    if (Object.hasOwn(digits, character)) {
+      current = digits[character];
+      continue;
+    }
+    if (character === "万") {
+      section += current;
+      total += Math.max(1, section) * 10000;
+      section = 0;
+      current = 0;
+      continue;
+    }
+    const unit = units[character];
+    if (unit) {
+      section += (current || 1) * unit;
+      current = 0;
+    }
+  }
+  return String(sign * (total + section + current));
 }
 
 function answerValuesEquivalent(left, right) {
@@ -5069,7 +5456,10 @@ const FINAL_ANSWER_PROMPT = [
   "请结合当前题目图片、学生讲解文字、黑板图片和学生刚说出的最后答案，判断最后答案是否正确。",
   "必须实际根据题目条件和计算关系核对，不能因为学生说得肯定就判定正确。",
   "如果学生没有给出明确答案、答案看不清或题目条件不足以判断，correct 必须为 false，hint 要请学生把最后答案和单位再说清楚。",
-  "correct=true 时 feedback 只给一句简短、贴合内容的鼓励；correct=false 时不要直接说‘你错了’，只给一个温和的检查方向。",
+  "correct=true 时 feedback 只给一句简短、贴合内容的确认，不要继续追问。",
+  "correct=false 时 hint 必须明确指出学生答案与题目在哪一步不一致，例如具体的运算错误、符号错误、对应关系错误、选项错误或遗漏单位。",
+  "错误提示最多两句话，可以给出该错误步骤的正确计算或正确关系，但不要展开整道题的完整解法。",
+  "禁止只说‘再检查一下’‘没有对上’‘重新算一遍’等空泛套话。",
   "不要输出完整解题过程，不要替学生讲完。严格返回 JSON。"
 ].join("\n");
 
@@ -5080,7 +5470,35 @@ async function handleFinalAnswerCheck(req, res) {
     return;
   }
 
-  const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  let answerKey = null;
+  try {
+    answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  } catch (error) {
+    console.warn(`[final-answer] answer-key unavailable, using direct fallback: ${error.message || error}`);
+    sendJson(
+      res,
+      200,
+      await safeDirectFinalAnswerCheck(body, {
+        reason: error.message || "answer-key request failed",
+        status: error.code || "answer-key-error"
+      })
+    );
+    return;
+  }
+  if (!answerKey.trusted) {
+    console.warn(
+      `[final-answer] answer-key not trusted, using direct fallback status=${answerKey.status} confidence=${answerKey.confidence}`
+    );
+    sendJson(
+      res,
+      200,
+      await safeDirectFinalAnswerCheck(body, {
+        reason: answerKey.reason || "answer key not trusted",
+        status: answerKey.status || "answer-key-untrusted"
+      })
+    );
+    return;
+  }
   if (!answerKey.trusted) {
     sendJson(res, 200, {
       correct: false,
@@ -5089,6 +5507,21 @@ async function handleFinalAnswerCheck(req, res) {
       hint: "这道题的标准答案还没有可靠核准，我先不判断对错。请确认题目图片完整清晰后再核对。",
       confidence: 0,
       verificationStatus: answerKey.status,
+      model: QWEN_GUIDE_MODEL,
+      provider: "qwen-double-verified-final-answer"
+    });
+    return;
+  }
+
+  const directlyCompatible = studentAnswerMatchesVerifiedKey(body.answer, answerKey);
+  if (directlyCompatible) {
+    sendJson(res, 200, {
+      correct: true,
+      finalAnswer: String(body.answer).trim(),
+      feedback: "这个结果和题目条件对上了。",
+      hint: "",
+      confidence: answerKey.confidence,
+      verificationStatus: "double-verified-direct-match",
       model: QWEN_GUIDE_MODEL,
       provider: "qwen-double-verified-final-answer"
     });
@@ -5119,15 +5552,19 @@ async function handleFinalAnswerCheck(req, res) {
     maxOutputTokens: 700
   });
 
-  const locallyCompatible = studentAnswerMatchesVerifiedKey(body.answer, answerKey);
-  const correct = result.correct === true && Number(result.confidence) >= ANSWER_KEY_MIN_CONFIDENCE && locallyCompatible;
+  const interpretedCompatible = studentAnswerMatchesVerifiedKey(result.finalAnswer, answerKey);
+  const correct =
+    result.correct === true &&
+    Number(result.confidence) >= ANSWER_KEY_MIN_CONFIDENCE &&
+    interpretedCompatible;
   sendJson(res, 200, {
     ...result,
     correct,
     feedback: correct ? result.feedback : "",
     hint: correct
       ? ""
-      : result.hint || "最后答案还没有和核验结果对上，请根据题目条件再检查一次。",
+      : result.hint ||
+        "这个答案与已核准结果不一致。请检查得出最终结果的那一步运算、符号或单位。",
     confidence: correct ? Math.min(Number(result.confidence) || 0, answerKey.confidence) : Number(result.confidence) || 0,
     verificationStatus: "double-verified",
     model: QWEN_GUIDE_MODEL,
@@ -5135,11 +5572,73 @@ async function handleFinalAnswerCheck(req, res) {
   });
 }
 
+async function directFinalAnswerCheck(body, fallbackInfo = {}) {
+  const result = await callQwenMultimodalJson({
+    model: QWEN_GUIDE_MODEL,
+    schema: finalAnswerSchema,
+    instructions: [
+      FINAL_ANSWER_PROMPT,
+      ORDERED_PROPORTION_RULES,
+      "标准答案双重核验暂时不可用。你必须直接根据题目图片重新计算，并核对学生最后答案。若图片题意足够清楚，可以判断 correct=true/false；若题目关键条件看不清，才返回 correct=false 并说明需要补充清晰题图。不要因为缺少双重基线就拒绝核对。"
+    ].join("\n\n"),
+    content: [
+      {
+        type: "input_text",
+        text: JSON.stringify({
+          studentAnswer: String(body.answer || "").trim(),
+          lectureText: body.lectureText || "",
+          latestHandwritingResult: body.latestHandwritingResult || null,
+          knownProblemText: body.problemText || "",
+          fallbackReason: fallbackInfo.reason || "",
+          instruction:
+            "请先读题并独立计算，再判断 studentAnswer 是否正确。正确时 feedback 只说一句确认并提醒点击我讲完了；错误时 hint 必须指出具体错在哪里。"
+        })
+      },
+      { type: "input_image", label: "当前题目图片", image_url: body.questionImage, detail: "high" },
+      ...(body.boardImage ? [{ type: "input_image", label: "当前黑板图片", image_url: body.boardImage, detail: "high" }] : [])
+    ],
+    maxOutputTokens: 700
+  });
+
+  const confidence = Number(result.confidence) || 0;
+  const correct = result.correct === true && confidence >= 0.72;
+  return {
+    ...result,
+    correct,
+    feedback: correct ? result.feedback || "最后答案核对正确。" : "",
+    hint: correct
+      ? ""
+      : result.hint || "我直接核对后还不能确认这个答案正确，请把最后一步运算或单位再检查一下。",
+    confidence,
+    verificationStatus: `direct-fallback:${fallbackInfo.status || "answer-key-unavailable"}`,
+    model: QWEN_GUIDE_MODEL,
+    provider: "qwen-direct-final-answer-fallback"
+  };
+}
+
+async function safeDirectFinalAnswerCheck(body, fallbackInfo = {}) {
+  try {
+    return await directFinalAnswerCheck(body, fallbackInfo);
+  } catch (error) {
+    console.warn(`[final-answer] direct fallback failed: ${error.message || error}`);
+    return {
+      correct: false,
+      finalAnswer: String(body.answer || "").trim(),
+      feedback: "",
+      hint:
+        "核对服务现在连接失败，可能是 API key、额度或模型权限问题。你刚才的答案已经收到，请先不要保存，稍后重试一次核对。",
+      confidence: 0,
+      verificationStatus: `service-unavailable:${error.code || fallbackInfo.status || "qwen-error"}`,
+      model: QWEN_GUIDE_MODEL,
+      provider: "qwen-direct-final-answer-fallback"
+    };
+  }
+}
+
 function enforceOrderedProportionConvention(result, context = {}) {
   const output = { ...(result || {}) };
   const currentQuestionContext = [
     context.problemText,
-    context.transcript,
     context.latestStudentSpeech,
     ...(Array.isArray(context.knowledgePoints) ? context.knowledgePoints : [])
   ].filter(Boolean).join(" ");
@@ -5254,6 +5753,7 @@ async function handleGuide(req, res) {
             "如果 eventType=active_help，学生已经明确提问或表示不会，必须 shouldSpeak=true，并直接回应这个问题；只给当前最需要的一个小步骤，不要先泛泛鼓励。",
             "如果只是普通 1 分钟沉默且 awaitingSilenceFollowup=false，必须 shouldSpeak=true，并贴着学生最后讲到的内容给一个小切入点；不直接给完整公式或完整答案。",
             "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
+            "如果 eventType=thought_complete 且确实需要回应，speech 只能是一句短回应；不要展开完整讲解、不要连续解释多个概念。",
             "lectureComplete 默认必须为 false；只有 answerVerified=true、boardCompletionVerified=true，且学生已经讲完关键思路时才设为 true。点击‘我讲完了’本身不是完成证据。",
             "lectureComplete=true 后 speech 只做一次收束，不得继续追问、要求复述或重复已经说过的选项。",
             "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致。trusted=false 时禁止判断对错或输出确定数学结论。",
@@ -5269,7 +5769,6 @@ async function handleGuide(req, res) {
   });
 
   guideResult = enforceOrderedProportionConvention(guideResult, {
-    transcript: body.transcript || "",
     latestStudentSpeech: body.latestStudentSpeech || "",
     problemText: body.problemText || "",
     knowledgePoints: body.knowledgePoints || []
@@ -5449,6 +5948,8 @@ module.exports = {
   mergeDetachedQuestionNumberLines,
   extractMainQuestionAnchors,
   recoverNumberMarkerAnchors,
+  recoverSequentialExplicitQuestionAnchors,
+  recoverLeadingMalformedQuestionAnchor,
   recoverDiscontinuousQuestionAnchors,
   buildOcrQuestionBands,
   normalizeQuestionRegions,

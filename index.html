@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>恋恋错题本</title>
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=20260725-55" />
   </head>
   <body>
     <div class="app-shell">
@@ -157,10 +157,16 @@
                   <strong id="selectedSummary">未选择题目</strong>
                   <span id="selectedHint">可多选，按选择顺序讲解</span>
                 </div>
-                <button class="primary-btn" id="startLectureBtn" disabled>
-                  <span data-icon="play"></span>
-                  开始讲解
-                </button>
+                <div class="start-actions">
+                  <button class="text-btn" id="clearSelectionBtn" type="button" disabled>
+                    <span data-icon="x"></span>
+                    取消全选
+                  </button>
+                  <button class="primary-btn" id="startLectureBtn" disabled>
+                    <span data-icon="play"></span>
+                    开始讲解
+                  </button>
+                </div>
               </div>
             </section>
           </div>
@@ -345,6 +351,6 @@
       </article>
     </template>
 
-    <script src="app.js?v=20260719-43"></script>
+    <script src="app.js?v=20260725-65"></script>
   </body>
 </html>

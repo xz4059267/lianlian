@@ -6,6 +6,8 @@ const {
   mergeDetachedQuestionNumberLines,
   extractMainQuestionAnchors,
   recoverNumberMarkerAnchors,
+  recoverSequentialExplicitQuestionAnchors,
+  recoverLeadingMalformedQuestionAnchor,
   recoverDiscontinuousQuestionAnchors,
   buildOcrQuestionBands,
   normalizeQuestionRegions,
@@ -94,6 +96,62 @@ test("keeps a well-anchored local page on the fast path", () => {
 
   assert.equal(confidence.needsVisionReview, false);
   assert.ok(confidence.score >= confidence.threshold);
+});
+
+test("recovers a leading question number when OCR glues the next body digit to it", () => {
+  const lines = [
+    {
+      text: "242. 年，中国成功发射了某空间望远镜，运行轨道距地面约450千米",
+      x: 86,
+      y: 209,
+      w: 720,
+      h: 30
+    },
+    {
+      text: "25. 某粮库用于储存小麦的粮囤是圆柱和圆锥的组合体",
+      x: 96,
+      y: 568,
+      w: 760,
+      h: 32
+    },
+    {
+      text: "26. 三所学校开展数学实践活动，回答下列问题",
+      x: 107,
+      y: 1025,
+      w: 730,
+      h: 32
+    }
+  ];
+  const anchors = extractMainQuestionAnchors(lines, 1280, 1706);
+  const recovered = recoverLeadingMalformedQuestionAnchor(lines, anchors, 1280, 1706);
+
+  assert.deepEqual(recovered.map((anchor) => anchor.sourceQuestionNumber), ["24", "25", "26"]);
+  assert.equal(recovered[0].startY, 209);
+  assert.equal(recovered[0].evidenceSource, "ocr-leading-number-glue-correction");
+});
+
+test("routes a page to vision review when substantial content sits above the first anchor", () => {
+  const confidence = assessLocalSegmentationConfidence({
+    anchors: [
+      { sourceQuestionNumber: "25", startY: 568 },
+      { sourceQuestionNumber: "26", startY: 1025 }
+    ],
+    ocrLines: [
+      { text: "年，中国成功发射了某空间望远镜，运行轨道距地面约450千米", x: 86, y: 209, w: 720, h: 30 },
+      { text: "运行周期约95分钟，地球半径约为6400千米", x: 90, y: 280, w: 650, h: 28 },
+      { text: "25. 某粮库用于储存小麦的粮囤", x: 96, y: 568, w: 500, h: 32 },
+      { text: "26. 如图，回答下列问题", x: 107, y: 1025, w: 420, h: 32 }
+    ],
+    layoutRegions: [
+      { label: "text", score: 0.95, x: 70, y: 190, w: 900, h: 300 },
+      { label: "text", score: 0.95, x: 80, y: 560, w: 980, h: 430 }
+    ],
+    width: 1280,
+    height: 1706
+  });
+
+  assert.equal(confidence.needsVisionReview, true);
+  assert.ok(confidence.reasons.includes("首个题号上方存在大量未归属正文"));
 });
 
 test("accepts a formula-led main question when it has a legal numbered prefix", () => {
@@ -343,6 +401,57 @@ test("keeps discontinuous numbering when the missing number has no existing visu
   const anchors = extractMainQuestionAnchors(lines, 800, 500);
   const recovered = recoverDiscontinuousQuestionAnchors(lines, anchors, [], 800, 500);
   assert.deepEqual(recovered.map((anchor) => anchor.sourceQuestionNumber), ["5", "7"]);
+});
+
+test("recovers explicit consecutive Q7 and Q8 markers after Q6", () => {
+  const marker7 = { text: "7.", x: 40, y: 220, w: 18, h: 22 };
+  const stem7 = { text: "已知四个数成比例，求未知数的值", x: 72, y: 221, w: 520, h: 22 };
+  const marker8 = { text: "8．", x: 40, y: 340, w: 18, h: 22 };
+  const stem8 = { text: "根据题目条件选择正确答案", x: 72, y: 341, w: 500, h: 22 };
+  const lines = [
+    { text: "6. 如图，请判断两个结论是否正确", x: 40, y: 100, w: 620, h: 24, blockIndexes: [0], blocks: [] },
+    { text: marker7.text, ...marker7, blockIndexes: [1], blocks: [marker7] },
+    { text: stem7.text, ...stem7, blockIndexes: [2], blocks: [stem7] },
+    { text: marker8.text, ...marker8, blockIndexes: [3], blocks: [marker8] },
+    { text: stem8.text, ...stem8, blockIndexes: [4], blocks: [stem8] }
+  ];
+  const anchors = [{
+    sourceQuestionNumber: "6",
+    questionNumber: "6",
+    startY: 100,
+    top: 100,
+    left: 40,
+    text: lines[0].text,
+    line: lines[0]
+  }];
+  const recovered = recoverSequentialExplicitQuestionAnchors(lines, anchors, 800, 500);
+
+  assert.deepEqual(recovered.map((anchor) => anchor.sourceQuestionNumber), ["6", "7", "8"]);
+  assert.equal(recovered[1].evidenceSource, "ocr-explicit-marker+sequential-number");
+  assert.equal(recovered[2].startY, 340);
+});
+
+test("does not turn sub-question markers into consecutive main questions", () => {
+  const lines = [
+    { text: "6. 已知条件，请完成下面各小问", x: 40, y: 100, w: 620, h: 24, blockIndexes: [0], blocks: [] },
+    { text: "（7）求第一种情况", x: 60, y: 220, w: 420, h: 22, blockIndexes: [1], blocks: [] },
+    { text: "8）求第二种情况", x: 60, y: 300, w: 420, h: 22, blockIndexes: [2], blocks: [] }
+  ];
+  const anchors = extractMainQuestionAnchors(lines, 800, 500);
+  const recovered = recoverSequentialExplicitQuestionAnchors(lines, anchors, 800, 500);
+
+  assert.deepEqual(recovered.map((anchor) => anchor.sourceQuestionNumber), ["6"]);
+});
+
+test("does not invent Q7 when no explicit Q7 marker exists", () => {
+  const lines = [
+    { text: "6. 已知条件，请完成下面各小问", x: 40, y: 100, w: 620, h: 24, blockIndexes: [0], blocks: [] },
+    { text: "继续根据上面的条件进行计算", x: 60, y: 220, w: 520, h: 22, blockIndexes: [1], blocks: [] }
+  ];
+  const anchors = extractMainQuestionAnchors(lines, 800, 500);
+  const recovered = recoverSequentialExplicitQuestionAnchors(lines, anchors, 800, 500);
+
+  assert.deepEqual(recovered.map((anchor) => anchor.sourceQuestionNumber), ["6"]);
 });
 
 test("preserves an unresolved missing question inside the previous crop instead of deleting its image content", () => {
@@ -692,6 +801,7 @@ test("corrects guidance that illegally reorders four proportional terms", () => 
       lectureComplete: false
     },
     {
+      problemText: "已知 2、3、x、6 成比例，求 x 的值。",
       transcript: "我按2:3=x:6算出x=4。",
       latestStudentSpeech: "答案是4"
     }
@@ -702,6 +812,27 @@ test("corrects guidance that illegally reorders four proportional terms", () => 
   assert.equal(corrected.formulaOrStep, "2:3=x:6，x=4");
   assert.equal(corrected.askStudentToRepeat, false);
   assert.doesNotMatch(corrected.speech, /没有规定|另一个答案/);
+});
+
+test("does not carry old proportion guidance into a different current problem", () => {
+  const original = {
+    shouldSpeak: true,
+    speech: "我们检查圆心角是360度的几分之几。",
+    hintLevel: "light",
+    formulaOrStep: "360×1/8",
+    askStudentToRepeat: false,
+    studentAction: "接着讲圆心角。",
+    lectureComplete: false
+  };
+  const corrected = enforceOrderedProportionConvention(original, {
+    problemText: "这个扇形的面积是所在圆面积的1/8，求圆心角。",
+    transcript: "上一题我按2:3=x:6算出x=4。",
+    latestStudentSpeech: "45度",
+    knowledgePoints: ["圆心角"]
+  });
+
+  assert.equal(corrected.speech, original.speech);
+  assert.equal(corrected.formulaOrStep, original.formulaOrStep);
 });
 
 test("accepts only equivalent answers from the independent solver and verifier", () => {
@@ -723,6 +854,18 @@ test("accepts only equivalent answers from the independent solver and verifier",
     ),
     false
   );
+});
+
+test("treats spoken Chinese zero as equivalent to m=0", () => {
+  const answerKey = {
+    trusted: true,
+    canonicalAnswer: "m=0",
+    acceptedAnswers: ["0"]
+  };
+
+  assert.equal(answerValuesEquivalent("M等于零", "m=0"), true);
+  assert.equal(studentAnswerMatchesVerifiedKey("M等于零", answerKey), true);
+  assert.equal(answerValuesEquivalent("m为负二", "m=-2"), true);
 });
 
 test("fails closed when a math judgment has no verified answer key", () => {
