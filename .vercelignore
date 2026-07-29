@@ -1,0 +1,15 @@
+.env
+.venv/
+.paddleocr/
+.paddlex/
+.paddlex-onnx/
+.git/
+.agents/
+.codex/
+node_modules/
+*.log
+server-*.log
+__pycache__/
+*.pyc
+dist/
+build/

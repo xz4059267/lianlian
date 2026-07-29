@@ -1,0 +1,15 @@
+{
+  "name": "lian-wrong-question-book",
+  "version": "1.0.0",
+  "private": true,
+  "description": "恋恋错题本网页与 API 服务",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check app.js",
+    "test": "node --test tests/segmentation-postprocess.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

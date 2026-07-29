@@ -9,6 +9,10 @@ const ROOT = __dirname;
 loadEnvFile(path.join(ROOT, ".env"));
 
 const PORT = Number(process.env.PORT || 4173);
+const IS_VERCEL = process.env.VERCEL === "1" || Boolean(process.env.VERCEL_URL);
+const LOCAL_OCR_ENABLED = !["0", "false", "off"].includes(
+  String(process.env.LOCAL_OCR_ENABLED || (IS_VERCEL ? "0" : "1")).toLowerCase()
+);
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.deepseek_api_key || "";
 const DEEPSEEK_BASE_URL = (process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/+$/, "");
 const SEGMENT_MODEL = process.env.DEEPSEEK_SEGMENT_MODEL || "deepseek-v4-flash";
@@ -38,6 +42,54 @@ const QWEN_VL_MODEL =
   "qwen3.5-omni-plus";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
+const ALIYUN_OCR_APPCODE =
+  process.env.ALIYUN_OCR_APPCODE ||
+  process.env.ALIYUN_OCR_APP_CODE ||
+  process.env.aliyun_ocr_appcode ||
+  process.env.AppCode ||
+  "";
+const ALIYUN_OCR_ACCESS_KEY_ID =
+  process.env.ALIYUN_OCR_ACCESS_KEY_ID ||
+  process.env.ALIBABA_CLOUD_ACCESS_KEY_ID ||
+  process.env.ALIBABA_ACCESS_KEY_ID ||
+  process.env.AccessKeyId ||
+  process.env.AccessKeyID ||
+  process.env.ACCESS_KEY_ID ||
+  "";
+const ALIYUN_OCR_ACCESS_KEY_SECRET =
+  process.env.ALIYUN_OCR_ACCESS_KEY_SECRET ||
+  process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET ||
+  process.env.ALIBABA_ACCESS_KEY_SECRET ||
+  process.env.AccessKeySecret ||
+  process.env.ACCESS_KEY_SECRET ||
+  "";
+const ALIYUN_OCR_SECURITY_TOKEN =
+  process.env.ALIYUN_OCR_SECURITY_TOKEN ||
+  process.env.ALIBABA_CLOUD_SECURITY_TOKEN ||
+  "";
+const ALIYUN_OCR_OFFICIAL_ENDPOINT = (
+  process.env.ALIYUN_OCR_OFFICIAL_ENDPOINT ||
+  "https://ocr-api.cn-hangzhou.aliyuncs.com"
+).replace(/\/+$/, "");
+const ALIYUN_OCR_REGION_ID = process.env.ALIYUN_OCR_REGION_ID || "cn-hangzhou";
+const ALIYUN_OCR_URL = (
+  process.env.ALIYUN_OCR_URL ||
+  "https://subject2.market.alicloudapi.com/educationservice/papercut"
+).replace(/\/+$/, "");
+const ALIYUN_OCR_TEXT_FALLBACK_URL = (
+  process.env.ALIYUN_OCR_TEXT_FALLBACK_URL ||
+  "https://ocrapi-advanced.taobao.com/ocrservice/advanced"
+).replace(/\/+$/, "");
+const ALIYUN_OCR_ENABLED = !["0", "false", "off"].includes(
+  String(
+    process.env.ALIYUN_OCR_ENABLED ||
+    (ALIYUN_OCR_APPCODE || (ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET) ? "1" : "0")
+  ).toLowerCase()
+);
+const SEGMENT_ALIYUN_ONLY = !["0", "false", "off"].includes(
+  String(process.env.SEGMENT_ALIYUN_ONLY || "0").toLowerCase()
+);
+const ALIYUN_OCR_TIMEOUT_MS = Number(process.env.ALIYUN_OCR_TIMEOUT_MS || 18000);
 const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
 const PADDLE_OCR_SCRIPT = path.join(ROOT, "tools", "paddle_ocr.py");
 const PADDLE_LAYOUT_SCRIPT = path.join(ROOT, "tools", "paddle_layout.py");
@@ -45,7 +97,9 @@ const OCR_MAX_SIDE = Number(process.env.OCR_MAX_SIDE || 1800);
 const OCR_FAST_MAX_SIDE = Number(process.env.OCR_FAST_MAX_SIDE || 1800);
 const LAYOUT_MAX_SIDE = Number(process.env.LAYOUT_MAX_SIDE || 1600);
 const LAYOUT_TIMEOUT_MS = Number(process.env.LAYOUT_TIMEOUT_MS || 45000);
-const LAYOUT_ENABLED = !["0", "false", "off"].includes(String(process.env.LAYOUT_ENABLED || "1").toLowerCase());
+const LAYOUT_ENABLED =
+  LOCAL_OCR_ENABLED &&
+  !["0", "false", "off"].includes(String(process.env.LAYOUT_ENABLED || "1").toLowerCase());
 const OCR_CACHE_LIMIT = Number(process.env.OCR_CACHE_LIMIT || 32);
 const SEGMENT_CACHE_LIMIT = Number(process.env.SEGMENT_CACHE_LIMIT || 32);
 const ANSWER_KEY_CACHE_LIMIT = Number(process.env.ANSWER_KEY_CACHE_LIMIT || 64);
@@ -542,6 +596,647 @@ function setCachedOcrBlocks(key, blocks) {
   }
 }
 
+function normalizeAliyunOcrBlocks(payload) {
+  const wordsInfo =
+    (Array.isArray(payload?.prism_wordsInfo) && payload.prism_wordsInfo) ||
+    (Array.isArray(payload?.data?.prism_wordsInfo) && payload.data.prism_wordsInfo) ||
+    collectAliyunPaperCutWords(payload) ||
+    [];
+
+  const blocks = wordsInfo
+    .map((item) => {
+      const text = String(item?.word || item?.text || "").replace(/\s+/g, " ").trim();
+      if (!text) return null;
+      const points = Array.isArray(item?.pos) ? item.pos : [];
+      const xs = points.map((point) => Number(point?.x)).filter(Number.isFinite);
+      const ys = points.map((point) => Number(point?.y)).filter(Number.isFinite);
+      if (xs.length && ys.length) {
+        const left = Math.min(...xs);
+        const top = Math.min(...ys);
+        const right = Math.max(...xs);
+        const bottom = Math.max(...ys);
+        return {
+          text,
+          x: left,
+          y: top,
+          w: right - left,
+          h: bottom - top
+        };
+      }
+
+      const x = Number(item?.x ?? item?.left);
+      const y = Number(item?.y ?? item?.top);
+      const w = Number(item?.w ?? item?.width);
+      const h = Number(item?.h ?? item?.height);
+      if ([x, y, w, h].every(Number.isFinite)) return { text, x, y, w, h };
+      return null;
+    })
+    .filter(Boolean);
+
+  return normalizeOcrBlocks(blocks);
+}
+
+function getAliyunPaperCutPages(payload) {
+  const data = payload?.Data || payload?.data || payload?.result || payload;
+  let parsedData = data;
+  if (typeof parsedData === "string") {
+    try {
+      parsedData = JSON.parse(parsedData);
+    } catch {
+      parsedData = data;
+    }
+  }
+  const pages =
+    (Array.isArray(parsedData?.page_list) && parsedData.page_list) ||
+    (Array.isArray(parsedData?.pageList) && parsedData.pageList) ||
+    (Array.isArray(parsedData?.pages) && parsedData.pages) ||
+    (Array.isArray(parsedData?.data?.page_list) && parsedData.data.page_list) ||
+    [];
+  return pages;
+}
+
+function collectAliyunPaperCutWords(payload) {
+  const pages = getAliyunPaperCutPages(payload);
+  const words = [];
+  for (const page of pages) {
+    const pageWords = page?.prism_wordsInfo || page?.prismWordsInfo || page?.wordsInfo || [];
+    if (Array.isArray(pageWords)) words.push(...pageWords);
+    const subjects = page?.subject_list || page?.subjectList || page?.subjects || [];
+    for (const subject of Array.isArray(subjects) ? subjects : []) {
+      const subjectWords = subject?.prism_wordsInfo || subject?.prismWordsInfo || subject?.wordsInfo || [];
+      if (Array.isArray(subjectWords)) words.push(...subjectWords);
+      const contentList = subject?.content_list_info || subject?.contentListInfo || subject?.content_list || [];
+      for (const content of Array.isArray(contentList) ? contentList : []) {
+        const contentWords = content?.prism_wordsInfo || content?.prismWordsInfo || content?.wordsInfo || [];
+        if (Array.isArray(contentWords)) words.push(...contentWords);
+      }
+    }
+  }
+  return words.length ? words : null;
+}
+
+function boxFromAliyunItem(item, width, height) {
+  const numericArrayToBox = (value) => {
+    if (!Array.isArray(value) || value.length < 4) return null;
+    const numbers = value.slice(0, 4).map(Number);
+    if (!numbers.every(Number.isFinite)) return null;
+    const [left, top, third, fourth] = numbers;
+    const right = third > left ? third : left + third;
+    const bottom = fourth > top ? fourth : top + fourth;
+    if (right <= left || bottom <= top) return null;
+    return {
+      x: Math.max(0, Math.min(1, left / width)),
+      y: Math.max(0, Math.min(1, top / height)),
+      w: Math.max(0.001, Math.min(1, (right - left) / width)),
+      h: Math.max(0.001, Math.min(1, (bottom - top) / height))
+    };
+  };
+
+  const directBox =
+    item?.box ||
+    item?.rect ||
+    item?.bbox ||
+    item?.boundBox ||
+    item?.positionBox ||
+    item?.location ||
+    item?.area;
+  if (directBox && typeof directBox === "object" && !Array.isArray(directBox)) {
+    const nested = boxFromAliyunItem(directBox, width, height);
+    if (nested) return nested;
+  }
+  if (Array.isArray(directBox)) {
+    const numericBox = numericArrayToBox(directBox);
+    if (numericBox) return numericBox;
+    const nested = boxFromAliyunItem({ points: directBox }, width, height);
+    if (nested) return nested;
+  }
+
+  const points =
+    (Array.isArray(item?.pos) && item.pos) ||
+    (Array.isArray(item?.position) && item.position) ||
+    (Array.isArray(item?.vertexes) && item.vertexes) ||
+    (Array.isArray(item?.vertices) && item.vertices) ||
+    (Array.isArray(item?.points) && item.points) ||
+    [];
+  const numericPointBox = numericArrayToBox(points);
+  if (numericPointBox) return numericPointBox;
+  const xs = points.map((point) =>
+    Array.isArray(point) ? Number(point[0]) : Number(point?.x ?? point?.X)
+  ).filter(Number.isFinite);
+  const ys = points.map((point) =>
+    Array.isArray(point) ? Number(point[1]) : Number(point?.y ?? point?.Y)
+  ).filter(Number.isFinite);
+  if (xs.length && ys.length) {
+    const left = Math.min(...xs);
+    const top = Math.min(...ys);
+    const right = Math.max(...xs);
+    const bottom = Math.max(...ys);
+    return {
+      x: Math.max(0, Math.min(1, left / width)),
+      y: Math.max(0, Math.min(1, top / height)),
+      w: Math.max(0.001, Math.min(1, (right - left) / width)),
+      h: Math.max(0.001, Math.min(1, (bottom - top) / height))
+    };
+  }
+
+  const leftValue = Number(item?.x ?? item?.left ?? item?.Left);
+  const topValue = Number(item?.y ?? item?.top ?? item?.Top);
+  const rightValue = Number(item?.right ?? item?.Right ?? item?.x2 ?? item?.X2);
+  const bottomValue = Number(item?.bottom ?? item?.Bottom ?? item?.y2 ?? item?.Y2);
+  if ([leftValue, topValue, rightValue, bottomValue].every(Number.isFinite) && rightValue > leftValue && bottomValue > topValue) {
+    return {
+      x: Math.max(0, Math.min(1, leftValue / width)),
+      y: Math.max(0, Math.min(1, topValue / height)),
+      w: Math.max(0.001, Math.min(1, (rightValue - leftValue) / width)),
+      h: Math.max(0.001, Math.min(1, (bottomValue - topValue) / height))
+    };
+  }
+
+  const x = leftValue;
+  const y = topValue;
+  const w = Number(item?.w ?? item?.width ?? item?.Width);
+  const h = Number(item?.h ?? item?.height ?? item?.Height);
+  if ([x, y, w, h].every(Number.isFinite) && w > 0 && h > 0) {
+    return {
+      x: Math.max(0, Math.min(1, x / width)),
+      y: Math.max(0, Math.min(1, y / height)),
+      w: Math.max(0.001, Math.min(1, w / width)),
+      h: Math.max(0.001, Math.min(1, h / height))
+    };
+  }
+  return null;
+}
+
+function stringifyAliyunQuestionText(item) {
+  const direct = [
+    item?.word,
+    item?.text,
+    item?.content,
+    item?.question,
+    item?.title,
+    item?.stem,
+    item?.subject,
+    item?.recText,
+    item?.description
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const nested = [];
+  const nestedKeys = [
+    "prism_wordsInfo",
+    "prismWordsInfo",
+    "wordsInfo",
+    "content_list_info",
+    "contentListInfo",
+    "content_list",
+    "children",
+    "blocks",
+    "items"
+  ];
+  for (const key of nestedKeys) {
+    const values = Array.isArray(item?.[key]) ? item[key] : [];
+    values.forEach((child) => {
+      const text = stringifyAliyunQuestionText(child);
+      if (text) nested.push(text);
+    });
+  }
+  return [...direct, ...nested].join(" ").replace(/\s+/g, " ").trim();
+}
+
+function isLikelyAliyunOptionOnlyText(text) {
+  const value = String(text || "").normalize("NFKC").replace(/\s+/g, " ").trim();
+  if (!value) return false;
+  if (/^\s*(?:[（(]\s*\d+\s*[）)]|\d+\s*[）)]|[①②③④⑤⑥⑦⑧⑨⑩])/.test(value)) return false;
+  if (/^\s*(?:第\s*)?\d{1,3}(?:\s*题|[.．、])\s*[\u4e00-\u9fa5A-Za-z]/.test(value)) return false;
+  const hasQuestionStemWord = /已知|若|如果|如图|求|计算|证明|判断|选择|下列|关于|则|那么|为何|多少|哪个|正确|错误|满足|解|方程|比例|面积|周长|体积|圆心角/u.test(value);
+  const startsWithOption = /^[A-D]\s*[.．、:：)]/i.test(value);
+  const optionValuePattern = /^[A-D]?\s*[.．、:：)]?\s*[-+−]?\d+(?:\.\d+)?(?:\s*\/\s*[-+−]?\d+(?:\.\d+)?)?\s*(?:π|%|°|度|cm|mm|m|km|厘米|毫米|米|千米|平方厘米|立方厘米|元|分|克|千克|个)?\s*$/iu;
+  const mostlyChoiceLine = startsWithOption && value.length <= 48 && !hasQuestionStemWord;
+  return mostlyChoiceLine || optionValuePattern.test(value);
+}
+
+function hasAliyunQuestionStemText(text) {
+  const value = String(text || "").normalize("NFKC").replace(/\s+/g, " ").trim();
+  if (!value) return false;
+  const stemWords = /[\u5df2\u77e5]|\u82e5|\u5982\u679c|\u5982\u56fe|\u6c42|\u8ba1\u7b97|\u8bc1\u660e|\u5224\u65ad|\u9009\u62e9|\u4e0b\u5217|\u5173\u4e8e|\u5219|\u90a3\u4e48|\u4e3a\u4f55|\u591a\u5c11|\u54ea\u4e2a|\u6b63\u786e|\u9519\u8bef|\u6ee1\u8db3|\u89e3|\u65b9\u7a0b|\u6bd4\u4f8b|\u9762\u79ef|\u5468\u957f|\u4f53\u79ef|\u5706\u5fc3\u89d2|\u534a\u5f84|\u76f4\u5f84|\u7b49\u4e8e/u;
+  const chineseCount = (value.match(/[\u4e00-\u9fa5]/gu) || []).length;
+  const hasLegalQuestionPrefix = /^\s*(?:\u7b2c\s*)?\d{1,3}(?:\s*\u9898|[.．、])\s*[\u4e00-\u9fa5A-Za-z]/u.test(value);
+  return stemWords.test(value) || (hasLegalQuestionPrefix && chineseCount >= 6);
+}
+
+function isLikelyAliyunFigureOnlyText(text) {
+  const value = String(text || "").normalize("NFKC").replace(/\s+/g, " ").trim();
+  if (!value) return true;
+  if (isLikelyAliyunOptionOnlyText(value)) return true;
+  if (hasAliyunQuestionStemText(value)) return false;
+
+  const compact = value.replace(/\s+/g, "");
+  const onlyQuestionCaption = /^(?:\u7b2c)?\d{1,3}\u9898$/u.test(compact);
+  const figureOrTableLabelOnly = /^(?:(?:\u56fe|\u8868)\s*(?:[①②③④⑤⑥⑦⑧⑨⑩]|\d{1,3}|[（(]\d{1,3}[）)]|\u4e00|\u4e8c|\u4e09|\u56db|\u4e94|\u516d|\u4e03|\u516b|\u4e5d|\u5341)\s*)+$/u.test(compact);
+  const dataOrFormulaOnly = /^[A-Za-z0-9+\-−*/=<>≤≥().,，:：;；%°πΠ_\s\u00b2\u00b3\u2160-\u216b\u2460-\u2469]+$/u.test(value) &&
+    !/[\u5df2\u77e5]|\u82e5|\u5982|\u6c42|\u5219|\u5173\u4e8e|\u4e0b\u5217|\u6b63\u786e|\u9009\u62e9/u.test(value);
+  const veryShortNonStem = compact.length <= 16 && !/[?？]/u.test(compact);
+  return onlyQuestionCaption || figureOrTableLabelOnly || dataOrFormulaOnly || veryShortNonStem;
+}
+
+function isLikelyAliyunVisualOnlyCard(text) {
+  const value = String(text || "").normalize("NFKC").replace(/\s+/g, " ").trim();
+  if (!value) return true;
+  if (hasAliyunQuestionStemText(value)) return false;
+  const chineseCount = (value.match(/[\u4e00-\u9fa5]/gu) || []).length;
+  const digitCount = (value.match(/\d/g) || []).length;
+  const compact = value.replace(/\s+/g, "");
+  const hasQuestionCaption = /\u7b2c\s*\d{1,3}\s*\u9898/u.test(value);
+  const hasTableOrFigureSignal = /(?:\u56fe|\u8868|\u5b8c\u6210|\u6c34\u4f4d|\u65f6\u95f4|\u70b9|\u523b\u5ea6|\u5355\u4f4d|%|\d+\s*(?:cm|mm|km|m|\u5398\u7c73|\u7c73|\u5343\u7c73))/iu.test(value);
+  const withoutQuestionCaption = value.replace(/\u7b2c\s*\d{1,3}\s*\u9898/gu, "");
+  const onlyCaptionOrFigureLabel = /^(?:\u7b2c?\d{1,3}\u9898|(?:\u56fe|\u8868)[①②③④⑤⑥⑦⑧⑨⑩\d一二三四五六七八九十]+)$/u.test(compact);
+  const tableCaptionBlock = hasQuestionCaption && hasTableOrFigureSignal && chineseCount <= 18;
+  const dataHeavyCaptionBlock = hasQuestionCaption && digitCount >= 4 && chineseCount <= 24 && !hasAliyunQuestionStemText(withoutQuestionCaption);
+  const shortVisualLabel = compact.length <= 20 && hasTableOrFigureSignal && !/[?？]/u.test(compact);
+  return onlyCaptionOrFigureLabel || tableCaptionBlock || dataHeavyCaptionBlock || shortVisualLabel;
+}
+
+function extractAliyunLeadingQuestionNumberFromText(text) {
+  const value = String(text || "").normalize("NFKC").trim();
+  if (!value || isLikelyAliyunOptionOnlyText(value) || isLikelyAliyunFigureOnlyText(value) || isLikelyAliyunVisualOnlyCard(value)) return "";
+  const match = value.match(/^\s*(?:第\s*)?(\d{1,3})(?:\s*题|[.．、])\s*(.+)$/u);
+  if (!match) return "";
+  const tail = String(match[2] || "").trim();
+  if (!tail || !/[A-Za-z\u4e00-\u9fa5]/u.test(tail)) return "";
+  const number = Number(match[1]);
+  return Number.isInteger(number) && number > 0 && number <= 200 ? String(number) : "";
+}
+
+function getAliyunQuestionNumber(item, summary) {
+  const rawValues = [
+    Array.isArray(item?.ids) ? item.ids[0] : item?.ids,
+    Array.isArray(item?.Ids) ? item.Ids[0] : item?.Ids,
+    Array.isArray(item?.subjectIds) ? item.subjectIds[0] : item?.subjectIds,
+    Array.isArray(item?.subject_ids) ? item.subject_ids[0] : item?.subject_ids,
+    item?.questionNumber,
+    item?.question_number,
+    item?.questionNo,
+    item?.question_no,
+    item?.questionId,
+    item?.question_id,
+    item?.subjectNo,
+    item?.subject_no,
+    item?.problemNo,
+    item?.problem_no,
+    item?.no,
+    item?.num,
+    item?.number,
+    item?.index
+  ];
+  for (const value of rawValues) {
+    const number = normalizeSourceQuestionNumber(value);
+    if (number) return number;
+  }
+  return extractAliyunLeadingQuestionNumberFromText(summary);
+}
+
+function collectAliyunQuestionLikeItems(root) {
+  const collected = [];
+  const visited = new Set();
+  const questionArrayKeyPattern = /(subject|question|problem|paperCut|paper_cut|exercise|item).*list|list.*(subject|question|problem|exercise)|subjects|questions|problems|items/iu;
+  const walk = (value, path = "") => {
+    if (!value || typeof value !== "object") return;
+    if (visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      value.forEach((child, index) => walk(child, `${path}[${index}]`));
+      return;
+    }
+
+    const keys = Object.keys(value);
+    const hasOwnBox = Boolean(boxFromAliyunItem(value, 1, 1));
+    const hasQuestionField = keys.some((key) =>
+      /question|subject|problem|stem|title|content|word|text|no|number|index/iu.test(key)
+    );
+    const pathLooksQuestion = /subject|question|problem|paperCut|paper_cut|exercise/iu.test(path);
+    if (hasOwnBox && (hasQuestionField || pathLooksQuestion)) {
+      collected.push(value);
+    }
+
+    for (const key of keys) {
+      const child = value[key];
+      if (Array.isArray(child) && questionArrayKeyPattern.test(key)) {
+        child.forEach((entry) => {
+          if (entry && typeof entry === "object") collected.push(entry);
+          walk(entry, `${path}.${key}`);
+        });
+      } else {
+        walk(child, `${path}.${key}`);
+      }
+    }
+  };
+  walk(root, "");
+  return collected;
+}
+
+function normalizeAliyunPaperCutQuestions(payload, width, height) {
+  const pages = getAliyunPaperCutPages(payload);
+  const questions = [];
+  const seen = new Set();
+  const addQuestion = (subject) => {
+    if (!subject || typeof subject !== "object") return;
+    const words = [];
+    const boxes = [];
+    const contentList = subject?.content_list_info || subject?.contentListInfo || subject?.content_list || [];
+    const collectItem = (item) => {
+      const text = String(item?.word || item?.text || item?.content || item?.title || item?.stem || "").trim();
+      if (text) words.push(text);
+      const box = boxFromAliyunItem(item, width, height);
+      if (box) boxes.push(box);
+    };
+
+    collectItem(subject);
+    const subjectWords = subject?.prism_wordsInfo || subject?.prismWordsInfo || subject?.wordsInfo || [];
+    if (Array.isArray(subjectWords)) subjectWords.forEach(collectItem);
+    if (Array.isArray(contentList)) {
+      contentList.forEach((content) => {
+        collectItem(content);
+        const contentWords = content?.prism_wordsInfo || content?.prismWordsInfo || content?.wordsInfo || [];
+        if (Array.isArray(contentWords)) contentWords.forEach(collectItem);
+      });
+    }
+
+    const fallbackSummary = stringifyAliyunQuestionText(subject);
+    const summary = (words.join(" ") || fallbackSummary).replace(/\s+/g, " ").trim();
+    if (isLikelyAliyunOptionOnlyText(summary)) {
+      console.log(`[segment] Aliyun option-only block skipped: "${summary.slice(0, 60)}"`);
+      return;
+    }
+    if (isLikelyAliyunFigureOnlyText(summary) || isLikelyAliyunVisualOnlyCard(summary)) {
+      console.log(`[segment] Aliyun figure/table-only block skipped: "${summary.slice(0, 60)}"`);
+      return;
+    }
+    const number = getAliyunQuestionNumber(subject, summary);
+    if (!boxes.length) return;
+    const union = unionPixelBoxes(
+      boxes.map((box) => normalizedBoxToPixels(box, width, height)).filter(Boolean),
+      width,
+      height
+    );
+    if (!union || union.w < 3 || union.h < 3) return;
+    const key = `${number || "?"}:${Math.round(union.x)}:${Math.round(union.y)}:${Math.round(union.w)}:${Math.round(union.h)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    questions.push({
+      questionNumber: number,
+      stemBoxes: boxes.length ? boxes : [],
+      optionBoxes: [],
+      otherBoxes: [],
+      summary,
+      type: subject?.type || subject?.questionType || subject?.question_type || "未知",
+      provider: "aliyun-paper-cut",
+      evidenceSource: "aliyun-paper-cut"
+    });
+  };
+
+  let directSubjectCount = 0;
+  for (const page of pages) {
+    const subjects = page?.subject_list || page?.subjectList || page?.subjects || [];
+    for (const subject of Array.isArray(subjects) ? subjects : []) {
+      directSubjectCount += 1;
+      addQuestion(subject);
+    }
+  }
+  if (!directSubjectCount) {
+    collectAliyunQuestionLikeItems(payload).forEach(addQuestion);
+  }
+  console.log(`[segment] Aliyun paper-cut parser directSubjects=${directSubjectCount}, question candidates=${questions.length}`);
+  return questions;
+}
+
+function aliyunPercentEncode(value) {
+  return encodeURIComponent(String(value))
+    .replace(/\+/g, "%20")
+    .replace(/\*/g, "%2A")
+    .replace(/%7E/g, "~");
+}
+
+function buildAliyunRpcSignedUrl(endpoint, params, accessKeySecret) {
+  const filteredParams = Object.fromEntries(
+    Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== "")
+  );
+  const canonicalizedQuery = Object.keys(filteredParams)
+    .sort()
+    .map((key) => `${aliyunPercentEncode(key)}=${aliyunPercentEncode(filteredParams[key])}`)
+    .join("&");
+  const stringToSign = `POST&${aliyunPercentEncode("/")}&${aliyunPercentEncode(canonicalizedQuery)}`;
+  const signature = crypto
+    .createHmac("sha1", `${accessKeySecret}&`)
+    .update(stringToSign, "utf8")
+    .digest("base64");
+  const url = new URL(endpoint);
+  url.pathname = "/";
+  const signedParams = { ...filteredParams, Signature: signature };
+  Object.keys(signedParams)
+    .sort()
+    .forEach((key) => url.searchParams.set(key, signedParams[key]));
+  return url;
+}
+
+function parseAliyunOfficialPayload(raw) {
+  let payload = raw;
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch {
+      return raw;
+    }
+  }
+  if (typeof payload?.Data === "string") {
+    try {
+      payload = { ...payload, Data: JSON.parse(payload.Data) };
+    } catch {
+      return payload;
+    }
+  }
+  if (typeof payload?.data === "string") {
+    try {
+      payload = { ...payload, data: JSON.parse(payload.data) };
+    } catch {
+      return payload;
+    }
+  }
+  return payload;
+}
+
+async function extractAliyunOfficialPaperCutResult(imageDataUrl, options = {}) {
+  if (!ALIYUN_OCR_ACCESS_KEY_ID || !ALIYUN_OCR_ACCESS_KEY_SECRET) return null;
+  const image = decodeDataImage(imageDataUrl);
+  if (!image) return { blocks: [], questions: [] };
+  const bodyBuffer = image.buffer;
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const nonce = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+  const query = {
+    Action: "RecognizeEduPaperCut",
+    Version: "2021-07-07",
+    Format: "JSON",
+    AccessKeyId: ALIYUN_OCR_ACCESS_KEY_ID,
+    SignatureMethod: "HMAC-SHA1",
+    SignatureVersion: "1.0",
+    SignatureNonce: nonce,
+    Timestamp: timestamp,
+    CutType: process.env.ALIYUN_OCR_CUT_TYPE || "question",
+    ImageType: process.env.ALIYUN_OCR_IMAGE_TYPE || "photo",
+    Subject: process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math",
+    OutputOricoord: process.env.ALIYUN_OCR_OUTPUT_ORICOORD || "true"
+  };
+  if (ALIYUN_OCR_SECURITY_TOKEN) query.SecurityToken = ALIYUN_OCR_SECURITY_TOKEN;
+  const url = buildAliyunRpcSignedUrl(ALIYUN_OCR_OFFICIAL_ENDPOINT, query, ALIYUN_OCR_ACCESS_KEY_SECRET);
+  const headers = {
+    "Content-Type": "application/octet-stream"
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ALIYUN_OCR_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: bodyBuffer,
+      signal: controller.signal
+    });
+    const raw = await response.text();
+    const payload = parseAliyunOfficialPayload(raw);
+    const serviceCode = payload?.Code || payload?.code || payload?.Error?.Code || payload?.error_code;
+    if (!response.ok || serviceCode) {
+      const message = payload?.Message || payload?.message || payload?.error_msg || raw.slice(0, 180) || response.statusText;
+      throw new Error(`Aliyun official OCR ${response.status}${serviceCode ? ` ${serviceCode}` : ""}: ${message}`);
+    }
+    const blocks = normalizeAliyunOcrBlocks(payload);
+    const questions = normalizeAliyunPaperCutQuestions(
+      payload,
+      Number(options.width) || 1,
+      Number(options.height) || 1
+    );
+    console.log(
+      `[segment] Aliyun official edu paper-cut block count: ${blocks.length}, question count=${questions.length}, elapsed=${Date.now() - startedAt}ms`
+    );
+    const data = payload?.Data || payload?.data || payload?.result || payload;
+    const pages = getAliyunPaperCutPages(payload);
+    console.log(
+      `[segment] Aliyun official response keys=${Object.keys(data || {}).slice(0, 12).join(",")}, pages=${pages.length}`
+    );
+    return { blocks, questions, provider: "aliyun-official-recognize-edu-paper-cut" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function extractAliyunPaperCutResult(imageDataUrl, options = {}) {
+  if (!ALIYUN_OCR_ENABLED) return { blocks: [], questions: [] };
+  if (ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET) {
+    try {
+      const officialResult = await extractAliyunOfficialPaperCutResult(imageDataUrl, options);
+      if (officialResult && (officialResult.questions?.length || officialResult.blocks?.length)) {
+        return officialResult;
+      }
+    } catch (error) {
+      if (SEGMENT_ALIYUN_ONLY) throw error;
+      console.warn("[segment] Aliyun official edu paper-cut failed, trying AppCode fallback:", error.message || error);
+    }
+  }
+  if (!ALIYUN_OCR_APPCODE) return { blocks: [], questions: [] };
+  const image = decodeDataImage(imageDataUrl);
+  if (!image) return { blocks: [], questions: [] };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ALIYUN_OCR_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(ALIYUN_OCR_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `APPCODE ${ALIYUN_OCR_APPCODE}`,
+        "Content-Type": "application/json; charset=UTF-8"
+      },
+      body: JSON.stringify({
+        imgList: [image.buffer.toString("base64")],
+        cutType: process.env.ALIYUN_OCR_CUT_TYPE || "question",
+        imageType: process.env.ALIYUN_OCR_IMAGE_TYPE || "photo",
+        subject: process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math",
+        prob: false,
+        charInfo: false,
+        rotate: true,
+        table: false,
+        sortPage: true
+      }),
+      signal: controller.signal
+    });
+    const raw = await response.text();
+    let payload = null;
+    try {
+      payload = raw ? JSON.parse(raw) : null;
+    } catch {
+      throw new Error(`Aliyun OCR returned non-JSON: ${raw.slice(0, 160)}`);
+    }
+    if (!response.ok || payload?.error_code || payload?.code === "InvalidParam") {
+      const message = payload?.error_msg || payload?.message || raw.slice(0, 160) || response.statusText;
+      throw new Error(`Aliyun OCR ${response.status}: ${message}`);
+    }
+
+    const blocks = normalizeAliyunOcrBlocks(payload);
+    const questions = normalizeAliyunPaperCutQuestions(
+      payload,
+      Number(options.width) || 1,
+      Number(options.height) || 1
+    );
+    console.log(
+      `[segment] Aliyun paper-cut OCR block count: ${blocks.length}, question count=${questions.length}, elapsed=${Date.now() - startedAt}ms`
+    );
+    return { blocks, questions };
+  } catch (error) {
+    if (ALIYUN_OCR_TEXT_FALLBACK_URL && ALIYUN_OCR_TEXT_FALLBACK_URL !== ALIYUN_OCR_URL) {
+      console.warn("[segment] Aliyun paper-cut failed, trying text OCR fallback:", error.message || error);
+      const response = await fetch(ALIYUN_OCR_TEXT_FALLBACK_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": `APPCODE ${ALIYUN_OCR_APPCODE}`,
+          "Content-Type": "application/json; charset=UTF-8"
+        },
+        body: JSON.stringify({
+          img: image.buffer.toString("base64"),
+          prob: false,
+          charInfo: false,
+          rotate: true,
+          table: false,
+          sortPage: true
+        }),
+        signal: controller.signal
+      });
+      const raw = await response.text();
+      let payload = null;
+      try {
+        payload = raw ? JSON.parse(raw) : null;
+      } catch {
+        throw new Error(`Aliyun text OCR returned non-JSON: ${raw.slice(0, 160)}`);
+      }
+      if (!response.ok || payload?.error_code || payload?.code === "InvalidParam") {
+        const message = payload?.error_msg || payload?.message || raw.slice(0, 160) || response.statusText;
+        throw new Error(`Aliyun text OCR ${response.status}: ${message}`);
+      }
+      const blocks = normalizeAliyunOcrBlocks(payload);
+      console.log(
+        `[segment] Aliyun text OCR fallback block count: ${blocks.length}, elapsed=${Date.now() - startedAt}ms`
+      );
+      return { blocks, questions: [] };
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function extractAliyunTextBlocks(imageDataUrl) {
+  const result = await extractAliyunPaperCutResult(imageDataUrl);
+  return result.blocks || [];
+}
+
 function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
@@ -550,7 +1245,7 @@ function getSegmentCacheKey(imageDataUrl, width, height, mode) {
   return crypto
     .createHash("sha256")
     .update(String(imageDataUrl || ""))
-    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|segment:v43`)
+    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|aliyunPaperCutFirst:${ALIYUN_OCR_ENABLED}|official:${Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET)}|aliyunOnly:${SEGMENT_ALIYUN_ONLY}|segment:v50`)
     .digest("hex");
 }
 
@@ -602,6 +1297,7 @@ function rejectPendingOcrRequests(service, error) {
 }
 
 function getPaddleOcrService() {
+  if (!LOCAL_OCR_ENABLED) return null;
   if (!fs.existsSync(OCR_PYTHON) || !fs.existsSync(PADDLE_OCR_SCRIPT)) return null;
   if (paddleOcrService && !paddleOcrService.exited) return paddleOcrService;
 
@@ -727,6 +1423,7 @@ function rejectPendingLayoutRequests(service, error) {
 }
 
 function getPaddleLayoutService() {
+  if (!LOCAL_OCR_ENABLED) return null;
   if (!LAYOUT_ENABLED || !fs.existsSync(OCR_PYTHON) || !fs.existsSync(PADDLE_LAYOUT_SCRIPT)) return null;
   if (paddleLayoutService && !paddleLayoutService.exited) return paddleLayoutService;
 
@@ -865,11 +1562,24 @@ async function extractTextBlocks(imageDataUrl, options = {}) {
     return cachedBlocks;
   }
 
+  if (!options.skipAliyun) {
+  try {
+    const aliyunBlocks = await extractAliyunTextBlocks(imageDataUrl);
+    if (aliyunBlocks.length) {
+      setCachedOcrBlocks(cacheKey, aliyunBlocks);
+      return cloneOcrBlocks(aliyunBlocks);
+    }
+  } catch (error) {
+    console.warn("[segment] Aliyun OCR failed, trying local OCR fallback:", error.message || error);
+  }
+  }
+
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "lian-ocr-"));
   const imagePath = path.join(tempDir, `source${image.ext}`);
   fs.writeFileSync(imagePath, image.buffer);
   let paddleBlocks = null;
 
+  try {
   try {
     const paddleResult = await extractPaddleTextBlocks(imagePath, maxSide);
     paddleBlocks = paddleResult.blocks;
@@ -888,22 +1598,29 @@ async function extractTextBlocks(imageDataUrl, options = {}) {
     console.warn("[segment] PaddleOCR failed, trying Tesseract fallback:", error.message || error);
   }
 
-  try {
-    const tsv = await runCommand("tesseract", [imagePath, "stdout", "-l", "chi_sim+eng", "--psm", "6", "tsv"]);
-    const tesseractBlocks = parseTesseractTsv(tsv);
-    if (tesseractBlocks.length) {
-      console.log(`[segment] Tesseract OCR block count: ${tesseractBlocks.length}`);
+  if (LOCAL_OCR_ENABLED) {
+    try {
+      const tsv = await runCommand("tesseract", [imagePath, "stdout", "-l", "chi_sim+eng", "--psm", "6", "tsv"]);
+      const tesseractBlocks = parseTesseractTsv(tsv);
+      if (tesseractBlocks.length) {
+        console.log(`[segment] Tesseract OCR block count: ${tesseractBlocks.length}`);
+      }
+      setCachedOcrBlocks(cacheKey, tesseractBlocks);
+      return tesseractBlocks;
+    } catch (error) {
+      console.warn("[segment] OCR unavailable or failed. TODO: connect service OCR if local OCR is unavailable.", error.message || error);
+      if (paddleBlocks) {
+        setCachedOcrBlocks(cacheKey, paddleBlocks);
+        return cloneOcrBlocks(paddleBlocks);
+      }
+      return [];
     }
-    setCachedOcrBlocks(cacheKey, tesseractBlocks);
-    return tesseractBlocks;
-  } catch (error) {
-    console.warn("[segment] OCR unavailable or failed. TODO: connect service OCR if local OCR is unavailable.", error.message || error);
-    if (paddleBlocks) {
-      setCachedOcrBlocks(cacheKey, paddleBlocks);
-      return cloneOcrBlocks(paddleBlocks);
-    }
-    return [];
-  } finally {
+  }
+
+  console.warn("[segment] local OCR is disabled in this environment; using non-OCR fallback path.");
+  setCachedOcrBlocks(cacheKey, []);
+  return [];
+} finally {
     fs.rm(tempDir, { recursive: true, force: true }, () => {});
   }
 }
@@ -2919,6 +3636,54 @@ function normalizeVisualQuestionRegions(questions, width, height) {
     .filter(Boolean);
 }
 
+function buildDirectAliyunQuestions(paperCutQuestions, width, height) {
+  return normalizeVisualQuestionRegions(paperCutQuestions, width, height)
+    .filter((candidate) => {
+      const label = candidate.summary || candidate.text || "";
+      const optionOnly = isLikelyAliyunOptionOnlyText(label);
+      if (optionOnly) {
+        console.log(`[segment-v2] direct Aliyun option-only card skipped: "${String(label).slice(0, 60)}"`);
+      }
+      const figureOnly = !optionOnly && (isLikelyAliyunFigureOnlyText(label) || isLikelyAliyunVisualOnlyCard(label));
+      if (figureOnly) {
+        console.log(`[segment-v2] direct Aliyun figure/table-only card skipped: "${String(label).slice(0, 60)}"`);
+      }
+      return !optionOnly && !figureOnly;
+    })
+    .sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x)
+    .map((candidate, index) => {
+      const finalBox = clampPixelBox(candidate.box, width, height) || {
+        x: 0,
+        y: 0,
+        w: width,
+        h: height
+      };
+      const sourceQuestionNumber = candidate.sourceQuestionNumber || String(index + 1);
+      const summary = candidate.summary || candidate.text || `题目 ${sourceQuestionNumber}`;
+      return {
+        ...candidate,
+        sourceQuestionNumber,
+        questionNumber: sourceQuestionNumber,
+        number: sourceQuestionNumber,
+        displayIndex: index + 1,
+        title: summary,
+        problemText: summary,
+        problemType: candidate.type || "未知",
+        type: candidate.type || "未知",
+        finalBox,
+        x: finalBox.x,
+        y: finalBox.y,
+        w: finalBox.w,
+        h: finalBox.h,
+        needsReview: false,
+        uncertain: false,
+        validation: [],
+        mergeReasons: ["阿里云教育版试卷切题 OCR 原始题块直出"],
+        generatedBy: "aliyun-official-paper-cut-direct"
+      };
+    });
+}
+
 function isSupportingQuestionRole(role) {
   return ["subQuestion", "table", "figure", "formula", "supportingContent"].includes(String(role || ""));
 }
@@ -4521,8 +5286,8 @@ async function handleSegmentV2(req, res) {
   const mode = String(body.mode || "initial");
   const forceVisionModel = !SEGMENT_FAST_MODE || mode === "strict_structure";
   const recognitionStrategy = forceVisionModel
-    ? "layout-ocr-vision-forced-v4"
-    : "layout-ocr-adaptive-v4";
+    ? "aliyun-edu-paper-cut-first-strict-v1"
+    : "aliyun-edu-paper-cut-first-v1";
   const ocrMaxSide = forceVisionModel ? OCR_MAX_SIDE : OCR_FAST_MAX_SIDE;
   const cacheLookupStartedAt = Date.now();
   const cacheKey = getSegmentCacheKey(body.image, width, height, `${mode}:${recognitionStrategy}`);
@@ -4539,53 +5304,177 @@ async function handleSegmentV2(req, res) {
   }
 
   const recognitionStartedAt = Date.now();
-  const ocrTask = (async () => {
-    const startedAt = Date.now();
-    try {
-      return await extractTextBlocks(body.image, { maxSide: ocrMaxSide });
-    } finally {
-      timings.ocrMs = Date.now() - startedAt;
-    }
-  })();
-  const layoutTask = (async () => {
-    const startedAt = Date.now();
-    try {
-      return await extractLayoutRegions(body.image, { maxSide: LAYOUT_MAX_SIDE });
-    } finally {
-      timings.layoutMs = Date.now() - startedAt;
-    }
-  })();
-  const eagerVisionTask = forceVisionModel
-    ? (async () => {
-        const startedAt = Date.now();
-        try {
-          return await callVisionQuestionStructure(body.image);
-        } finally {
-          timings.visionModelMs = Date.now() - startedAt;
-        }
-      })()
-    : Promise.resolve(null);
-  if (!forceVisionModel) {
-    timings.visionDeferred = true;
-    timings.visionModelMs = 0;
+  let ocrPayload = { textBlocks: [], paperCutQuestions: [] };
+  let layoutRegions = [];
+  let eagerVisionResult = { status: "fulfilled", value: null };
+  let paperCutUsed = false;
+  let aliyunPaperCutError = "";
+  const paperCutStartedAt = Date.now();
+  try {
+    const paperCut = await extractAliyunPaperCutResult(body.image, { width, height });
+    timings.aliyunPaperCutMs = Date.now() - paperCutStartedAt;
+    ocrPayload = {
+      textBlocks: paperCut.blocks || [],
+      paperCutQuestions: paperCut.questions || []
+    };
+    paperCutUsed = Boolean(ocrPayload.textBlocks.length || ocrPayload.paperCutQuestions.length);
+  } catch (error) {
+    timings.aliyunPaperCutMs = Date.now() - paperCutStartedAt;
+    aliyunPaperCutError = error.message || String(error);
+    console.warn("[segment-v2] Aliyun paper-cut OCR failed, trying local/Qwen fallback:", error.message || error);
   }
-  const [ocrResult, layoutResult, eagerVisionResult] = await Promise.allSettled([
-    ocrTask,
-    layoutTask,
-    eagerVisionTask
-  ]);
+
+  if (SEGMENT_ALIYUN_ONLY) {
+    const textBlocks = Array.isArray(ocrPayload?.textBlocks) ? ocrPayload.textBlocks : [];
+    const paperCutQuestions = Array.isArray(ocrPayload?.paperCutQuestions) ? ocrPayload.paperCutQuestions : [];
+    const directQuestions = buildDirectAliyunQuestions(paperCutQuestions, width, height);
+    timings.parallelRecognitionMs = Date.now() - recognitionStartedAt;
+    timings.recognitionStrategy = "aliyun-edu-paper-cut-only-v1";
+    timings.ocrMaxSide = ocrMaxSide;
+    timings.aliyunOnly = true;
+    timings.backendTotalMs = Date.now() - requestStartedAt;
+    timings.cacheHit = false;
+    console.log(
+      `[segment-v2] aliyun-only: paperCutQuestions=${paperCutQuestions.length}, direct=${directQuestions.length}, blocks=${textBlocks.length}, error=${aliyunPaperCutError || "none"}`
+    );
+    console.log(`[render] final question numbers=[${directQuestions.map((question) => question.sourceQuestionNumber).filter(Boolean).join(",")}]`);
+    return sendSegmentResult(res, cacheKey, {
+      questions: directQuestions,
+      fallbackToWholePage: false,
+      note: directQuestions.length
+        ? "仅使用阿里云教育版试卷切题 OCR 原始题块，已关闭本地 OCR、Qwen 和其他兜底。"
+        : `仅使用阿里云教育版试卷切题 OCR，但阿里云没有返回可展示的题块；已关闭其他兜底。${aliyunPaperCutError ? `接口错误：${aliyunPaperCutError}` : ""}`,
+      model: "Aliyun RecognizeEduPaperCut",
+      provider: "aliyun-education-paper-cut-only",
+      recognitionStrategy: "aliyun-edu-paper-cut-only-v1",
+      ocrBlockCount: textBlocks.length,
+      layoutRegionCount: 0,
+      localConfidence: null,
+      visionUsed: false,
+      timings,
+      debug: {
+        rawModelBoxes: normalizeVisualQuestionRegions(paperCutQuestions, width, height).flatMap((question) => question.rawModelBoxes),
+        ocrLineBoxes: textBlocks.map((block, index) => ({ index, ...block })),
+        layoutBoxes: [],
+        finalBoxes: directQuestions.map((question) => ({
+          sourceQuestionNumber: question.sourceQuestionNumber,
+          needsReview: question.needsReview,
+          ...question.finalBox
+        })),
+        boundaryLines: [],
+        deduplicatedBoxes: []
+      }
+    });
+  }
+
+  if (ocrPayload.paperCutQuestions.length) {
+    timings.ocrMs = timings.aliyunPaperCutMs;
+    timings.layoutMs = 0;
+    timings.layoutSkipped = "aliyun-paper-cut-questions";
+    timings.visionModelMs = 0;
+    timings.visionDeferred = true;
+    timings.visionSkipped = "aliyun-paper-cut-questions";
+  } else {
+    const fallbackStartedAt = Date.now();
+    const ocrTask = (async () => {
+      const startedAt = Date.now();
+      try {
+        if (ocrPayload.textBlocks.length) return ocrPayload;
+        return {
+          textBlocks: await extractTextBlocks(body.image, { maxSide: ocrMaxSide, skipAliyun: true }),
+          paperCutQuestions: []
+        };
+      } finally {
+        timings.ocrMs = (timings.aliyunPaperCutMs || 0) + Date.now() - startedAt;
+      }
+    })();
+    const layoutTask = (async () => {
+      const startedAt = Date.now();
+      try {
+        return await extractLayoutRegions(body.image, { maxSide: LAYOUT_MAX_SIDE });
+      } finally {
+        timings.layoutMs = Date.now() - startedAt;
+      }
+    })();
+    const eagerVisionTask = forceVisionModel
+      ? (async () => {
+          const startedAt = Date.now();
+          try {
+            return await callVisionQuestionStructure(body.image);
+          } finally {
+            timings.visionModelMs = Date.now() - startedAt;
+          }
+        })()
+      : Promise.resolve(null);
+    if (!forceVisionModel) {
+      timings.visionDeferred = true;
+      timings.visionModelMs = 0;
+    }
+    const [ocrResult, layoutResult, visionResult] = await Promise.allSettled([
+      ocrTask,
+      layoutTask,
+      eagerVisionTask
+    ]);
+    if (ocrResult.status === "fulfilled") ocrPayload = ocrResult.value;
+    else console.warn("[segment-v2] OCR failed:", ocrResult.reason?.message || ocrResult.reason);
+    if (layoutResult.status === "fulfilled") layoutRegions = layoutResult.value;
+    else console.warn("[segment-v2] layout failed:", layoutResult.reason?.message || layoutResult.reason);
+    eagerVisionResult = visionResult;
+    timings.fallbackRecognitionMs = Date.now() - fallbackStartedAt;
+  }
   timings.parallelRecognitionMs = Date.now() - recognitionStartedAt;
   timings.recognitionStrategy = recognitionStrategy;
   timings.ocrMaxSide = ocrMaxSide;
-  const textBlocks = ocrResult.status === "fulfilled" ? ocrResult.value : [];
-  const layoutRegions = layoutResult.status === "fulfilled" ? layoutResult.value : [];
-  let visionQuestions = eagerVisionResult.status === "fulfilled"
-    ? eagerVisionResult.value?.questions || []
+  const textBlocks = Array.isArray(ocrPayload)
+    ? ocrPayload
+    : (ocrPayload.textBlocks || []);
+  const paperCutQuestions = Array.isArray(ocrPayload?.paperCutQuestions)
+    ? ocrPayload.paperCutQuestions
     : [];
-  let visionUsed = forceVisionModel && visionQuestions.length > 0;
-  if (ocrResult.status === "rejected") console.warn("[segment-v2] OCR failed:", ocrResult.reason?.message || ocrResult.reason);
-  if (layoutResult.status === "rejected") console.warn("[segment-v2] layout failed:", layoutResult.reason?.message || layoutResult.reason);
+  let visionQuestions = [
+    ...paperCutQuestions,
+    ...(eagerVisionResult.status === "fulfilled" ? eagerVisionResult.value?.questions || [] : [])
+  ];
+  let visionUsed = (forceVisionModel && visionQuestions.length > 0) || paperCutQuestions.length > 0;
   if (eagerVisionResult.status === "rejected") console.warn("[segment-v2] vision failed:", eagerVisionResult.reason?.message || eagerVisionResult.reason);
+
+  if (SEGMENT_ALIYUN_ONLY) {
+    const directQuestions = buildDirectAliyunQuestions(paperCutQuestions, width, height);
+    timings.aliyunOnly = true;
+    timings.backendTotalMs = Date.now() - requestStartedAt;
+    timings.cacheHit = false;
+    console.log(
+      `[segment-v2] aliyun-only: paperCutQuestions=${paperCutQuestions.length}, direct=${directQuestions.length}, blocks=${textBlocks.length}`
+    );
+    console.log(`[render] final question numbers=[${directQuestions.map((question) => question.sourceQuestionNumber).filter(Boolean).join(",")}]`);
+    return sendSegmentResult(res, cacheKey, {
+      questions: directQuestions,
+      fallbackToWholePage: false,
+      note: directQuestions.length
+        ? "仅使用阿里云教育版试卷切题 OCR 原始题块，已关闭本地 OCR、Qwen 和其他兜底。"
+        : `仅使用阿里云教育版试卷切题 OCR，但阿里云没有返回可展示的题块；已关闭其他兜底。${aliyunPaperCutError ? `接口错误：${aliyunPaperCutError}` : ""}`,
+      model: "Aliyun RecognizeEduPaperCut",
+      provider: "aliyun-education-paper-cut-only",
+      recognitionStrategy: "aliyun-edu-paper-cut-only-v1",
+      ocrBlockCount: textBlocks.length,
+      layoutRegionCount: 0,
+      localConfidence: null,
+      visionUsed: false,
+      timings,
+      debug: {
+        rawModelBoxes: normalizeVisualQuestionRegions(paperCutQuestions, width, height).flatMap((question) => question.rawModelBoxes),
+        ocrLineBoxes: textBlocks.map((block, index) => ({ index, ...block })),
+        layoutBoxes: [],
+        finalBoxes: directQuestions.map((question) => ({
+          sourceQuestionNumber: question.sourceQuestionNumber,
+          needsReview: question.needsReview,
+          ...question.finalBox
+        })),
+        boundaryLines: [],
+        deduplicatedBoxes: []
+      }
+    });
+  }
 
   const anchorStageStartedAt = Date.now();
   const groupedOcrLines = groupOcrBlocksIntoLines(textBlocks, width, height);
@@ -4629,7 +5518,7 @@ async function handleSegmentV2(req, res) {
     const visionStartedAt = Date.now();
     try {
       const review = await callVisionQuestionStructure(body.image);
-      visionQuestions = review?.questions || [];
+      visionQuestions = [...paperCutQuestions, ...(review?.questions || [])];
       visionUsed = visionQuestions.length > 0;
       timings.visionFallbackTriggered = true;
       timings.visionDeferred = false;
@@ -4831,6 +5720,11 @@ async function handleSegmentV2(req, res) {
       : "本地版面检测与 OCR 已并行完成题目切分。",
     model: visionUsed ? QWEN_VL_MODEL : (LAYOUT_ENABLED ? "PP-DocLayoutV2 + PaddleOCR" : "PaddleOCR"),
     provider: visionUsed ? "qwen-vision-paddle-layout-ocr-hybrid" : "paddle-layout-ocr-local",
+    note: paperCutUsed
+      ? "已优先使用阿里云教育版试卷切题 OCR，并完成题目后处理。"
+      : (visionUsed ? "本地证据不足，已由 Qwen 复核题目结构。" : "本地版面检测与 OCR 已完成题目切分。"),
+    model: paperCutUsed ? "Aliyun Edu PaperCut OCR" : (visionUsed ? QWEN_VL_MODEL : (LAYOUT_ENABLED ? "PP-DocLayoutV2 + PaddleOCR" : "PaddleOCR")),
+    provider: paperCutUsed ? "aliyun-education-paper-cut-ocr-first" : (visionUsed ? "qwen-vision-paddle-layout-ocr-hybrid" : "paddle-layout-ocr-local"),
     recognitionStrategy,
     ocrBlockCount: textBlocks.length,
     layoutRegionCount: layoutRegions.length,
@@ -5007,10 +5901,12 @@ const TRANSCRIPT_CORRECTION_PROMPT = [
 
 const TRANSCRIPT_CORRECTION_PROMPT_V2 = [
   "你是初中数学讲解场景里的语音转写校对器。",
-  "浏览器语音识别已经先输出了一段中文。请结合当前题目图片、题卡摘要、知识点和前文讲解，只修正明显的同音词、近音词、数字、字母、数学术语或标点识别错误。",
+  "浏览器语音识别已经先输出了一段中文，前端也做了一次本地数学规范化。请结合当前题目图片、题卡摘要、知识点、黑板内容和前文讲解，只修正明显的同音词、近音词、数字、字母、数学术语或标点识别错误。",
   "学生讲解通常紧贴题目条件，所以当 ASR 文本里出现和题目无关的词，要优先考虑它是不是题目中的数学词被误识别了。",
-  "重点恢复数学与题面词：x、y、m、n、等于、比例、方程、左数、右数、相邻、下方、上方、箭头、共同指向、差、和、积、商、选项、结论。",
+  "重点恢复数学与题面词：x、y、m、n、等于、负数、加、减、乘、除、比例、方程、等式、左数、右数、相邻、下方、上方、箭头、共同指向、差、和、积、商、选项、结论。",
+  "数学表达要尽量规范：三x/3X 写成 3x，5Y 写成 5y，等于负一写成 = -1，x减y写成 x - y。",
   "例如题目说“上方相邻的左数与右数之差等于下方箭头共同指向的数”，ASR 把“左数/右数/之差/箭头”听成“总数/右束支/树”等时，要按题目语义改回。",
+  "黑板内容只能作为纠错上下文：如果学生当前语音和黑板正在写的式子一致，可以用黑板帮助恢复变量、符号和数字；但不能凭空把黑板上有、学生没说的步骤加入文本。",
   "只校对学生确实可能说过的这一句，不要补充新的解题步骤，不要替学生回答题目。",
   "如果无法确定，就保留原文。只返回 correctedText 和 changed。"
 ].join("\n");
@@ -5032,14 +5928,18 @@ async function handleTranscriptCorrection(req, res) {
         type: "input_text",
         text: JSON.stringify({
           asrText: text,
+          rawAsrText: body.rawAsrText || text,
+          localNormalizedText: body.localNormalizedText || text,
           problemText: body.problemText || "",
           knowledgePoints: body.knowledgePoints || [],
+          latestHandwritingResult: body.latestHandwritingResult || null,
           transcriptBeforeThisSentence: body.transcript || "",
-          correctionGoal: "把语音识别结果校正成贴合当前题目的学生原话；不要讲题，不要总结。",
+          correctionGoal: "把语音识别结果校正成贴合当前题目的学生原话；优先保留 localNormalizedText 中已经规范好的数学符号；不要讲题，不要总结。",
           instruction: "只返回 correctedText 和 changed，不要回答题目。"
         })
       },
-      { type: "input_image", label: "当前数学题目", image_url: body.questionImage, detail: "high" }
+      { type: "input_image", label: "当前数学题目", image_url: body.questionImage, detail: "high" },
+      ...(body.boardImage ? [{ type: "input_image", label: "当前黑板内容", image_url: body.boardImage, detail: "low" }] : [])
     ],
     maxOutputTokens: 500
   });
@@ -5050,6 +5950,52 @@ async function handleTranscriptCorrection(req, res) {
     changed: Boolean(result.changed) && correctedText !== text,
     model: QWEN_GUIDE_MODEL,
     provider: "qwen-multimodal-transcript-correction"
+  });
+}
+
+async function handleArchiveSummary(req, res) {
+  const body = await readJsonBody(req);
+  if (!body.questionImage) {
+    sendJson(res, 400, { error: "缺少题目图片", code: "missing_question_image" });
+    return;
+  }
+
+  const result = await callQwenMultimodalJson({
+    model: QWEN_GUIDE_MODEL,
+    schema: archiveSummarySchema,
+    instructions: ARCHIVE_SUMMARY_PROMPT,
+    content: [
+      {
+        type: "input_text",
+        text: JSON.stringify({
+          questionTitle: body.questionTitle || "",
+          problemText: body.problemText || "",
+          knowledgePoints: body.knowledgePoints || [],
+          lectureText: body.lectureText || "",
+          verifiedFinalAnswer: body.verifiedFinalAnswer || "",
+          handwritingSummary: body.latestHandwritingResult || null,
+          instruction:
+            "请生成保存到错题本里的恋恋总结和易错点。必须具体到这道题；如果题图中有原来做错的痕迹，请明确指出。"
+        })
+      },
+      { type: "input_image", label: "当前错题图片，包含可能的原错痕迹和批改痕迹", image_url: body.questionImage, detail: "high" },
+      ...(body.boardImage ? [{ type: "input_image", label: "学生本次黑板笔迹", image_url: body.boardImage, detail: "high" }] : [])
+    ],
+    maxOutputTokens: 900
+  });
+
+  const mistakePoints = Array.isArray(result.mistakePoints)
+    ? result.mistakePoints.map((point) => String(point || "").trim()).filter(Boolean).slice(0, 4)
+    : [];
+
+  sendJson(res, 200, {
+    lianSummary: String(result.lianSummary || "").trim(),
+    mistakePoints,
+    observedWrongTrace: String(result.observedWrongTrace || "").trim(),
+    reviewFocus: String(result.reviewFocus || "").trim(),
+    confidence: Number(result.confidence) || 0,
+    model: QWEN_GUIDE_MODEL,
+    provider: "qwen-multimodal-archive-summary"
   });
 }
 
@@ -5072,6 +6018,51 @@ const finalAnswerSchema = {
     required: ["correct", "finalAnswer", "feedback", "hint", "confidence"]
   }
 };
+
+const archiveSummarySchema = {
+  name: "wrong_question_archive_summary",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      lianSummary: {
+        type: "string",
+        description: "A concrete review summary for this exact problem, mentioning the core condition, method, and final conclusion."
+      },
+      mistakePoints: {
+        type: "array",
+        items: { type: "string" },
+        description: "Specific mistake points for this exact problem. Prefer observed original wrong traces in the image when visible."
+      },
+      observedWrongTrace: {
+        type: "string",
+        description: "Visible prior wrong-answer trace from the problem image, such as crossed-out answer, red marks, circled correction, or blank if not visible."
+      },
+      reviewFocus: {
+        type: "string",
+        description: "One concrete focus for next review."
+      },
+      confidence: {
+        type: "number",
+        description: "Confidence from 0 to 1."
+      }
+    },
+    required: ["lianSummary", "mistakePoints", "observedWrongTrace", "reviewFocus", "confidence"]
+  }
+};
+
+const ARCHIVE_SUMMARY_PROMPT = [
+  "你是恋恋错题本的错题归档分析助手。",
+  "请只针对当前这一道题生成复习用内容，必须具体到题目，不要泛泛而谈。",
+  "你会看到：题目图片、可能的黑板笔迹图片、学生最后讲解文字、已核对答案和题卡摘要。",
+  "如果题目图片中能看到学生之前的错误痕迹，例如被红叉划掉的答案、圈出的错选项、红笔改正、擦写痕迹、旁边写的正确答案，要把它作为易错点的优先依据。",
+  "不要把红笔批改或学生原先填写的答案当成标准答案；只能把它们作为“之前可能错在哪里”的证据。",
+  "lianSummary 要写出本题的关键条件、解法抓手和最后结果，1 到 2 句即可。",
+  "mistakePoints 必须是本题专属，2 到 4 条，每条指出具体位置或具体关系，例如“原来把 2:3:x:6 的对应顺序看反”“题图中被叉掉的 35°说明圆心角没有按 360×1/8 算”等。",
+  "如果看不到明确错题痕迹，也要根据题目、讲解文字和黑板步骤总结具体风险，不要说空泛的‘注意审题’。",
+  "只输出 JSON。"
+].join("\n");
 
 const answerKeySolverSchema = {
   name: "verified_question_solution",
@@ -5406,9 +6397,79 @@ function makeUnverifiedGuideSafe(result) {
   };
 }
 
+function extractAnswerVariable(answerKey) {
+  const candidates = answerKeyCandidates(answerKey);
+  for (const candidate of candidates) {
+    const match = String(candidate || "").normalize("NFKC").match(/^\s*([a-zA-Z])\s*(?:=|＝|等于|为)/);
+    if (match) return match[1].toLowerCase();
+  }
+  return "";
+}
+
+function extractGuideAnswerClaims(text, answerKey) {
+  const value = String(text || "").normalize("NFKC").replace(/[−﹣－]/g, "-");
+  const answerVariable = extractAnswerVariable(answerKey);
+  const claims = [];
+  const numeric = "-?\\d+(?:\\.\\d+)?(?:\\s*/\\s*-?\\d+(?:\\.\\d+)?)?";
+
+  if (answerVariable) {
+    const variablePattern = new RegExp(`\\b${answerVariable}\\s*(?:=|＝|等于|为)\\s*(${numeric})`, "gi");
+    let match;
+    while ((match = variablePattern.exec(value))) {
+      claims.push({ raw: `${answerVariable}=${match[1].replace(/\s+/g, "")}`, reason: "variable-assignment" });
+    }
+  }
+
+  const answerPattern = new RegExp(`(?:答案|结果|解得|最终|最后|正确应(?:该)?是|所以(?:得到|有)?)\\s*(?:是|为|等于|=|：|:)?\\s*(${numeric})`, "gi");
+  let match;
+  while ((match = answerPattern.exec(value))) {
+    claims.push({ raw: match[1].replace(/\s+/g, ""), reason: "answer-claim" });
+  }
+
+  return claims;
+}
+
+function guideContradictsVerifiedAnswer(result, answerKey) {
+  if (!answerKey?.trusted) return null;
+  const text = [result?.speech, result?.formulaOrStep, result?.studentAction].filter(Boolean).join(" ");
+  if (!text) return null;
+  const claims = extractGuideAnswerClaims(text, answerKey);
+  const wrongClaims = claims.filter((claim) => !studentAnswerMatchesVerifiedKey(claim.raw, answerKey));
+  if (!wrongClaims.length) return null;
+  return wrongClaims;
+}
+
+function makeAnswerLockedGuideSafe(result, answerKey, body, reason = "answer contradiction") {
+  const canonicalAnswer = String(answerKey?.canonicalAnswer || "").trim();
+  const canStateAnswer = Boolean(body?.lectureUnlocked || body?.answerVerified || body?.boardCompletionVerified);
+  const speech = canStateAnswer && canonicalAnswer
+    ? `刚才那句我收回，以核准结果为准：${canonicalAnswer}。这里我们只按题目条件核对常数项和符号。`
+    : "刚才那一步我需要收回重新核对，先不要把它当成结论。我们回到题目条件检查常数项和符号。";
+  console.warn(`[guide-safety] blocked guide answer contradiction: ${reason}`);
+  return {
+    ...(result || {}),
+    shouldSpeak: true,
+    speech,
+    hintLevel: "light",
+    formulaOrStep: "",
+    askStudentToRepeat: false,
+    studentAction: "按题目条件重新核对这一步，不要采用刚才那句里不一致的结果。",
+    lectureComplete: false
+  };
+}
+
 async function auditGuideMath(result, answerKey, body) {
   if (!answerKey?.trusted) return makeUnverifiedGuideSafe(result);
   if (!guideHasCheckableMathClaim(result)) return result;
+  const wrongClaims = guideContradictsVerifiedAnswer(result, answerKey);
+  if (wrongClaims) {
+    return makeAnswerLockedGuideSafe(
+      result,
+      answerKey,
+      body,
+      wrongClaims.map((claim) => `${claim.raw}:${claim.reason}`).join(",")
+    );
+  }
   try {
     const audit = await callQwenMultimodalJson({
       model: QWEN_GUIDE_MODEL,
@@ -5757,6 +6818,8 @@ async function handleGuide(req, res) {
             "lectureComplete 默认必须为 false；只有 answerVerified=true、boardCompletionVerified=true，且学生已经讲完关键思路时才设为 true。点击‘我讲完了’本身不是完成证据。",
             "lectureComplete=true 后 speech 只做一次收束，不得继续追问、要求复述或重复已经说过的选项。",
             "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致。trusted=false 时禁止判断对错或输出确定数学结论。",
+            "verifiedAnswerReference.trusted=true 时，禁止给出与 canonicalAnswer 不一致的候选最终答案；指出错误时只说具体错在常数项、符号、对应关系或公式，不要说“或者另一个答案”。",
+            "不要把题目图片里被划掉、红叉或旁边批改的原错答案当作可能正确答案。",
             "禁止使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。"
           ],
           styleRules: LIAN_STYLE_RULES
@@ -5904,11 +6967,28 @@ function serveStatic(req, res) {
   });
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const pathname = new URL(req.url, `http://localhost:${PORT}`).pathname;
   try {
+    if (req.method === "GET" && pathname === "/api/health") {
+      return sendJson(res, 200, {
+        ok: true,
+        service: "lian-wrong-question-book",
+        runtime: IS_VERCEL ? "vercel" : "local",
+        qwenConfigured: Boolean(QWEN_API_KEY),
+        qwenModel: QWEN_VL_MODEL,
+        aliyunOcrConfigured: Boolean(ALIYUN_OCR_APPCODE),
+        aliyunOcrEnabled: ALIYUN_OCR_ENABLED,
+        aliyunOfficialEduPaperCutConfigured: Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET),
+        segmentAliyunOnly: SEGMENT_ALIYUN_ONLY,
+        localOcrEnabled: LOCAL_OCR_ENABLED,
+        layoutEnabled: LAYOUT_ENABLED,
+        uptimeSeconds: Math.round(process.uptime())
+      });
+    }
     if (req.method === "POST" && pathname === "/api/segment") return await handleSegmentV2(req, res);
     if (req.method === "POST" && pathname === "/api/transcript-correct") return await handleTranscriptCorrection(req, res);
+    if (req.method === "POST" && pathname === "/api/archive-summary") return await handleArchiveSummary(req, res);
     if (req.method === "POST" && pathname === "/api/answer-key") return await handleAnswerKeyPrefetch(req, res);
     if (req.method === "POST" && pathname === "/api/final-answer") return await handleFinalAnswerCheck(req, res);
     if (req.method === "POST" && pathname === "/api/guide") return await handleGuide(req, res);
@@ -5921,7 +7001,9 @@ const server = http.createServer(async (req, res) => {
       code: error.code || "server_error"
     });
   }
-});
+}
+
+const server = http.createServer(handleRequest);
 
 if (require.main === module) {
   server.listen(PORT, () => {
@@ -5944,6 +7026,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  handleRequest,
+  server,
   groupOcrBlocksIntoLines,
   mergeDetachedQuestionNumberLines,
   extractMainQuestionAnchors,
@@ -5962,6 +7046,8 @@ module.exports = {
   buildLayoutContentBlocks,
   assessLocalSegmentationConfidence,
   enforceOrderedProportionConvention,
+  guideContradictsVerifiedAnswer,
+  makeAnswerLockedGuideSafe,
   answerValuesEquivalent,
   answerKeyResultsAgree,
   makeUnverifiedGuideSafe,

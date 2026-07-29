@@ -2,6 +2,9 @@ const iconMap = {
   upload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M20 16.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-2.5"/></svg>',
   board: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="4" width="18" height="13" rx="1.5"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>',
   book: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z"/></svg>',
+  calendar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M8 2v4"/><path d="M16 2v4"/><path d="M3 10h18"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/><path d="M8 18h.01"/><path d="M12 18h.01"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg>',
+  list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>',
   image: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8" cy="10" r="2"/><path d="m21 15-4.5-4.5L7 20"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 11a8.1 8.1 0 0 0-15.5-2"/><path d="M4 5v4h4"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2"/><path d="M20 19v-4h-4"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/></svg>',
@@ -40,7 +43,8 @@ const views = {
   uploadView: $("#uploadView"),
   teachView: $("#teachView"),
   completeView: $("#completeView"),
-  notebookView: $("#notebookView")
+  notebookView: $("#notebookView"),
+  reviewView: $("#reviewView")
 };
 
 const dom = {
@@ -48,6 +52,7 @@ const dom = {
   enterUploadBtn: $("#enterUploadBtn"),
   welcomeNotebookBtn: $("#welcomeNotebookBtn"),
   notebookCount: $("#notebookCount"),
+  reviewCount: $("#reviewCount"),
   dropZone: $("#dropZone"),
   imageInput: $("#imageInput"),
   previewPanel: $("#previewPanel"),
@@ -104,7 +109,11 @@ const dom = {
   newUploadBtn: $("#newUploadBtn"),
   notebookList: $("#notebookList"),
   notebookDetail: $("#notebookDetail"),
-  reviewReminder: $("#reviewReminder")
+  reviewReminder: $("#reviewReminder"),
+  reviewPageState: $("#reviewPageState"),
+  reminderCenter: $("#reminderCenter"),
+  dueReviewList: $("#dueReviewList"),
+  reviewPlan: $("#reviewPlan")
 };
 
 let ctx = dom.canvas.getContext("2d");
@@ -143,12 +152,20 @@ const LIAN_VOICE_RATE = 0.92;
 const LIAN_VOICE_PITCH = 1.01;
 const LIAN_VOICE_VOLUME = 0.82;
 const ACTIVE_HELP_PATTERN = /为什么|不懂|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下|怎么(?:来|来的|求|算|做|解|得到|列|消元|化简)|如何(?:求|算|做|解|得到|列|消元|化简)|该(?:怎么|如何)|能不能(?:提示|讲|告诉)|可以怎么/;
+const EXPLICIT_STUCK_PATTERN = /不会(?:了|做|算|求|解|列|写|弄|往下|继续|下一步)|不太会|不懂|没(?:有)?思路|不知道(?:了|该|要|怎么|咋|从哪|下一步|往下)|卡住|卡在|看不懂|没看懂|做不下去|不会$/;
 
 function isDirectHelpRequest(text) {
   const normalized = String(text || "").replace(/\s/g, "");
   if (!normalized) return false;
-  if (ACTIVE_HELP_PATTERN.test(normalized)) return true;
+  if (EXPLICIT_STUCK_PATTERN.test(normalized) || ACTIVE_HELP_PATTERN.test(normalized)) return true;
   return /(?:吗|呢|怎么办|是什么|是多少|对不对|行不行)[？?]?$/.test(normalized);
+}
+
+function isImmediateStuckRequest(text) {
+  const normalized = String(text || "").replace(/\s/g, "");
+  if (!normalized) return false;
+  if (/不会(?:是|等于|为|成|得到)/.test(normalized)) return false;
+  return EXPLICIT_STUCK_PATTERN.test(normalized);
 }
 
 const state = {
@@ -197,6 +214,8 @@ const state = {
   speechDraftText: "",
   speechDraftBase: "",
   speechNoResultTimer: null,
+  lastImmediateHelpAt: 0,
+  lastImmediateHelpText: "",
   transcriptCorrectionRequestId: 0,
   awaitingFinalAnswer: false,
   pendingFinalAnswerText: "",
@@ -224,6 +243,8 @@ const state = {
   lianVoiceIdentity: "",
   lianVoiceSelectionLocked: false,
   lianSpeechRequestId: 0,
+  lianSpeechPausedRecognition: false,
+  lianSpeechKeepAliveTimer: null,
   micPermissionGranted: false,
   micPermissionPending: false,
   silenceTimer: null,
@@ -331,6 +352,7 @@ function shiftTeachSessionTimes(pausedFor) {
     "lastUserInputAt",
     "lastEncourageAt",
     "lastThoughtReviewAt",
+    "lastImmediateHelpAt",
     "lastIssueAt",
     "silenceCareAskedAt"
   ].forEach((key) => {
@@ -411,6 +433,7 @@ function showView(viewId) {
   Object.entries(views).forEach(([id, view]) => view.classList.toggle("active", id === viewId));
   dom.navBtns.forEach((button) => button.classList.toggle("active", button.dataset.view === viewId));
   if (viewId === "notebookView") renderNotebook();
+  if (viewId === "reviewView") renderReviewPage();
   if (viewId === "teachView") {
     requestAnimationFrame(() => {
       resizeBoardCanvas();
@@ -445,10 +468,13 @@ function loadNotebook() {
 function saveNotebook() {
   localStorage.setItem("lian-notebook", JSON.stringify(state.notebook));
   updateNotebookCount();
+  if (views.reviewView?.classList.contains("active")) renderReviewPage();
 }
 
 function updateNotebookCount() {
   dom.notebookCount.textContent = String(state.notebook.length);
+  const dueCount = getReviewBuckets(state.notebook).due.length;
+  if (dom.reviewCount) dom.reviewCount.textContent = String(dueCount);
 }
 
 function guideIdleText() {
@@ -496,10 +522,45 @@ function interruptGuideForStudentSpeech() {
   state.pendingThoughtTimer = null;
   state.activeGuideRequestId += 1;
   state.lianSpeechRequestId += 1;
+  state.lianSpeechPausedRecognition = false;
+  clearInterval(state.lianSpeechKeepAliveTimer);
+  state.lianSpeechKeepAliveTimer = null;
   if ("speechSynthesis" in window) window.speechSynthesis.cancel();
   dom.lianAvatar.classList.remove("speaking");
   dom.lianAvatar.classList.add("listening");
   dom.lianState.textContent = "安静听你讲";
+}
+
+function pauseRecognitionForLianSpeech() {
+  if (!state.isListening || !state.speechRecognition || state.teachSessionPaused) return false;
+  state.lianSpeechPausedRecognition = true;
+  stopSpeechNoResultTimer();
+  clearSpeechDraft();
+  try {
+    state.speechRecognition.stop();
+  } catch {
+    // The browser may already be between recognition sessions.
+  }
+  dom.studentAvatar.classList.remove("speaking");
+  dom.studentState.textContent = "听恋恋说";
+  return true;
+}
+
+function resumeRecognitionAfterLianSpeech() {
+  if (!state.lianSpeechPausedRecognition) return;
+  state.lianSpeechPausedRecognition = false;
+  if (!state.isListening || state.teachSessionPaused || !state.speechRecognition) return;
+  clearTimeout(state.recognitionResumeTimer);
+  state.recognitionResumeTimer = setTimeout(() => {
+    if (!state.isListening || state.teachSessionPaused || state.lianSpeechPausedRecognition) return;
+    try {
+      state.speechRecognition.start();
+      dom.studentState.textContent = "正在收听";
+      startSpeechNoResultTimer();
+    } catch {
+      dom.studentState.textContent = "正在收听";
+    }
+  }, 180);
 }
 
 function clearIssueSilenceTimer() {
@@ -1732,7 +1793,13 @@ function applyBoardHeight(question = currentPageQuestion()) {
 
 function resizeBoardCanvas(options = {}) {
   const previousRect = dom.canvas.getBoundingClientRect();
-  const rect = dom.blackboard.getBoundingClientRect();
+  const boardRect = dom.blackboard.getBoundingClientRect();
+  const rect = previousRect.width && previousRect.height
+    ? previousRect
+    : {
+        width: dom.blackboard.clientWidth || boardRect.width,
+        height: dom.blackboard.clientHeight || boardRect.height
+      };
   if (!rect.width || !rect.height) return;
   const ratio = window.devicePixelRatio || 1;
   const nextPixelWidth = Math.round(rect.width * ratio);
@@ -1776,7 +1843,7 @@ function resizeBoardCanvas(options = {}) {
 
 function scheduleBoardCanvasResize() {
   if (!views.teachView.classList.contains("active")) return;
-  if (state.drawing || state.imageDragging) return;
+  if (state.drawing || state.imageDragging || state.tool === "moveImage") return;
   cancelAnimationFrame(state.boardResizeRaf);
   state.boardResizeRaf = requestAnimationFrame(() => {
     saveCurrentPage();
@@ -2002,9 +2069,9 @@ function imageRatioForQuestion(question) {
 function ensureBoardImageState(question, reset = false) {
   if (!question) return null;
   const rect = dom.blackboard.getBoundingClientRect();
-  const hasMeasuredBoard = Boolean(rect.width);
-  const boardWidth = rect.width || 900;
-  const boardHeight = rect.height || 560;
+  const hasMeasuredBoard = Boolean(dom.blackboard.clientWidth || rect.width);
+  const boardWidth = dom.blackboard.clientWidth || rect.width || 900;
+  const boardHeight = dom.blackboard.clientHeight || rect.height || 560;
   const imageRatio = imageRatioForQuestion(question);
   const preferredWidth = boardWidth * (question.captureMode === "manual-capture" ? 0.76 : 0.7);
   const maxWidthByHeight = (boardHeight - 48) / imageRatio;
@@ -2050,8 +2117,8 @@ function currentBoardImageBox() {
 function clampBoardImageState(imageState) {
   if (!imageState) return;
   const rect = dom.blackboard.getBoundingClientRect();
-  const boardWidth = rect.width || 900;
-  const boardHeight = rect.height || 560;
+  const boardWidth = dom.blackboard.clientWidth || rect.width || 900;
+  const boardHeight = dom.blackboard.clientHeight || rect.height || 560;
   const visible = 72;
   const renderedWidth = imageState.baseWidth * imageState.scale;
   const renderedHeight = imageState.baseHeight * imageState.scale;
@@ -2086,7 +2153,7 @@ function zoomBoardImage(factor, anchor = null) {
   if (!imageState) return;
   const oldScale = imageState.scale;
   const nextScale = Math.min(3.5, Math.max(0.45, oldScale * factor));
-  const boardRect = dom.blackboard.getBoundingClientRect();
+  const boardRect = dom.canvas.getBoundingClientRect();
   const zoomAnchor = anchor || {
     x: imageState.x + (imageState.baseWidth * oldScale) / 2,
     y: imageState.y + (imageState.baseHeight * oldScale) / 2
@@ -3011,11 +3078,13 @@ function getSpeechRecognition() {
 
   recognition.onsoundstart = () => {
     if (state.teachSessionPaused) return;
+    if (state.lianSpeechPausedRecognition || state.currentLianUtterance) return;
     dom.studentState.textContent = "听到声音";
   };
 
   recognition.onspeechstart = () => {
     if (state.teachSessionPaused) return;
+    if (state.lianSpeechPausedRecognition || state.currentLianUtterance) return;
     clearTimeout(state.recognitionTimer);
     interruptGuideForStudentSpeech();
     dom.studentAvatar.classList.add("speaking");
@@ -3024,6 +3093,7 @@ function getSpeechRecognition() {
 
   recognition.onresult = (event) => {
     if (state.teachSessionPaused) return;
+    if (state.lianSpeechPausedRecognition || state.currentLianUtterance) return;
     let finalText = "";
     let interimText = "";
     for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -3041,6 +3111,7 @@ function getSpeechRecognition() {
       dom.studentAvatar.classList.add("speaking");
       dom.studentState.textContent = "正在讲题";
       showSpeechDraft(interimText);
+      tryHandleImmediateStuckSpeech(interimText);
     }
     if (finalText) {
       void handleRecognizedSpeech(finalText);
@@ -3099,6 +3170,11 @@ function getSpeechRecognition() {
 
   recognition.onend = () => {
     stopSpeechNoResultTimer();
+    if (state.lianSpeechPausedRecognition) {
+      dom.studentAvatar.classList.remove("speaking");
+      dom.studentState.textContent = "听恋恋说";
+      return;
+    }
     if (state.ignoreNextRecognitionEnd) {
       state.ignoreNextRecognitionEnd = false;
       state.isListening = false;
@@ -3264,14 +3340,75 @@ function clearSpeechDraft() {
 
 function normalizeMathSpeechText(text) {
   let normalized = normalizeQuestionAwareSpeechText(cleanSpeechText(text));
-  if (!/等于|方程|等式|比例|比值|未知数|关系式|列式|结果|答案|x|y|m|n/i.test(normalized)) return normalized;
+  normalized = normalizeSpokenMathSymbols(normalized);
+  if (!/等于|方程|等式|比例|比值|未知数|关系式|列式|结果|答案|x|y|m|n|[+\-*/=＝×÷]/i.test(normalized)) return normalized;
 
   normalized = normalized
     .replace(/爱克斯|埃克斯|艾克斯/g, "x")
     .replace(/歪(?=等于|加|减|乘|除|的值|是|为|得|关系)/g, "y")
     .replace(/嗯(?=等于|加|减|乘|除|的值|是|为|得)/g, "m")
     .replace(/恩(?=等于|加|减|乘|除|的值|是|为|得)/g, "n");
-  return normalizeQuestionAwareSpeechText(normalized).replace(/\s+/g, " ").trim();
+  return normalizeSpokenMathSymbols(normalizeQuestionAwareSpeechText(normalized)).replace(/\s+/g, " ").trim();
+}
+
+function spokenChineseNumberToArabic(value) {
+  const text = String(value || "");
+  const digits = {
+    零: 0,
+    〇: 0,
+    一: 1,
+    幺: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9
+  };
+  if (Object.hasOwn(digits, text)) return String(digits[text]);
+  if (text === "十") return "10";
+  const teen = /^十([一二两三四五六七八九])$/.exec(text);
+  if (teen) return String(10 + digits[teen[1]]);
+  const tens = /^([一二两三四五六七八九])十([一二两三四五六七八九])?$/.exec(text);
+  if (tens) return String(digits[tens[1]] * 10 + (tens[2] ? digits[tens[2]] : 0));
+  return text;
+}
+
+function normalizeSpokenMathSymbols(text) {
+  let value = String(text || "").normalize("NFKC");
+  if (!value) return "";
+
+  value = value
+    .replace(/[−﹣－]/g, "-")
+    .replace(/[×✕]/g, "×")
+    .replace(/爱克斯|埃克斯|艾克斯/gi, "x")
+    .replace(/\bX\b/g, "x")
+    .replace(/\bY\b/g, "y")
+    .replace(/\bM\b/g, "m")
+    .replace(/\bN\b/g, "n")
+    .replace(/([0-9一二两三四五六七八九十零〇幺])\s*[xX]/g, (_, number) => `${spokenChineseNumberToArabic(number)}x`)
+    .replace(/([0-9一二两三四五六七八九十零〇幺])\s*[yY]/g, (_, number) => `${spokenChineseNumberToArabic(number)}y`)
+    .replace(/([0-9一二两三四五六七八九十零〇幺])\s*[mM]/g, (_, number) => `${spokenChineseNumberToArabic(number)}m`)
+    .replace(/([0-9一二两三四五六七八九十零〇幺])\s*[nN]/g, (_, number) => `${spokenChineseNumberToArabic(number)}n`);
+
+  value = value
+    .replace(/负\s*([一二两三四五六七八九十零〇幺]|\d+(?:\.\d+)?)/g, (_, number) => `-${spokenChineseNumberToArabic(number)}`)
+    .replace(/([xymnXYMN]|\d+(?:\.\d+)?)\s*(?:加上|加)\s*([xymnXYMN]|\d+(?:\.\d+)?)/g, "$1 + $2")
+    .replace(/([xymnXYMN]|\d+(?:\.\d+)?)\s*(?:减去|减)\s*([xymnXYMN]|\d+(?:\.\d+)?)/g, "$1 - $2")
+    .replace(/([xymnXYMN]|\d+(?:\.\d+)?)\s*(?:乘以|乘)\s*([xymnXYMN]|\d+(?:\.\d+)?)/g, "$1×$2")
+    .replace(/([xymnXYMN]|\d+(?:\.\d+)?)\s*(?:除以|除)\s*([xymnXYMN]|\d+(?:\.\d+)?)/g, "$1÷$2")
+    .replace(/([xymnXYMN]|\d+(?:\.\d+)?|\))\s*(?:等于|是|为)\s*(-?[xymnXYMN]|-?\d+(?:\.\d+)?)/g, "$1 = $2")
+    .replace(/([xymnXYMN])\s*(?:的值)?\s*(?:等于|是|为)\s*(-?\d+(?:\.\d+)?)/g, "$1 = $2")
+    .replace(/等于\s*(-?\d+(?:\.\d+)?|[xymnXYMN])/g, "= $1")
+    .replace(/\s*([+\-=＝])\s*/g, " $1 ")
+    .replace(/＝/g, "=")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return value;
 }
 
 function normalizeQuestionAwareSpeechText(text) {
@@ -3314,6 +3451,7 @@ async function correctLatestTranscript(text, options = {}) {
   const question = currentPageQuestion();
   if (!question || text.length < 4) return text;
   const requestId = ++state.transcriptCorrectionRequestId;
+  const boardImage = options.boardImage ?? (hasCurrentBoardInk(question) ? getBoardImageForGuide() : "");
 
   try {
     const response = await fetch("/api/transcript-correct", {
@@ -3322,8 +3460,12 @@ async function correctLatestTranscript(text, options = {}) {
       body: JSON.stringify({
         questionImage: question.image,
         text,
+        rawAsrText: options.rawAsrText || text,
+        localNormalizedText: options.localNormalizedText || text,
         problemText: question.problemText || question.title || "",
         knowledgePoints: question.knowledgePoints || [],
+        latestHandwritingResult: state.latestHandwritingResult || null,
+        boardImage,
         transcript: options.transcript || dom.transcriptInput.value.trim()
       })
     });
@@ -3359,29 +3501,74 @@ async function commitSpeechTextWithCorrection(text) {
 
 async function handleRecognizedSpeech(text) {
   clearSpeechDraft();
-  const immediateText = normalizeMathSpeechText(text);
+  const rawText = cleanSpeechText(text);
+  const immediateText = normalizeMathSpeechText(rawText);
   if (!immediateText) return;
+  if (wasImmediateHelpAlreadyHandled(immediateText)) {
+    if (compactSpeechForCompare(immediateText).length > compactSpeechForCompare(state.lastImmediateHelpText).length + 4) {
+      replaceLastTranscriptSegment(state.lastImmediateHelpText, immediateText);
+      state.lastImmediateHelpText = immediateText;
+    }
+    void correctLatestTranscript(immediateText, { rawAsrText: rawText, localNormalizedText: immediateText });
+    return;
+  }
   appendTranscript(immediateText);
 
   // Direct questions and explicit final answers must not wait for the optional
   // transcript-correction request.
   if (
+    isDirectHelpRequest(rawText) ||
     isDirectHelpRequest(immediateText) ||
     state.awaitingFinalAnswer ||
     isExplicitFinalAnswerStatement(immediateText) ||
     extractDirectFinalAnswerCandidate(immediateText)
   ) {
     handleStudentSpeech(immediateText);
-    void correctLatestTranscript(immediateText);
+    void correctLatestTranscript(immediateText, { rawAsrText: rawText, localNormalizedText: immediateText });
     return;
   }
 
-  const spokenText = await correctLatestTranscript(immediateText);
+  const spokenText = await correctLatestTranscript(immediateText, { rawAsrText: rawText, localNormalizedText: immediateText });
   if (spokenText) handleStudentSpeech(spokenText);
+}
+
+function compactSpeechForCompare(text) {
+  return String(text || "")
+    .replace(/\s/g, "")
+    .replace(/[，。！？,.!?、；;：:]/g, "")
+    .toLowerCase();
+}
+
+function wasImmediateHelpAlreadyHandled(text) {
+  const now = Date.now();
+  if (!state.lastImmediateHelpAt || now - state.lastImmediateHelpAt > 7000) return false;
+  const latest = compactSpeechForCompare(text);
+  const handled = compactSpeechForCompare(state.lastImmediateHelpText);
+  if (!latest || !handled) return false;
+  return latest.includes(handled) || handled.includes(latest);
+}
+
+function tryHandleImmediateStuckSpeech(text) {
+  if (state.teachSessionPaused || state.currentQuestionCompleted) return false;
+  const rawText = cleanSpeechText(text);
+  const immediateText = normalizeMathSpeechText(rawText);
+  if (!immediateText || (!isImmediateStuckRequest(rawText) && !isImmediateStuckRequest(immediateText))) return false;
+  if (wasImmediateHelpAlreadyHandled(immediateText)) return true;
+
+  clearSpeechDraft();
+  appendTranscript(immediateText);
+  state.lastImmediateHelpAt = Date.now();
+  state.lastImmediateHelpText = immediateText;
+  handleStudentSpeech(immediateText);
+  void correctLatestTranscript(immediateText, { rawAsrText: rawText, localNormalizedText: immediateText });
+  return true;
 }
 
 function cleanSpeechText(text) {
   return String(text || "")
+    .replace(/嗯(?=\s*(?:等于|加|减|乘|除|的值|是|为|得|等号|关系|方程))/g, "m")
+    .replace(/恩(?=\s*(?:等于|加|减|乘|除|的值|是|为|得|等号|关系|方程))/g, "n")
+    .replace(/歪(?=\s*(?:等于|加|减|乘|除|的值|是|为|得|等号|关系|方程))/g, "y")
     .replace(/[，,。！？!?；;：:]/g, " ")
     .replace(/^(呃+|额+|嗯+|啊+|哦+|唔+|呐+|那个|这个|就是|然后呢|对吧|是不是)+/g, "")
     .replace(/(^|\s)(呃+|额+|嗯+|啊+|哦+|唔+|呐+|那个|这个|就是|然后呢|对吧|是不是)(?=\s|$)/g, " ")
@@ -4256,6 +4443,29 @@ function prepareLianSpeechText(value) {
     .replace(/换行/g, "换杭");
 }
 
+function splitLianSpeechText(text) {
+  const value = String(text || "").replace(/\s+/g, " ").trim();
+  if (!value) return [];
+  const sentenceParts = value.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [value];
+  const chunks = [];
+  for (const part of sentenceParts) {
+    let current = part.trim();
+    while (current.length > 42) {
+      const cutAt = Math.max(
+        current.lastIndexOf("，", 42),
+        current.lastIndexOf(",", 42),
+        current.lastIndexOf("、", 42),
+        current.lastIndexOf(" ", 42)
+      );
+      const index = cutAt > 14 ? cutAt + 1 : 42;
+      chunks.push(current.slice(0, index).trim());
+      current = current.slice(index).trim();
+    }
+    if (current) chunks.push(current);
+  }
+  return chunks.filter(Boolean);
+}
+
 function lianSpeak(text, options = {}) {
   if (state.teachSessionPaused && options.allowWhilePaused !== true) return Promise.resolve(false);
   const now = Date.now();
@@ -4277,6 +4487,7 @@ function lianSpeak(text, options = {}) {
 
   if (options.trackQuestion !== false) rememberLianQuestion(text);
   const speechRequestId = ++state.lianSpeechRequestId;
+  const pausedRecognition = pauseRecognitionForLianSpeech();
 
   return new Promise((resolve) => {
     let finished = false;
@@ -4285,10 +4496,15 @@ function lianSpeak(text, options = {}) {
       if (finished) return;
       finished = true;
       if (fallbackTimer) clearTimeout(fallbackTimer);
-      state.currentLianUtterance = null;
-      dom.lianAvatar.classList.remove("speaking");
-      dom.lianAvatar.classList.add("listening");
-      dom.lianState.textContent = guideIdleText();
+      if (speechRequestId === state.lianSpeechRequestId) {
+        clearInterval(state.lianSpeechKeepAliveTimer);
+        state.lianSpeechKeepAliveTimer = null;
+        state.currentLianUtterance = null;
+        if (pausedRecognition) resumeRecognitionAfterLianSpeech();
+        dom.lianAvatar.classList.remove("speaking");
+        dom.lianAvatar.classList.add("listening");
+        dom.lianState.textContent = guideIdleText();
+      }
       resolve();
     };
 
@@ -4301,33 +4517,56 @@ function lianSpeak(text, options = {}) {
       try {
         refreshLianVoice();
         const speechText = prepareLianSpeechText(text);
-        const startSpeech = (voice, retried = false) => {
+        const chunks = splitLianSpeechText(speechText);
+        if (!chunks.length) {
+          finishSpeaking();
+          return;
+        }
+        const startSpeech = (voice, chunkIndex = 0, retried = false) => {
           if (finished || speechRequestId !== state.lianSpeechRequestId) {
             finishSpeaking();
             return;
           }
-          const utterance = new SpeechSynthesisUtterance(speechText);
+          if (chunkIndex >= chunks.length) {
+            finishSpeaking();
+            return;
+          }
+          const chunk = chunks[chunkIndex];
+          const utterance = new SpeechSynthesisUtterance(chunk);
           utterance.lang = "zh-CN";
           if (voice) utterance.voice = voice;
           utterance.rate = LIAN_VOICE_RATE;
           utterance.pitch = LIAN_VOICE_PITCH;
           utterance.volume = LIAN_VOICE_VOLUME;
-          utterance.onend = finishSpeaking;
+          utterance.onend = () => {
+            if (fallbackTimer) clearTimeout(fallbackTimer);
+            fallbackTimer = null;
+            startSpeech(voice, chunkIndex + 1, retried);
+          };
           utterance.onerror = (event) => {
             console.warn("Lian speech failed:", event?.error || event);
             if (!retried && voice) {
               window.speechSynthesis.cancel();
-              startSpeech(null, true);
+              startSpeech(null, chunkIndex, true);
               return;
             }
             finishSpeaking();
           };
           state.currentLianUtterance = utterance;
+          if (fallbackTimer) clearTimeout(fallbackTimer);
+          fallbackTimer = setTimeout(() => {
+            console.warn("Lian speech chunk timed out, continuing");
+            startSpeech(voice, chunkIndex + 1, retried);
+          }, Math.max(4200, 900 + chunk.length * 280));
           window.speechSynthesis.resume?.();
           window.speechSynthesis.speak(utterance);
           setTimeout(() => window.speechSynthesis.resume?.(), 80);
         };
-        fallbackTimer = setTimeout(finishSpeaking, Math.max(2400, 900 + text.length * 70));
+        clearInterval(state.lianSpeechKeepAliveTimer);
+        state.lianSpeechKeepAliveTimer = setInterval(() => {
+          if (finished || speechRequestId !== state.lianSpeechRequestId) return;
+          window.speechSynthesis.resume?.();
+        }, 1200);
         startSpeech(getLianVoice());
       } catch (error) {
         console.warn("Lian speech fallback:", error);
@@ -4646,12 +4885,106 @@ function getNotebookLectureText() {
   return dom.transcriptInput.value.trim();
 }
 
+function buildLianArchiveSummary(question, lectureText) {
+  const title = String(question?.title || "这道题").trim();
+  const knowledge = String(question?.knowledge || question?.type || "").trim();
+  const hasLecture = Boolean(String(lectureText || "").trim());
+  if (knowledge) {
+    return `${title}的关键是围绕“${knowledge}”把题目条件、关键关系式和最后结论讲清楚。${hasLecture ? "本次已经保存了你的讲解文字，复习时可以先遮住提示再复讲一遍。" : "复习时重点重新说出条件和关键步骤。"}`;
+  }
+  return `${title}已经完成整理。复习时先回忆题目给出的条件，再把关键式子和最后答案用自己的话讲一遍。`;
+}
+
+function buildMistakePoints(question, lectureText) {
+  const text = `${question?.problemText || ""} ${lectureText || ""}`;
+  const points = [];
+  if (/[-−]|负|正负|移项/.test(text)) points.push("注意符号变化，尤其是移项、相减和代入后的正负号。");
+  if (/[：:]|比例|分之|\/|比/.test(text)) points.push("注意比例关系的顺序，要按题目给出的对应关系列式。");
+  if (/度|°|圆|面积|体积|单位|cm|米|千米|m\b/i.test(text)) points.push("注意单位和公式含义，最后结果要带上合适单位。");
+  if (/方程|x|y|m|n|代入|消元/i.test(text)) points.push("注意把未知数、方程关系和代入验证过程说完整。");
+  if (!points.length) points.push("容易只记住最后答案，复习时要重新讲出题目条件和关键步骤。");
+  return points.slice(0, 3);
+}
+
+async function requestArchiveSummary(question, lectureText, boardImage) {
+  const response = await fetch("/api/archive-summary", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      questionImage: question.image,
+      boardImage,
+      questionTitle: question.title || "",
+      problemText: question.problemText || "",
+      knowledgePoints: question.knowledgePoints || [],
+      lectureText,
+      verifiedFinalAnswer: state.verifiedFinalAnswerText || "",
+      latestHandwritingResult: state.latestHandwritingResult || null
+    })
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || "错题总结生成失败");
+
+  const observedWrongTrace = String(result.observedWrongTrace || "").trim();
+  const mistakePoints = Array.isArray(result.mistakePoints)
+    ? result.mistakePoints.map((point) => String(point || "").trim()).filter(Boolean)
+    : [];
+  if (observedWrongTrace && !mistakePoints.some((point) => point.includes(observedWrongTrace.slice(0, 8)))) {
+    mistakePoints.unshift(`题图中的原错痕迹：${observedWrongTrace}`);
+  }
+
+  return {
+    lianSummary: String(result.lianSummary || "").trim(),
+    mistakePoints: mistakePoints.slice(0, 4),
+    observedWrongTrace,
+    reviewFocus: String(result.reviewFocus || "").trim(),
+    archiveProvider: result.provider || "",
+    archiveModel: result.model || "",
+    archiveConfidence: Number(result.confidence) || 0
+  };
+}
+
+function buildReviewPlan(fromDate = new Date()) {
+  const offsets = [
+    { label: "今天", hours: 4 },
+    { label: "1天后", days: 1 },
+    { label: "3天后", days: 3 },
+    { label: "7天后", days: 7 }
+  ];
+  return offsets.map((item) => {
+    const date = new Date(fromDate);
+    if (item.hours) date.setHours(date.getHours() + item.hours);
+    if (item.days) date.setDate(date.getDate() + item.days);
+    return {
+      label: item.label,
+      at: date.toISOString(),
+      done: false
+    };
+  });
+}
+
 async function buildNotebookRecord(question) {
   const pages = pagesForQuestion(question.id);
   const strokeImages = await compactStrokePages(pages);
   const lectureText = getNotebookLectureText();
   const now = new Date();
   const reviewAt = new Date(now.getTime() + 4 * 60 * 60 * 1000);
+  const boardImage = getBoardImageForGuide();
+  let archiveSummary = {
+    lianSummary: buildLianArchiveSummary(question, lectureText),
+    mistakePoints: buildMistakePoints(question, lectureText),
+    observedWrongTrace: "",
+    reviewFocus: "",
+    archiveProvider: "local-fallback",
+    archiveModel: "",
+    archiveConfidence: 0
+  };
+  try {
+    const generated = await requestArchiveSummary(question, lectureText, boardImage);
+    if (generated.lianSummary && generated.mistakePoints.length) archiveSummary = generated;
+  } catch (error) {
+    console.warn("Archive summary fallback:", error);
+  }
+  const reviewPlan = buildReviewPlan(now);
 
   return {
     id: safeNowId("note"),
@@ -4661,6 +4994,14 @@ async function buildNotebookRecord(question) {
     strokeImages,
     lectureText,
     transcript: lectureText,
+    lianSummary: archiveSummary.lianSummary,
+    mistakePoints: archiveSummary.mistakePoints,
+    observedWrongTrace: archiveSummary.observedWrongTrace,
+    reviewFocus: archiveSummary.reviewFocus,
+    archiveProvider: archiveSummary.archiveProvider,
+    archiveModel: archiveSummary.archiveModel,
+    archiveConfidence: archiveSummary.archiveConfidence,
+    reviewPlan,
     reviewAt: reviewAt.toISOString(),
     status: "还要复习",
     createdAt: now.toISOString()
@@ -4748,11 +5089,13 @@ function getStrokeInkBounds(context, width, height) {
 function getSnapshotImageState(questionId) {
   const imageState = state.boardImageStates[questionId];
   const rect = dom.blackboard.getBoundingClientRect();
-  if (!imageState || !rect.width || !rect.height) return null;
+  const boardWidth = dom.blackboard.clientWidth || rect.width;
+  const boardHeight = dom.blackboard.clientHeight || rect.height;
+  if (!imageState || !boardWidth || !boardHeight) return null;
   return {
     ...imageState,
-    boardWidth: rect.width,
-    boardHeight: rect.height
+    boardWidth,
+    boardHeight
   };
 }
 
@@ -4824,6 +5167,131 @@ function renderCompletion() {
 dom.openNotebookBtn.addEventListener("click", () => showView("notebookView"));
 dom.newUploadBtn.addEventListener("click", () => showView("uploadView"));
 
+function isRecordMastered(record) {
+  return /已掌握/.test(String(record?.status || ""));
+}
+
+function getReviewDate(record) {
+  const date = new Date(record?.reviewAt || record?.createdAt || Date.now());
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+function getReviewBuckets(records = []) {
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayEnd = new Date(todayStart);
+  todayEnd.setDate(todayEnd.getDate() + 1);
+  const upcomingEnd = new Date(now);
+  upcomingEnd.setDate(upcomingEnd.getDate() + 3);
+
+  const active = records.filter((record) => !isRecordMastered(record));
+  const overdue = active.filter((record) => getReviewDate(record) < todayStart);
+  const today = active.filter((record) => {
+    const reviewDate = getReviewDate(record);
+    return reviewDate >= todayStart && reviewDate < todayEnd;
+  });
+  const upcoming = active.filter((record) => {
+    const reviewDate = getReviewDate(record);
+    return reviewDate >= todayEnd && reviewDate <= upcomingEnd;
+  });
+  const due = active.filter((record) => getReviewDate(record) <= todayEnd);
+  return { active, overdue, today, upcoming, due };
+}
+
+function renderReviewPage() {
+  updateNotebookCount();
+  if (!dom.reminderCenter || !dom.dueReviewList || !dom.reviewPlan) return;
+
+  if (!state.notebook.length) {
+    const empty = '<div class="empty-review">讲解并保存错题后，这里会生成复习提醒。</div>';
+    dom.reviewPageState.textContent = "暂无需要复习的错题";
+    dom.reminderCenter.innerHTML = empty;
+    dom.dueReviewList.innerHTML = empty;
+    dom.reviewPlan.innerHTML = empty;
+    return;
+  }
+
+  const buckets = getReviewBuckets(state.notebook);
+  dom.reviewPageState.textContent = `当前 ${buckets.due.length} 道到期，${buckets.upcoming.length} 道即将复习`;
+
+  dom.reminderCenter.innerHTML = `
+    <div class="reminder-stats">
+      <article><strong>${buckets.today.length}</strong><span>今日到期</span></article>
+      <article><strong>${buckets.upcoming.length}</strong><span>即将到期</span></article>
+      <article><strong>${buckets.overdue.length}</strong><span>已逾期</span></article>
+    </div>
+    ${renderReviewMiniList([...buckets.overdue, ...buckets.today].slice(0, 4), "今天可以先复习这些")}
+  `;
+
+  const waiting = [...state.notebook]
+    .filter((record) => !isRecordMastered(record))
+    .sort((a, b) => getReviewDate(a) - getReviewDate(b));
+  dom.dueReviewList.innerHTML = waiting.length
+    ? waiting.map(renderReviewListItem).join("")
+    : '<div class="empty-review">暂时没有待复习错题。</div>';
+
+  dom.reviewPlan.innerHTML = state.notebook
+    .slice(0, 8)
+    .map(renderReviewPlanItem)
+    .join("");
+
+  $$(".review-open-note", dom.reviewPageState.closest(".review-page")).forEach((button) => {
+    button.addEventListener("click", () => {
+      state.activeNotebookId = button.dataset.noteId;
+      showView("notebookView");
+    });
+  });
+}
+
+function renderReviewMiniList(records, emptyText) {
+  if (!records.length) return `<div class="empty-review">${escapeHTML(emptyText)}</div>`;
+  return records
+    .map(
+      (record) => `
+        <button class="review-mini review-open-note" data-note-id="${record.id}" type="button">
+          <span>${escapeHTML(record.title)}</span>
+          <strong>${formatDate(record.reviewAt)}</strong>
+        </button>
+      `
+    )
+    .join("");
+}
+
+function renderReviewListItem(record) {
+  return `
+    <article class="review-list-item">
+      <img src="${record.questionImage}" alt="${escapeHTML(record.title)}" />
+      <div>
+        <strong>${escapeHTML(record.title)}</strong>
+        <span>${escapeHTML(record.status || "还要复习")} · ${formatDate(record.reviewAt)}</span>
+        <p>${escapeHTML(getRecordLianSummary(record))}</p>
+      </div>
+      <button class="text-btn review-open-note" data-note-id="${record.id}" type="button">查看</button>
+    </article>
+  `;
+}
+
+function renderReviewPlanItem(record) {
+  const plan = getRecordReviewPlan(record);
+  return `
+    <article class="review-plan-item">
+      <strong>${escapeHTML(record.title)}</strong>
+      <div class="plan-steps">
+        ${plan
+          .map(
+            (step) => `
+              <span class="${step.done ? "done" : ""}">
+                ${escapeHTML(step.label || "复习")} · ${formatDate(step.at)}
+              </span>
+            `
+          )
+          .join("")}
+      </div>
+    </article>
+  `;
+}
+
 function renderNotebook() {
   updateNotebookCount();
   if (!state.notebook.length) {
@@ -4878,9 +5346,14 @@ function renderNotebookDetail(record) {
   const strokeImages = getRecordStrokeImages(record);
   const firstStroke = strokeImages[0] || "";
   const lectureText = getRecordLectureText(record);
+  const lianSummary = getRecordLianSummary(record);
+  const mistakePoints = getRecordMistakePoints(record);
   const lectureTextBlock = lectureText
     ? `<p>讲解文字：${escapeHTML(lectureText)}</p>`
     : "<p>讲解文字：这次没有保存文字讲解。</p>";
+  const mistakePointBlock = mistakePoints.length
+    ? `<ul class="mistake-points">${mistakePoints.map((point) => `<li>${escapeHTML(point)}</li>`).join("")}</ul>`
+    : '<p class="muted-line">暂未整理易错点。</p>';
   const strokeBlock = firstStroke
     ? `<img src="${firstStroke}" alt="黑板笔迹内容" />`
     : '<div class="empty-detail">这次没有保存笔迹。</div>';
@@ -4895,6 +5368,14 @@ function renderNotebookDetail(record) {
           <div class="detail-meta">轻量保存 · ${formatDate(record.createdAt)}</div>
         </div>
         ${lectureTextBlock}
+        <section class="detail-note-block">
+          <h4>恋恋总结</h4>
+          <p>${escapeHTML(lianSummary)}</p>
+        </section>
+        <section class="detail-note-block">
+          <h4>易错点</h4>
+          ${mistakePointBlock}
+        </section>
         <p>复习提醒：${formatDate(record.reviewAt)} · ${escapeHTML(record.status)}</p>
       </div>
     </div>
@@ -4944,6 +5425,40 @@ function getRecordStrokeImages(record) {
 
 function getRecordLectureText(record) {
   return (record.lectureText || record.transcript || "").trim();
+}
+
+function getRecordLianSummary(record) {
+  const saved = String(record?.lianSummary || record?.aiSummary || "").trim();
+  if (saved) return saved;
+  return buildLianArchiveSummary(
+    {
+      title: record?.title || "这道错题",
+      knowledge: record?.knowledge || ""
+    },
+    getRecordLectureText(record)
+  );
+}
+
+function getRecordMistakePoints(record) {
+  const points = record?.mistakePoints || record?.easyMistakes || [];
+  const observedWrongTrace = String(record?.observedWrongTrace || "").trim();
+  if (Array.isArray(points) && points.length) {
+    const normalized = points.map((point) => String(point).trim()).filter(Boolean);
+    if (observedWrongTrace && !normalized.some((point) => point.includes(observedWrongTrace.slice(0, 8)))) {
+      normalized.unshift(`题图中的原错痕迹：${observedWrongTrace}`);
+    }
+    return normalized.slice(0, 4);
+  }
+  const text = getRecordLectureText(record);
+  const fallback = buildMistakePoints({ title: record?.title || "", problemText: "" }, text);
+  if (observedWrongTrace) fallback.unshift(`题图中的原错痕迹：${observedWrongTrace}`);
+  return fallback.slice(0, 4);
+}
+
+function getRecordReviewPlan(record) {
+  if (Array.isArray(record?.reviewPlan) && record.reviewPlan.length) return record.reviewPlan;
+  const createdAt = Number.isNaN(new Date(record?.createdAt).getTime()) ? new Date() : new Date(record.createdAt);
+  return buildReviewPlan(createdAt);
 }
 
 function updateRecordStatus(id, status) {

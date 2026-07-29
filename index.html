@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>恋恋错题本</title>
-    <link rel="stylesheet" href="styles.css?v=20260725-55" />
+    <link rel="stylesheet" href="styles.css?v=20260728-01" />
   </head>
   <body>
     <div class="app-shell">
@@ -29,6 +29,11 @@
             <span class="nav-icon" data-icon="book"></span>
             错题本
             <span class="badge" id="notebookCount">0</span>
+          </button>
+          <button class="nav-btn" data-view="reviewView">
+            <span class="nav-icon" data-icon="calendar"></span>
+            复习
+            <span class="badge" id="reviewCount">0</span>
           </button>
         </nav>
       </header>
@@ -325,6 +330,39 @@
             </section>
           </div>
         </section>
+        <section class="view" id="reviewView" aria-labelledby="reviewTitle">
+          <div class="review-page">
+            <div class="section-heading">
+              <div>
+                <h2 id="reviewTitle">复习页</h2>
+                <p id="reviewPageState">把已经整理好的错题按节奏复习</p>
+              </div>
+            </div>
+            <div class="review-dashboard">
+              <section class="review-panel" aria-labelledby="reminderCenterTitle">
+                <div class="review-panel-title">
+                  <span data-icon="bell"></span>
+                  <h3 id="reminderCenterTitle">提醒中心</h3>
+                </div>
+                <div class="review-panel-body" id="reminderCenter"></div>
+              </section>
+              <section class="review-panel" aria-labelledby="dueReviewTitle">
+                <div class="review-panel-title">
+                  <span data-icon="list"></span>
+                  <h3 id="dueReviewTitle">待复习列表</h3>
+                </div>
+                <div class="review-panel-body" id="dueReviewList"></div>
+              </section>
+              <section class="review-panel" aria-labelledby="reviewPlanTitle">
+                <div class="review-panel-title">
+                  <span data-icon="calendar"></span>
+                  <h3 id="reviewPlanTitle">复习计划</h3>
+                </div>
+                <div class="review-panel-body" id="reviewPlan"></div>
+              </section>
+            </div>
+          </div>
+        </section>
       </main>
     </div>
 
@@ -351,6 +389,6 @@
       </article>
     </template>
 
-    <script src="app.js?v=20260725-65"></script>
+    <script src="app.js?v=20260728-01"></script>
   </body>
 </html>
