@@ -74,6 +74,10 @@ const dom = {
   selectedHint: $("#selectedHint"),
   clearSelectionBtn: $("#clearSelectionBtn"),
   startLectureBtn: $("#startLectureBtn"),
+  previewPrevImageBtn: $("#previewPrevImageBtn"),
+  previewNextImageBtn: $("#previewNextImageBtn"),
+  questionsPrevImageBtn: $("#questionsPrevImageBtn"),
+  questionsNextImageBtn: $("#questionsNextImageBtn"),
   replaceImageBtn: $("#replaceImageBtn"),
   clearImageBtn: $("#clearImageBtn"),
   lectureProgress: $("#lectureProgress"),
@@ -170,6 +174,8 @@ function isImmediateStuckRequest(text) {
 
 const state = {
   source: null,
+  sources: [],
+  activeSourceIndex: 0,
   segmentDebug: null,
   segmentTiming: null,
   questions: [],
@@ -211,6 +217,16 @@ const state = {
   lastHandwritingUnclearAt: 0,
   lastHandwritingUnclearKey: "",
   speechRecognition: null,
+  cloudSpeechConfig: null,
+  cloudAsrActive: false,
+  cloudAsrStream: null,
+  cloudAsrAudioContext: null,
+  cloudAsrSource: null,
+  cloudAsrProcessor: null,
+  cloudAsrBuffers: [],
+  cloudAsrSampleRate: 16000,
+  cloudAsrFlushTimer: null,
+  cloudAsrRequestInFlight: false,
   speechDraftText: "",
   speechDraftBase: "",
   speechNoResultTimer: null,
@@ -226,6 +242,8 @@ const state = {
   autoSavePromptedQuestionId: "",
   finalAnswerRequestId: 0,
   answerKeyStatusByQuestion: {},
+  answerKeysByQuestion: {},
+  answerKeyFetchPromises: {},
   answerKeyPrefetchQueue: [],
   answerKeyPrefetchQueuedIds: new Set(),
   answerKeyPrefetchActive: 0,
@@ -240,6 +258,9 @@ const state = {
   isMuted: false,
   lianVoice: null,
   currentLianUtterance: null,
+  lianAudioElement: null,
+  lianAudioUnlocked: false,
+  lianAudioUnlockPromise: null,
   lianVoiceIdentity: "",
   lianVoiceSelectionLocked: false,
   lianSpeechRequestId: 0,
@@ -505,7 +526,10 @@ function clearSilenceFollowup() {
 function markUserInput(type) {
   const now = Date.now();
   if (type === "speech") state.lastSpeechAt = now;
-  if (type === "board") state.lastBoardWriteAt = now;
+  if (type === "board") {
+    state.lastBoardWriteAt = now;
+    state.currentQuestionCompleted = false;
+  }
   state.lastUserInputAt = now;
 
   if (state.awaitingSilenceFollowup) {
@@ -523,12 +547,67 @@ function interruptGuideForStudentSpeech() {
   state.activeGuideRequestId += 1;
   state.lianSpeechRequestId += 1;
   state.lianSpeechPausedRecognition = false;
-  clearInterval(state.lianSpeechKeepAliveTimer);
-  state.lianSpeechKeepAliveTimer = null;
-  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  stopLianSpeechOutput();
   dom.lianAvatar.classList.remove("speaking");
   dom.lianAvatar.classList.add("listening");
   dom.lianState.textContent = "安静听你讲";
+}
+
+function stopLianSpeechOutput() {
+  clearInterval(state.lianSpeechKeepAliveTimer);
+  state.lianSpeechKeepAliveTimer = null;
+  const utterance = state.currentLianUtterance;
+  if (utterance && typeof utterance.pause === "function") {
+    try {
+      utterance.pause();
+      utterance.removeAttribute?.("src");
+      utterance.load?.();
+    } catch {
+      // Audio may already be released.
+    }
+  }
+  state.currentLianUtterance = null;
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+}
+
+function getLianAudioElement() {
+  if (state.lianAudioElement) return state.lianAudioElement;
+  const audio = new Audio();
+  audio.preload = "auto";
+  audio.volume = LIAN_VOICE_VOLUME;
+  state.lianAudioElement = audio;
+  return audio;
+}
+
+function unlockLianAudio() {
+  if (state.lianAudioUnlocked || state.lianAudioUnlockPromise) return state.lianAudioUnlockPromise;
+  const audio = getLianAudioElement();
+  const silentWav =
+    "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAAAA";
+  audio.muted = true;
+  audio.src = silentWav;
+  state.lianAudioUnlockPromise = audio.play()
+    .then(() => {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.muted = false;
+      state.lianAudioUnlocked = true;
+      return true;
+    })
+    .catch((error) => {
+      console.warn("[tts] audio unlock failed:", error?.name || error);
+      state.lianAudioUnlockPromise = null;
+      return false;
+    });
+  return state.lianAudioUnlockPromise;
+}
+
+if (typeof document !== "undefined") {
+  const unlockFromUserGesture = () => {
+    void unlockLianAudio();
+  };
+  document.addEventListener("pointerdown", unlockFromUserGesture, { capture: true, passive: true });
+  document.addEventListener("keydown", unlockFromUserGesture, { capture: true, passive: true });
 }
 
 function pauseRecognitionForLianSpeech() {
@@ -671,62 +750,117 @@ dom.dropZone.addEventListener("dragleave", () => {
 dom.dropZone.addEventListener("drop", (event) => {
   event.preventDefault();
   dom.dropZone.classList.remove("dragging");
-  const file = event.dataTransfer.files?.[0];
-  if (file) handleImageFile(file);
+  const files = [...(event.dataTransfer.files || [])];
+  if (files.length) handleImageFiles(files);
 });
 
 dom.imageInput.addEventListener("change", (event) => {
-  const file = event.target.files?.[0];
-  if (file) handleImageFile(file);
+  const files = [...(event.target.files || [])];
+  if (files.length) handleImageFiles(files);
 });
 
 dom.replaceImageBtn.addEventListener("click", () => dom.imageInput.click());
 dom.clearImageBtn.addEventListener("click", resetUpload);
 
-function handleImageFile(file) {
-  if (!file.type.startsWith("image/")) {
+function readImageFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith("image/")) {
+      reject(new Error("请选择图片文件"));
+      return;
+    }
+    const uploadStartedAt = performance.now();
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const fileReadFinishedAt = performance.now();
+        const dataUrl = reader.result;
+        const imageDecodeStartedAt = performance.now();
+        const image = await loadImage(dataUrl);
+        const imageDecodedAt = performance.now();
+        resolve({
+          dataUrl,
+          width: image.naturalWidth,
+          height: image.naturalHeight,
+          name: file.name,
+          timing: {
+            uploadStartedAt,
+            fileReadMs: Math.round(fileReadFinishedAt - uploadStartedAt),
+            imageDecodeMs: Math.round(imageDecodedAt - imageDecodeStartedAt)
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
+    };
+    reader.onerror = () => reject(new Error("上传失败，请换一张图片"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handleImageFiles(files) {
+  const imageFiles = [...files].filter((file) => file?.type?.startsWith("image/"));
+  if (!imageFiles.length) {
     setStatus(dom.uploadState, "请选择图片文件");
     return;
   }
 
-  const uploadStartedAt = performance.now();
-  const reader = new FileReader();
-  setStatus(dom.uploadState, "上传中");
-  reader.onload = async () => {
-    const fileReadFinishedAt = performance.now();
-    const dataUrl = reader.result;
-    const imageDecodeStartedAt = performance.now();
-    const image = await loadImage(dataUrl);
-    const imageDecodedAt = performance.now();
-    state.segmentTiming = {
-      uploadStartedAt,
-      fileReadMs: Math.round(fileReadFinishedAt - uploadStartedAt),
-      imageDecodeMs: Math.round(imageDecodedAt - imageDecodeStartedAt)
-    };
-    state.source = {
-      dataUrl,
-      width: image.naturalWidth,
-      height: image.naturalHeight,
-      name: file.name
-    };
-    state.questions = [];
-    state.selectedIds = [];
-    state.segmentDebug = null;
-    renderQuestions();
-    dom.sourcePreview.src = dataUrl;
-    dom.previewPanel.classList.remove("hidden");
-    dom.dropZone.classList.add("hidden");
-    setStatus(dom.uploadState, "图片已上传");
-    setStatus(dom.segmentState, "可以自动分割，也可以手动框选");
-    setManualMode(false);
-    await runAutoSegment({ fromUpload: true });
-  };
-  reader.onerror = () => setStatus(dom.uploadState, "上传失败，请换一张图片");
-  reader.readAsDataURL(file);
+  setManualMode(false);
+  state.sources = [];
+  state.source = null;
+  state.questions = [];
+  state.selectedIds = [];
+  state.segmentDebug = null;
+  state.segmentTiming = null;
+  renderSegmentDebug();
+  renderQuestions();
+  dom.previewPanel.classList.remove("hidden");
+  dom.dropZone.classList.add("hidden");
+  dom.processingBox.classList.remove("hidden");
+  setStatus(dom.uploadState, imageFiles.length > 1 ? `正在上传 ${imageFiles.length} 张图片` : "上传中");
+  setStatus(dom.segmentState, imageFiles.length > 1 ? `准备依次分割 ${imageFiles.length} 张图片` : "AI 分割中");
+
+  const batchStartedAt = performance.now();
+  let totalCreated = 0;
+  for (let index = 0; index < imageFiles.length; index += 1) {
+    const file = imageFiles[index];
+    try {
+      setStatus(dom.uploadState, `正在处理第 ${index + 1}/${imageFiles.length} 张`);
+      const source = await readImageFile(file);
+      source.id = safeNowId("source");
+      source.batchIndex = index + 1;
+      source.batchTotal = imageFiles.length;
+      state.sources.push(source);
+      state.source = source;
+      state.activeSourceIndex = index;
+      state.segmentTiming = source.timing;
+      dom.sourcePreview.src = source.dataUrl;
+      const beforeCount = state.questions.length;
+      await runAutoSegment({
+        fromUpload: true,
+        append: true,
+        batchIndex: index + 1,
+        batchTotal: imageFiles.length
+      });
+      totalCreated += Math.max(0, state.questions.length - beforeCount);
+    } catch (error) {
+      console.warn("[upload-batch] image failed", file?.name, error);
+      setStatus(dom.segmentState, `第 ${index + 1} 张处理失败，继续处理下一张`);
+    }
+  }
+
+  dom.processingBox.classList.add("hidden");
+  if (state.sources.length) setActiveSourceIndex(0);
+  const seconds = ((performance.now() - batchStartedAt) / 1000).toFixed(1);
+  setStatus(dom.uploadState, imageFiles.length > 1 ? `已上传 ${imageFiles.length} 张图片` : "图片已上传");
+  setStatus(dom.segmentState, totalCreated
+    ? `已从 ${imageFiles.length} 张图片识别 ${state.questions.length} 道题目 · 总耗时 ${seconds} 秒`
+    : `AI 没有可靠拆出单题，请改用手动框选 · 总耗时 ${seconds} 秒`);
 }
 
 function resetUpload() {
   state.source = null;
+  state.sources = [];
+  state.activeSourceIndex = 0;
   state.questions = [];
   state.selectedIds = [];
   state.segmentDebug = null;
@@ -741,7 +875,94 @@ function resetUpload() {
   renderQuestions();
 }
 
-dom.autoSegmentBtn.addEventListener("click", () => runAutoSegment());
+function activeSource() {
+  if (!state.sources.length) return state.source;
+  return state.sources[state.activeSourceIndex] || state.sources[0] || null;
+}
+
+function setActiveSourceIndex(index) {
+  if (!state.sources.length) return;
+  const nextIndex = Math.max(0, Math.min(index, state.sources.length - 1));
+  state.activeSourceIndex = nextIndex;
+  state.source = state.sources[nextIndex];
+  state.segmentDebug = state.source?.segmentDebug || null;
+  dom.sourcePreview.src = state.source.dataUrl;
+  clearManualSelection();
+  renderManualSelection();
+  renderSegmentDebug();
+  renderQuestions();
+}
+
+function changeActiveSource(direction) {
+  if (state.sources.length <= 1) return;
+  setActiveSourceIndex(state.activeSourceIndex + direction);
+}
+
+function updateSourcePagerUI() {
+  const buttons = [
+    dom.previewPrevImageBtn,
+    dom.previewNextImageBtn,
+    dom.questionsPrevImageBtn,
+    dom.questionsNextImageBtn
+  ].filter(Boolean);
+  const hasPages = state.sources.length > 1;
+  buttons.forEach((button) => button.classList.toggle("hidden", !hasPages));
+  if (!hasPages) return;
+  [dom.previewPrevImageBtn, dom.questionsPrevImageBtn].forEach((button) => {
+    if (button) button.disabled = state.activeSourceIndex <= 0;
+  });
+  [dom.previewNextImageBtn, dom.questionsNextImageBtn].forEach((button) => {
+    if (button) button.disabled = state.activeSourceIndex >= state.sources.length - 1;
+  });
+}
+
+[
+  dom.previewPrevImageBtn,
+  dom.questionsPrevImageBtn
+].forEach((button) => button?.addEventListener("click", () => changeActiveSource(-1)));
+
+[
+  dom.previewNextImageBtn,
+  dom.questionsNextImageBtn
+].forEach((button) => button?.addEventListener("click", () => changeActiveSource(1)));
+
+dom.autoSegmentBtn.addEventListener("click", () => runAutoSegmentForLoadedSources());
+
+async function runAutoSegmentForLoadedSources() {
+  if (!state.sources.length || state.sources.length === 1) {
+    await runAutoSegment();
+    return;
+  }
+
+  setManualMode(false);
+  state.questions = [];
+  state.selectedIds = [];
+  state.segmentDebug = null;
+  renderSegmentDebug();
+  renderQuestions();
+  dom.processingBox.classList.remove("hidden");
+  const batchStartedAt = performance.now();
+  for (let index = 0; index < state.sources.length; index += 1) {
+    const source = state.sources[index];
+    if (!source.id) source.id = safeNowId("source");
+    state.source = source;
+    state.activeSourceIndex = index;
+    state.segmentTiming = source.timing || { uploadStartedAt: performance.now(), fileReadMs: 0, imageDecodeMs: 0 };
+    dom.sourcePreview.src = source.dataUrl;
+    await runAutoSegment({
+      fromUpload: true,
+      append: true,
+      batchIndex: index + 1,
+      batchTotal: state.sources.length
+    });
+  }
+  dom.processingBox.classList.add("hidden");
+  setActiveSourceIndex(0);
+  setStatus(
+    dom.segmentState,
+    `已从 ${state.sources.length} 张图片识别 ${state.questions.length} 道题目 · 总耗时 ${((performance.now() - batchStartedAt) / 1000).toFixed(1)} 秒`
+  );
+}
 
 function completeSegmentationTiming(clientTimings, serverTimings, segmentationStartedAt, uploadStartedAt) {
   clientTimings.frontendSegmentationMs = Math.round(performance.now() - segmentationStartedAt);
@@ -784,16 +1005,22 @@ async function runAutoSegment(options = {}) {
   const serverTimings = { initial: null, strict: null };
   setManualMode(false);
   dom.processingBox.classList.remove("hidden");
-  setStatus(dom.segmentState, "AI 分割中");
+  const batchLabel = options.batchTotal > 1
+    ? `第 ${options.batchIndex}/${options.batchTotal} 张`
+    : "";
+  setStatus(dom.segmentState, batchLabel ? `${batchLabel} AI 分割中` : "AI 分割中");
 
   let segments = [];
   let usedApi = false;
+  let segmentFailureNote = "";
   try {
     const initialApiStartedAt = performance.now();
     const result = await requestAISegmentation("initial");
+    segmentFailureNote = result?.note || "";
     clientTimings.initialApiRoundTripMs = Math.round(performance.now() - initialApiStartedAt);
     serverTimings.initial = result?.timings || null;
     state.segmentDebug = result?.debug || null;
+    if (state.source) state.source.segmentDebug = state.segmentDebug;
     renderSegmentDebug();
     const initialNormalizationStartedAt = performance.now();
     segments = normalizeSegmentResult(result);
@@ -801,11 +1028,16 @@ async function runAutoSegment(options = {}) {
     const initialHadOnlyRejectedBoxes = !segments.length && Array.isArray(result?.questions) && result.questions.length > 0;
     const canStrictRetry = result?.allowStrictRetry === true && result?.cacheHit !== true;
     if (canStrictRetry && !result?.fallbackToWholePage && (needsStrictWholePageRetry(segments) || initialHadOnlyRejectedBoxes)) {
-      setStatus(dom.segmentState, "正在重新分析整页题目结构");
+      setStatus(dom.segmentState, batchLabel ? `${batchLabel} 正在重新分析整页题目结构` : "正在重新分析整页题目结构");
       const strictApiStartedAt = performance.now();
       const strictResult = await requestAISegmentation("strict_structure");
+      segmentFailureNote = strictResult?.note || segmentFailureNote;
       clientTimings.strictRetryRoundTripMs = Math.round(performance.now() - strictApiStartedAt);
       serverTimings.strict = strictResult?.timings || null;
+      if (strictResult?.debug && state.source) {
+        state.segmentDebug = strictResult.debug;
+        state.source.segmentDebug = strictResult.debug;
+      }
       const strictNormalizationStartedAt = performance.now();
       const strictSegments = normalizeSegmentResult(strictResult);
       clientTimings.resultNormalizationMs += Math.round(performance.now() - strictNormalizationStartedAt);
@@ -821,14 +1053,17 @@ async function runAutoSegment(options = {}) {
       clientTimings.initialApiRoundTripMs = Math.round(performance.now() - segmentationStartedAt);
     }
     console.warn("AI segmentation fallback:", error);
+    segmentFailureNote = error?.message || "AI 分割接口请求失败";
     state.segmentDebug = null;
     renderSegmentDebug();
   }
 
   if (!segments.length) {
-    dom.processingBox.classList.add("hidden");
-    state.questions = [];
-    state.selectedIds = [];
+    if (!options.append) {
+      dom.processingBox.classList.add("hidden");
+      state.questions = [];
+      state.selectedIds = [];
+    }
     const renderStartedAt = performance.now();
     renderQuestions();
     clientTimings.renderMs = Math.round(performance.now() - renderStartedAt);
@@ -838,7 +1073,10 @@ async function runAutoSegment(options = {}) {
       segmentationStartedAt,
       uploadStartedAt
     );
-    setStatus(dom.segmentState, `AI 没有可靠拆出单题，请改用手动框选 · 总耗时 ${(completedTimings.uploadToPresentedMs / 1000).toFixed(1)} 秒`);
+    const reason = segmentFailureNote
+      ? `${segmentFailureNote} · `
+      : "AI 没有可靠拆出单题，请改用手动框选 · ";
+    setStatus(dom.segmentState, `${batchLabel ? `${batchLabel} ` : ""}${reason}总耗时 ${(completedTimings.uploadToPresentedMs / 1000).toFixed(1)} 秒`);
     return;
   }
 
@@ -854,7 +1092,7 @@ async function runAutoSegment(options = {}) {
     const singleCropStartedAt = performance.now();
     questions.push(
       await createQuestionFromBox(segment.finalBox, segment.meta?.fallbackToWholePage ? "AI 整页兜底" : "AI 自动分割", {
-        index: index + 1,
+        index: state.questions.length + questions.length + 1,
         aiMeta: segment.meta
       })
     );
@@ -866,10 +1104,17 @@ async function runAutoSegment(options = {}) {
     : 0;
   clientTimings.cropCount = perCropMs.length;
 
-  state.questions = questions;
-  state.selectedIds = questions.map((question) => question.id);
+  if (options.append) {
+    state.questions.push(...questions);
+    questions.forEach((question) => {
+      if (!state.selectedIds.includes(question.id)) state.selectedIds.push(question.id);
+    });
+  } else {
+    state.questions = questions;
+    state.selectedIds = questions.map((question) => question.id);
+  }
   scheduleVerifiedAnswerKeyPrefetch(questions);
-  dom.processingBox.classList.add("hidden");
+  if (!options.append) dom.processingBox.classList.add("hidden");
   const statusMessage = usedWholePageFallback
       ? "AI 没有可靠拆成单题，已先保留整页，可手动框选细分"
       : usedFastNumberSplit
@@ -886,7 +1131,7 @@ async function runAutoSegment(options = {}) {
     segmentationStartedAt,
     uploadStartedAt
   );
-  setStatus(dom.segmentState, `${statusMessage} · 总耗时 ${(completedTimings.uploadToPresentedMs / 1000).toFixed(1)} 秒`);
+  setStatus(dom.segmentState, `${batchLabel ? `${batchLabel} ` : ""}${statusMessage} · 总耗时 ${(completedTimings.uploadToPresentedMs / 1000).toFixed(1)} 秒`);
 }
 
 async function requestAISegmentation(mode = "initial") {
@@ -1267,6 +1512,9 @@ async function createQuestionFromBox(box, sourceLabel, options = {}) {
     image: imageData,
     imageWidth: imageMeta.width,
     imageHeight: imageMeta.height,
+    sourceId: state.source?.id || "",
+    sourceIndex: state.source?.batchIndex || state.activeSourceIndex + 1 || 1,
+    sourceName: state.source?.name || "",
     questionNumber: sourceQuestionNumber,
     sourceQuestionNumber,
     displayIndex,
@@ -1608,7 +1856,14 @@ function renderSelectionRect() {
 function renderQuestions() {
   dom.questionList.innerHTML = "";
 
-  state.questions.forEach((question, index) => {
+  const source = activeSource();
+  const hasSourcePages = state.sources.length > 1;
+  const visibleQuestions = hasSourcePages && source?.id
+    ? state.questions.filter((question) => question.sourceId === source.id)
+    : state.questions;
+
+  visibleQuestions.forEach((question, visibleIndex) => {
+    const index = state.questions.findIndex((item) => item.id === question.id);
     const template = $("#questionCardTemplate");
     const card = template.content.firstElementChild.cloneNode(true);
     const selectedIndex = state.selectedIds.indexOf(question.id);
@@ -1616,7 +1871,7 @@ function renderQuestions() {
     card.dataset.id = question.id;
     $("img", card).src = question.image;
     const sourceNumber = question.sourceQuestionNumber || question.questionNumber || "";
-    const displayIndex = question.displayIndex || index + 1;
+    const displayIndex = question.displayIndex || visibleIndex + 1;
     $(".question-order", card).textContent = sourceNumber || displayIndex;
     $(".question-meta strong", card).textContent = sourceNumber ? `题目 ${sourceNumber}` : `题目 ${displayIndex}`;
     const selectArea = $(".select-area", card);
@@ -1632,10 +1887,16 @@ function renderQuestions() {
   });
 
   const count = state.selectedIds.length;
+  const currentSelectedCount = visibleQuestions.filter((question) => state.selectedIds.includes(question.id)).length;
   dom.selectedSummary.textContent = count ? `已选择 ${count} 道题` : "未选择题目";
-  dom.selectedHint.textContent = count ? "将按卡片上的数字依次讲解" : "可多选，按选择顺序讲解";
+  dom.selectedHint.textContent = hasSourcePages
+    ? `当前第 ${state.activeSourceIndex + 1}/${state.sources.length} 张，当前页 ${currentSelectedCount}/${visibleQuestions.length} 道已选`
+    : count
+      ? "将按卡片上的数字依次讲解"
+      : "可多选，按选择顺序讲解";
   dom.clearSelectionBtn.disabled = count === 0;
   dom.startLectureBtn.disabled = count === 0;
+  updateSourcePagerUI();
 }
 
 function toggleQuestionSelection(id) {
@@ -1675,6 +1936,7 @@ dom.startLectureBtn.addEventListener("click", () => {
     .map((id) => state.questions.find((question) => question.id === id))
     .filter(Boolean);
   if (!queue.length) return;
+  void unlockLianAudio();
   startLecture(queue);
 });
 
@@ -1705,7 +1967,9 @@ function startLecture(queue) {
   state.hasExplicitFinalAnswer = false;
   state.pendingLianQuestion = null;
   dom.finishQuestionBtn.disabled = false;
-  scheduleVerifiedAnswerKeyPrefetch(state.lecture);
+  const firstQuestion = state.lecture[0];
+  if (firstQuestion?.image) void prefetchVerifiedAnswerKey(firstQuestion);
+  scheduleVerifiedAnswerKeyPrefetch(state.lecture.slice(1));
   initCurrentQuestion();
   showView("teachView");
 }
@@ -1905,14 +2169,29 @@ function historyKey() {
   return question ? question.id : "";
 }
 
+function canvasHasVisibleInk() {
+  if (!dom.canvas?.width || !dom.canvas?.height) return false;
+  try {
+    const { data } = ctx.getImageData(0, 0, dom.canvas.width, dom.canvas.height);
+    for (let index = 3; index < data.length; index += 4) {
+      if (data[index] > 8) return true;
+    }
+  } catch (error) {
+    console.warn("[handwriting] canvas ink check failed:", error);
+  }
+  return false;
+}
+
 function hasCurrentBoardInk(question = currentPageQuestion()) {
-  return Boolean(question && state.boardInkByQuestion[question.id]);
+  if (!question) return false;
+  return Boolean(state.boardInkByQuestion[question.id]) || canvasHasVisibleInk();
 }
 
 function markCurrentBoardInk(question = currentPageQuestion()) {
   if (question) {
     state.boardInkByQuestion[question.id] = true;
     state.boardCompletionVerified = false;
+    state.currentQuestionCompleted = false;
   }
 }
 
@@ -1938,6 +2217,7 @@ function saveCurrentPage() {
   if (!dom.canvas.width) return;
   const pages = pagesForQuestion(question.id);
   pages[0] = dom.canvas.toDataURL("image/png");
+  state.boardInkByQuestion[question.id] = canvasHasVisibleInk();
 }
 
 function loadCurrentPage() {
@@ -1952,7 +2232,10 @@ function loadCurrentPage() {
   const pages = pagesForQuestion(question.id);
   drawDataUrlToCanvas(pages[0] || "", {
     questionId: question.id,
-    pageIndex: state.boardPageIndex
+    pageIndex: state.boardPageIndex,
+    onDraw: () => {
+      state.boardInkByQuestion[question.id] = canvasHasVisibleInk();
+    }
   });
   applyBoardImageState();
 }
@@ -1960,9 +2243,14 @@ function loadCurrentPage() {
 async function prefetchVerifiedAnswerKey(question) {
   if (!question?.id || !question.image) return;
   const currentStatus = state.answerKeyStatusByQuestion[question.id];
-  if (["loading", "ready"].includes(currentStatus)) return;
+  if (currentStatus === "ready" && state.answerKeysByQuestion[question.id]) {
+    return state.answerKeysByQuestion[question.id];
+  }
+  if (currentStatus === "loading" && state.answerKeyFetchPromises[question.id]) {
+    return await state.answerKeyFetchPromises[question.id];
+  }
   state.answerKeyStatusByQuestion[question.id] = "loading";
-  try {
+  state.answerKeyFetchPromises[question.id] = (async () => {
     const response = await fetch("/api/answer-key", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1973,8 +2261,43 @@ async function prefetchVerifiedAnswerKey(question) {
     });
     const result = await response.json().catch(() => ({}));
     state.answerKeyStatusByQuestion[question.id] = response.ok && result.ready ? "ready" : "unverified";
+    state.answerKeysByQuestion[question.id] = {
+      ready: Boolean(response.ok && result.ready),
+      status: result.status || (response.ok ? "unverified" : "error"),
+      confidence: Number(result.confidence) || 0,
+      canonicalAnswer: String(result.canonicalAnswer || "").trim(),
+      acceptedAnswers: Array.isArray(result.acceptedAnswers) ? result.acceptedAnswers : [],
+      problemText: String(result.problemText || "").trim(),
+      questionType: String(result.questionType || "").trim(),
+      knowledge: String(result.knowledge || "").trim(),
+      solutionOutline: Array.isArray(result.solutionOutline) ? result.solutionOutline : [],
+      verificationChecks: Array.isArray(result.verificationChecks) ? result.verificationChecks : [],
+      studentTrace: result.studentTrace || null,
+      reason: String(result.reason || "").trim(),
+      provider: result.provider || "",
+      elapsedMs: Number(result.elapsedMs) || 0,
+      fetchedAt: new Date().toISOString()
+    };
+    return state.answerKeysByQuestion[question.id];
+  })();
+  try {
+    return await state.answerKeyFetchPromises[question.id];
   } catch {
     state.answerKeyStatusByQuestion[question.id] = "unverified";
+    state.answerKeysByQuestion[question.id] = {
+      ready: false,
+      status: "network-error",
+      confidence: 0,
+      canonicalAnswer: "",
+      acceptedAnswers: [],
+      solutionOutline: [],
+      verificationChecks: [],
+      reason: "standard answer service unavailable",
+      fetchedAt: new Date().toISOString()
+    };
+    return state.answerKeysByQuestion[question.id];
+  } finally {
+    delete state.answerKeyFetchPromises[question.id];
   }
 }
 
@@ -2241,7 +2564,7 @@ dom.canvas.addEventListener("pointermove", (event) => {
       return;
     }
     if (!state.drawing) return;
-    const shouldRecognize = state.strokeHasInk && hasCurrentBoardInk();
+    const strokeHadInk = state.strokeHasInk;
     state.drawing = false;
     state.strokeHasInk = false;
     state.lastPoint = null;
@@ -2250,6 +2573,7 @@ dom.canvas.addEventListener("pointermove", (event) => {
     dom.studentAvatar.classList.remove("speaking");
     dom.studentState.textContent = "继续讲题";
     saveCurrentPage();
+    const shouldRecognize = hasCurrentBoardInk() && (strokeHadInk || state.tool === "eraser" || canvasHasVisibleInk());
     if (shouldRecognize) {
       markUserInput("board");
       scheduleHandwritingRecognition("停笔 6 秒后");
@@ -2393,25 +2717,31 @@ function resetQuestionGuideState() {
     "题目换好了，你先讲你的想法，我先跟着听。",
     "现在讲这道题，你不用急着算，先把思路说出来。"
   ]);
+  void lianSpeak(dom.lianBubble.textContent, {
+    dedupeKey: `question-change:${currentPageQuestion()?.id || state.boardPageIndex}`,
+    cooldownMs: 0,
+    allowRepeat: true,
+    log: false,
+    trackQuestion: false
+  });
   if (state.isListening) resetSilenceTimer();
 }
 
 function scheduleHandwritingRecognition(reason) {
   clearTimeout(state.recognitionTimer);
-  if (!hasCurrentBoardInk()) return;
+  const question = currentPageQuestion();
+  const hasInk = hasCurrentBoardInk(question);
+  console.log("[handwriting] schedule", {
+    reason,
+    questionId: question?.id || "",
+    hasInk,
+    completed: state.currentQuestionCompleted,
+    paused: state.teachSessionPaused
+  });
+  if (!hasInk) return;
   if (state.teachSessionPaused) {
     state.resumeHandwritingAfterNavigation = true;
     return;
-  }
-  if (state.isListening) {
-    const quietFor = Date.now() - (state.lastSpeechAt || 0);
-    if (quietFor < SPEECH_QUIET_BEFORE_BOARD_MS) {
-      state.recognitionTimer = setTimeout(
-        () => scheduleHandwritingRecognition(reason),
-        SPEECH_QUIET_BEFORE_BOARD_MS - quietFor + 80
-      );
-      return;
-    }
   }
   if (Date.now() < state.handwritingDisabledUntil) {
     showPausedHandwritingNotice();
@@ -2470,16 +2800,21 @@ function explainHandwritingError(error) {
 }
 
 async function runHandwritingRecognition(reason) {
+  state.recognitionTimer = null;
   const question = currentPageQuestion();
+  const hasInk = hasCurrentBoardInk(question);
+  console.log("[handwriting] run", {
+    reason,
+    questionId: question?.id || "",
+    hasInk,
+    completed: state.currentQuestionCompleted,
+    paused: state.teachSessionPaused
+  });
   if (state.teachSessionPaused) {
-    state.resumeHandwritingAfterNavigation = Boolean(question && hasCurrentBoardInk(question));
+    state.resumeHandwritingAfterNavigation = Boolean(question && hasInk);
     return;
   }
-  if (state.currentQuestionCompleted || !question || !dom.canvas.width || !hasCurrentBoardInk(question)) return;
-  if (state.isListening && Date.now() - (state.lastSpeechAt || 0) < SPEECH_QUIET_BEFORE_BOARD_MS) {
-    scheduleHandwritingRecognition(reason);
-    return;
-  }
+  if (state.currentQuestionCompleted || !question || !dom.canvas.width || !hasInk) return;
   if (Date.now() < state.handwritingDisabledUntil) {
     showPausedHandwritingNotice();
     return;
@@ -2494,13 +2829,23 @@ async function runHandwritingRecognition(reason) {
   try {
     const result = normalizeHandwritingResult(await requestHandwritingAnalysis(question, reason));
     if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) return;
-    if (state.isListening && Date.now() - (state.lastSpeechAt || 0) < SPEECH_QUIET_BEFORE_BOARD_MS) {
-      scheduleHandwritingRecognition(reason);
-      return;
-    }
     state.latestHandwritingResult = result;
     state.handwritingResults[question.id] = result;
     state.boardCompletionVerified = isBoardCompletionVerified(result);
+
+    if (isHandwritingCalculationWrong(result)) {
+      dom.recognitionPill.textContent = "发现需要检查";
+      maybeSpeakHandwritingGuidance(result);
+      return;
+    }
+
+    if (isIncompleteHandwritingIssue(result)) {
+      dom.recognitionPill.textContent = "等你写完";
+      maybeSpeakHandwritingGuidance(result);
+      return;
+    }
+
+    if (await maybeVerifyFinalAnswerFromHandwriting(result)) return;
 
     if (await maybePromptSaveFromHandwriting(result)) return;
 
@@ -2808,6 +3153,70 @@ function extractAnswerTextFromHandwriting(result) {
   return String(result?.mathExpression || result?.detectedWriting || result?.calculationCheck || "").trim();
 }
 
+function extractHandwritingFinalAnswerCandidate(result) {
+  const combined = [
+    result?.mathExpression,
+    result?.detectedWriting,
+    result?.calculationCheck,
+    result?.positiveFeedback,
+    result?.issueSummary
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .normalize("NFKC");
+  if (!combined.trim()) return "";
+
+  const assignmentMatches = [
+    ...combined.matchAll(/([a-zA-Z])\s*(?:=|＝|等于|为)\s*([-+]?\d+(?:\.\d+)?(?:\s*\/\s*[-+]?\d+(?:\.\d+)?)?)\s*(°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?/g)
+  ];
+  if (assignmentMatches.length) {
+    const latest = assignmentMatches.at(-1);
+    return `${latest[1].toLowerCase()}=${latest[2].replace(/\s+/g, "")}${latest[3] || ""}`;
+  }
+
+  const explicitAnswer = combined.match(
+    /(?:答案|结果|最终|最后|解得|所以|得到|得出|为|是|等于|=|＝)\s*([A-D]|[-+]?\d+(?:\.\d+)?(?:\s*\/\s*[-+]?\d+(?:\.\d+)?)?\s*(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?)/i
+  );
+  if (explicitAnswer?.[1]) return explicitAnswer[1].replace(/\s+/g, "");
+
+  const shortText = combined.replace(/\s+/g, "");
+  if (/^[A-D]$/i.test(shortText)) return shortText.toUpperCase();
+  if (/^[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/.test(shortText)) {
+    return shortText;
+  }
+  return "";
+}
+
+function shouldVerifyHandwritingFinalAnswer(result) {
+  if (!result?.isRelevant) return false;
+  if (isIncompleteHandwritingIssue(result) && !isHandwritingCalculationCorrect(result)) return false;
+  return Boolean(extractHandwritingFinalAnswerCandidate(result));
+}
+
+async function maybeVerifyFinalAnswerFromHandwriting(result) {
+  if (!shouldVerifyHandwritingFinalAnswer(result)) return false;
+  const question = currentPageQuestion();
+  if (!question || state.currentQuestionCompleted || state.completionCheckInProgress) return false;
+
+  const answer = extractHandwritingFinalAnswerCandidate(result);
+  await lianSpeak("我来核对答案。", {
+    dedupeKey: `handwriting-final-answer-check:${question.id}:${answer}`,
+    cooldownMs: 0,
+    allowRepeat: true
+  });
+
+  if (shouldPromptSaveFromHandwriting(result)) {
+    return await maybePromptSaveFromHandwriting(result);
+  }
+
+  await handleFinalAnswerSubmission(answer, {
+    source: "handwriting",
+    boardAlreadyVerified: isHandwritingCalculationCorrect(result) && hasReviewableBoardStep(result),
+    silentLog: true
+  });
+  return true;
+}
+
 function normalizeBoardMathText(value) {
   return String(value || "")
     .normalize("NFKC")
@@ -2859,7 +3268,22 @@ async function maybePromptSaveFromHandwriting(result) {
   state.boardCompletionVerified = true;
   dom.finishQuestionBtn.disabled = false;
 
-  await saveCurrentQuestionAndContinue({ feedback: result.positiveFeedback || "" });
+  markCurrentQuestionComplete();
+  dom.recognitionPill.textContent = "板书已确认";
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  dom.recognitionPill.classList.add("hidden");
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const feedback = String(result.positiveFeedback || "").trim();
+  await lianSpeak(
+    feedback
+      ? `${feedback} 答案和板书都核对好了。`
+      : "答案和板书都核对好了。"
+  );
+  setTimeout(() => {
+    if (currentPageQuestion()?.id !== question.id) return;
+    if (!state.finalAnswerVerified || !state.boardCompletionVerified) return;
+    void saveCurrentQuestionAndContinue({ feedback });
+  }, 1500);
   return true;
 }
 
@@ -2964,8 +3388,56 @@ function maybeSpeakHandwritingUnclear(result) {
   return true;
 }
 
+function hasHandwritingProgressForGuidance(result) {
+  const boardText = [
+    result?.detectedWriting,
+    result?.mathExpression,
+    result?.calculationCheck,
+    result?.expectedNextStep,
+    result?.missingBoardContent
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .normalize("NFKC");
+  if (!boardText.trim()) return false;
+  if (String(result?.guidance || "").trim()) return true;
+  if (String(result?.expectedNextStep || result?.missingBoardContent || "").trim()) return true;
+  return /[a-zA-Z]|=|:|\/|\+|-|\*|×|÷|\d|方程|比例|分之|角|面积|周长|半径|直径/.test(boardText);
+}
+
+function buildIncompleteHandwritingGuidance(result) {
+  const nextStep = String(result?.expectedNextStep || result?.missingBoardContent || "").trim();
+  const expression = String(result?.mathExpression || result?.detectedWriting || "").trim();
+  if (String(result?.guidance || "").trim()) return String(result.guidance).trim();
+  if (nextStep && expression) {
+    return `我看到你已经写到 ${expression} 这一步了。接下来先补一小步：${nextStep}`;
+  }
+  if (nextStep) {
+    return `你现在像是停在中间一步了。下一步先做这个：${nextStep}`;
+  }
+  if (expression) {
+    return `我看到你写到 ${expression} 这里了。先沿着这个式子往下算一小步，把等号后面的结果写出来。`;
+  }
+  return "我看到你停在中间步骤了。先把下一行关系式或计算结果补出来，我们再一起核对。";
+}
+
 function maybeSpeakHandwritingGuidance(result) {
   const now = Date.now();
+  if (isIncompleteHandwritingIssue(result) && hasHandwritingProgressForGuidance(result)) {
+    const issueKey = `incomplete:${result.expectedNextStep || result.missingBoardContent || result.mathExpression || result.detectedWriting || ""}`
+      .replace(/\s+/g, "")
+      .slice(0, 140);
+    if (issueKey === state.lastHandwritingIssueKey && now - state.lastHandwritingGuideAt < 18000) return false;
+    state.lastHandwritingIssueKey = issueKey;
+    state.lastHandwritingGuideAt = now;
+    dom.recognitionPill.textContent = "等你写完";
+    lianSpeak(buildIncompleteHandwritingGuidance(result), {
+      dedupeKey: `handwriting-incomplete:${issueKey}`,
+      cooldownMs: 0,
+      allowRepeat: false
+    });
+    return true;
+  }
   if (isIncompleteHandwritingIssue(result)) {
     state.lastHandwritingIssueKey = `incomplete:${result.issueSummary || result.detectedWriting || ""}`;
     state.lastHandwritingGuideAt = now;
@@ -3243,7 +3715,219 @@ async function ensureMicrophonePermission() {
   }
 }
 
+async function getCloudSpeechConfig() {
+  if (state.cloudSpeechConfig) return state.cloudSpeechConfig;
+  try {
+    const response = await fetch("/api/health", { cache: "no-store" });
+    const result = await response.json().catch(() => ({}));
+    state.cloudSpeechConfig = {
+      aliyunSpeechConfigured: Boolean(result.aliyunSpeechConfigured),
+      aliyunSpeechVoice: result.aliyunSpeechVoice || "",
+      sampleRate: 16000
+    };
+  } catch {
+    state.cloudSpeechConfig = { aliyunSpeechConfigured: false, sampleRate: 16000 };
+  }
+  return state.cloudSpeechConfig;
+}
+
+function downsampleAudioBuffer(samples, inputSampleRate, outputSampleRate = 16000) {
+  if (outputSampleRate === inputSampleRate) return samples;
+  const ratio = inputSampleRate / outputSampleRate;
+  const newLength = Math.max(1, Math.round(samples.length / ratio));
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i += 1) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(samples.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    let count = 0;
+    for (let j = start; j < end; j += 1) {
+      sum += samples[j];
+      count += 1;
+    }
+    result[i] = count ? sum / count : samples[start] || 0;
+  }
+  return result;
+}
+
+function encodeWavDataUrl(samples, sampleRate = 16000) {
+  const bytesPerSample = 2;
+  const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample);
+  const view = new DataView(buffer);
+  const writeString = (offset, string) => {
+    for (let i = 0; i < string.length; i += 1) view.setUint8(offset + i, string.charCodeAt(i));
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * bytesPerSample, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerSample, true);
+  view.setUint16(32, bytesPerSample, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * bytesPerSample, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i += 1, offset += 2) {
+    const sample = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+async function flushCloudAsrBuffer({ final = false } = {}) {
+  if (!state.cloudAsrBuffers.length || state.cloudAsrRequestInFlight) return;
+  const buffers = state.cloudAsrBuffers.splice(0);
+  const length = buffers.reduce((sum, buffer) => sum + buffer.length, 0);
+  if (length < state.cloudAsrSampleRate * (final ? 0.2 : 0.7)) return;
+  const merged = new Float32Array(length);
+  let offset = 0;
+  buffers.forEach((buffer) => {
+    merged.set(buffer, offset);
+    offset += buffer.length;
+  });
+  const wavDataUrl = encodeWavDataUrl(merged, state.cloudAsrSampleRate);
+  state.cloudAsrRequestInFlight = true;
+  try {
+    const response = await fetch("/api/asr", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audio: wavDataUrl })
+    });
+    const result = await response.json().catch(() => ({}));
+    const text = String(result.text || "").trim();
+    if (response.ok && text) {
+      await handleRecognizedSpeech(text);
+      resetSilenceTimer();
+    }
+  } catch (error) {
+    console.warn("Aliyun ASR failed:", error);
+  } finally {
+    state.cloudAsrRequestInFlight = false;
+  }
+}
+
+async function startCloudAsrListening() {
+  const allowed = await ensureMicrophonePermission();
+  if (!allowed) return false;
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass || !navigator.mediaDevices?.getUserMedia) return false;
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
+    }
+  });
+  const audioContext = new AudioContextClass();
+  const source = audioContext.createMediaStreamSource(stream);
+  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+  state.cloudAsrSampleRate = 16000;
+  state.cloudAsrBuffers = [];
+  state.cloudAsrStream = stream;
+  state.cloudAsrAudioContext = audioContext;
+  state.cloudAsrSource = source;
+  state.cloudAsrProcessor = processor;
+  processor.onaudioprocess = (event) => {
+    if (!state.cloudAsrActive || state.lianSpeechPausedRecognition || state.currentLianUtterance) return;
+    const input = event.inputBuffer.getChannelData(0);
+    const downsampled = downsampleAudioBuffer(input, audioContext.sampleRate, state.cloudAsrSampleRate);
+    state.cloudAsrBuffers.push(downsampled);
+    state.lastSpeechAt = Date.now();
+    stopSpeechNoResultTimer();
+  };
+  source.connect(processor);
+  processor.connect(audioContext.destination);
+  state.cloudAsrActive = true;
+  state.isListening = true;
+  state.resumeListeningAfterNavigation = false;
+  dom.micBtn.innerHTML = `${iconMap.mic}停止收听`;
+  dom.studentAvatar.classList.remove("speaking");
+  dom.studentState.textContent = "正在收听";
+  startSpeechNoResultTimer();
+  resetSilenceTimer(false);
+  state.cloudAsrFlushTimer = setInterval(() => {
+    void flushCloudAsrBuffer();
+  }, 2800);
+  return true;
+}
+
+function stopCloudAsrListening() {
+  stopSpeechNoResultTimer();
+  clearInterval(state.cloudAsrFlushTimer);
+  state.cloudAsrFlushTimer = null;
+  state.cloudAsrActive = false;
+  state.isListening = false;
+  try {
+    state.cloudAsrProcessor?.disconnect();
+    state.cloudAsrSource?.disconnect();
+  } catch {
+    // Already disconnected.
+  }
+  state.cloudAsrStream?.getTracks?.().forEach((track) => track.stop());
+  const closingAudioContext = state.cloudAsrAudioContext?.close?.();
+  if (closingAudioContext && typeof closingAudioContext.catch === "function") {
+    closingAudioContext.catch(() => {});
+  }
+  state.cloudAsrStream = null;
+  state.cloudAsrAudioContext = null;
+  state.cloudAsrSource = null;
+  state.cloudAsrProcessor = null;
+  void flushCloudAsrBuffer({ final: true });
+  dom.micBtn.innerHTML = `${iconMap.mic}开始收听`;
+  dom.studentAvatar.classList.remove("speaking");
+  dom.studentState.textContent = "准备讲题";
+}
+
 async function toggleListening() {
+  if (state.cloudAsrActive) {
+    stopCloudAsrListening();
+    return;
+  }
+
+  if (state.isListening) {
+    const recognition = getSpeechRecognition();
+    stopSpeechNoResultTimer();
+    const draft = clearSpeechDraft();
+    if (draft) {
+      void handleRecognizedSpeech(draft);
+    }
+    state.isListening = false;
+    state.silenceGuidePending = false;
+    clearSilenceFollowup();
+    clearTimeout(state.silenceTimer);
+    recognition?.stop();
+    return;
+  }
+
+  const cloudConfig = await getCloudSpeechConfig();
+  if (cloudConfig.aliyunSpeechConfigured) {
+    dom.micBtn.disabled = true;
+    dom.studentState.textContent = "准备收听";
+    await lianSpeak(pickPrompt("listening-start", LISTENING_START_PROMPTS), {
+      logKey: "listening-start-prompt",
+      allowRepeat: true
+    });
+    try {
+      await startCloudAsrListening();
+    } catch (error) {
+      console.warn("Aliyun ASR start failed, using browser ASR:", error);
+      state.cloudSpeechConfig = { ...cloudConfig, aliyunSpeechConfigured: false };
+    } finally {
+      dom.micBtn.disabled = false;
+    }
+    if (state.cloudAsrActive) return;
+  }
+
   const recognition = getSpeechRecognition();
   if (!recognition) {
     lianSpeak(
@@ -3256,42 +3940,32 @@ async function toggleListening() {
     return;
   }
 
-  if (state.isListening) {
-    stopSpeechNoResultTimer();
-    const draft = clearSpeechDraft();
-    if (draft) {
-      void handleRecognizedSpeech(draft);
-    }
-    state.isListening = false;
-    state.silenceGuidePending = false;
-    clearSilenceFollowup();
-    clearTimeout(state.silenceTimer);
-    recognition.stop();
-  } else {
-    const allowed = await ensureMicrophonePermission();
-    if (!allowed) return;
-    dom.micBtn.disabled = true;
-    dom.studentState.textContent = "准备收听";
-    await lianSpeak(pickPrompt("listening-start", LISTENING_START_PROMPTS), {
-      logKey: "listening-start-prompt",
-      allowRepeat: true
-    });
-    dom.micBtn.disabled = false;
-    try {
-      recognition.start();
-    } catch {
-      lianSpeak(
-        pickPrompt("microphone-starting", [
-          "麦克风还在准备，你稍等一下再点也可以。",
-          "我还没准备好开始收听，等一会儿再试试。",
-          "麦克风马上就好，稍等片刻再开始吧。"
-        ])
-      );
-    }
+  const allowed = await ensureMicrophonePermission();
+  if (!allowed) return;
+  dom.micBtn.disabled = true;
+  dom.studentState.textContent = "准备收听";
+  await lianSpeak(pickPrompt("listening-start", LISTENING_START_PROMPTS), {
+    logKey: "listening-start-prompt",
+    allowRepeat: true
+  });
+  dom.micBtn.disabled = false;
+  try {
+    recognition.start();
+  } catch {
+    lianSpeak(
+      pickPrompt("microphone-starting", [
+        "麦克风还在准备，你稍等一下再点也可以。",
+        "我还没准备好开始收听，等一会儿再试试。",
+        "麦克风马上就好，稍等片刻再开始吧。"
+      ])
+    );
   }
 }
 
 function stopListeningAfterSessionCompletion() {
+  if (state.cloudAsrActive) {
+    stopCloudAsrListening();
+  }
   stopSpeechNoResultTimer();
   clearTimeout(state.recognitionTimer);
   clearTimeout(state.silenceTimer);
@@ -3696,7 +4370,10 @@ function handleStudentSpeech(text) {
   }
   recordFinalAnswerEvidence(text);
   if (state.currentQuestionCompleted) return;
-  clearTimeout(state.recognitionTimer);
+  if (!hasCurrentBoardInk()) {
+    clearTimeout(state.recognitionTimer);
+    state.recognitionTimer = null;
+  }
   state.activeGuideRequestId += 1;
   dom.studentAvatar.classList.add("speaking");
   dom.studentState.textContent = "正在讲题";
@@ -4256,7 +4933,19 @@ function maybeGuide(text, reason = "guide", cooldown = 15000) {
   return true;
 }
 
+function isLianXiaoxiaoVoice(voice) {
+  const identity = [
+    voice?.voiceURI || "",
+    voice?.name || "",
+    voice?.lang || ""
+  ].join(" ").toLowerCase();
+  return /xiaoxiao|\u6653\u6653/.test(identity);
+}
+
 function chooseLianVoice(voices = []) {
+  const xiaoxiaoVoice = voices.find(isLianXiaoxiaoVoice);
+  if (xiaoxiaoVoice) return xiaoxiaoVoice;
+
   const gentleFemalePriorities = [
     ["xiaoxiao", "晓晓"],
     ["xiaoyi", "晓伊"],
@@ -4314,11 +5003,26 @@ function getVoiceIdentity(voice) {
 function refreshLianVoice({ force = false } = {}) {
   if (!("speechSynthesis" in window)) return null;
   const voices = window.speechSynthesis.getVoices();
-  if (!voices.length || state.lianVoiceSelectionLocked && !force) return state.lianVoice;
+  if (!voices.length) return state.lianVoice;
+  if (state.lianVoiceSelectionLocked && !force) {
+    const xiaoxiaoVoice = voices.find(isLianXiaoxiaoVoice);
+    if (xiaoxiaoVoice && !isLianXiaoxiaoVoice(state.lianVoice)) {
+      state.lianVoice = xiaoxiaoVoice;
+      state.lianVoiceIdentity = getVoiceIdentity(xiaoxiaoVoice);
+      return xiaoxiaoVoice;
+    }
+    return state.lianVoice;
+  }
 
   if (!force && state.lianVoiceIdentity) {
     const lockedVoice = voices.find((voice) => getVoiceIdentity(voice) === state.lianVoiceIdentity);
     if (lockedVoice) {
+      const xiaoxiaoVoice = voices.find(isLianXiaoxiaoVoice);
+      if (xiaoxiaoVoice && !isLianXiaoxiaoVoice(lockedVoice)) {
+        state.lianVoice = xiaoxiaoVoice;
+        state.lianVoiceIdentity = getVoiceIdentity(xiaoxiaoVoice);
+        return xiaoxiaoVoice;
+      }
       state.lianVoice = lockedVoice;
       return lockedVoice;
     }
@@ -4466,6 +5170,63 @@ function splitLianSpeechText(text) {
   return chunks.filter(Boolean);
 }
 
+async function playCloudLianSpeech(speechText, speechRequestId, publishText) {
+  if (state.isMuted || !speechText) return false;
+  const response = await fetch("/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: speechText })
+  });
+  if (!response.ok) return false;
+  const audioBlob = await response.blob();
+  if (!audioBlob.size || speechRequestId !== state.lianSpeechRequestId) return false;
+
+  const audioUrl = URL.createObjectURL(audioBlob);
+  const audio = getLianAudioElement();
+  audio.pause();
+  audio.src = audioUrl;
+  audio.preload = "auto";
+  audio.muted = false;
+  audio.volume = LIAN_VOICE_VOLUME;
+  state.currentLianUtterance = audio;
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    const cleanup = (played) => {
+      if (settled) return;
+      settled = true;
+      audio.onplaying = null;
+      audio.onended = null;
+      audio.onerror = null;
+      audio.onabort = null;
+      if (audio.src === audioUrl) {
+        audio.removeAttribute("src");
+        audio.load();
+      }
+      URL.revokeObjectURL(audioUrl);
+      resolve(Boolean(played));
+    };
+    audio.onplaying = () => {
+      if (speechRequestId !== state.lianSpeechRequestId) {
+        audio.pause();
+        cleanup(false);
+        return;
+      }
+      publishText();
+    };
+    audio.onended = () => cleanup(true);
+    audio.onerror = () => cleanup(false);
+    audio.onabort = () => cleanup(false);
+    audio.onpause = () => {
+      if (speechRequestId !== state.lianSpeechRequestId) cleanup(false);
+    };
+    audio.play().catch((error) => {
+      console.warn("[tts] cloud audio playback failed:", error?.name || error);
+      cleanup(false);
+    });
+  });
+}
+
 function lianSpeak(text, options = {}) {
   if (state.teachSessionPaused && options.allowWhilePaused !== true) return Promise.resolve(false);
   const now = Date.now();
@@ -4479,14 +5240,19 @@ function lianSpeak(text, options = {}) {
 
   if (dedupeKey) state.spokenGuidanceByKey.set(dedupeKey, now);
   state.lastGuideAt = now;
-  dom.lianBubble.textContent = text;
   dom.lianState.textContent = "正在回应";
   dom.lianAvatar.classList.remove("listening");
   dom.lianAvatar.classList.add("speaking");
-  if (options.log !== false) addLog("恋恋", text, { key: options.logKey || (dedupeKey ? `lian:${dedupeKey}` : "") });
-
-  if (options.trackQuestion !== false) rememberLianQuestion(text);
+  let textPublished = false;
+  const publishText = () => {
+    if (textPublished) return;
+    textPublished = true;
+    dom.lianBubble.textContent = text;
+    if (options.log !== false) addLog("恋恋", text, { key: options.logKey || (dedupeKey ? `lian:${dedupeKey}` : "") });
+    if (options.trackQuestion !== false) rememberLianQuestion(text);
+  };
   const speechRequestId = ++state.lianSpeechRequestId;
+  stopLianSpeechOutput();
   const pausedRecognition = pauseRecognitionForLianSpeech();
 
   return new Promise((resolve) => {
@@ -4495,6 +5261,7 @@ function lianSpeak(text, options = {}) {
     const finishSpeaking = () => {
       if (finished) return;
       finished = true;
+      publishText();
       if (fallbackTimer) clearTimeout(fallbackTimer);
       if (speechRequestId === state.lianSpeechRequestId) {
         clearInterval(state.lianSpeechKeepAliveTimer);
@@ -4508,11 +5275,12 @@ function lianSpeak(text, options = {}) {
       resolve();
     };
 
-    if (!state.isMuted && "speechSynthesis" in window) {
+    const playBrowserSpeech = () => {
+      if (state.isMuted || !("speechSynthesis" in window)) return false;
       window.speechSynthesis.cancel();
       if (speechRequestId !== state.lianSpeechRequestId) {
         finishSpeaking();
-        return;
+        return true;
       }
       try {
         refreshLianVoice();
@@ -4520,7 +5288,7 @@ function lianSpeak(text, options = {}) {
         const chunks = splitLianSpeechText(speechText);
         if (!chunks.length) {
           finishSpeaking();
-          return;
+          return true;
         }
         const startSpeech = (voice, chunkIndex = 0, retried = false) => {
           if (finished || speechRequestId !== state.lianSpeechRequestId) {
@@ -4538,6 +5306,9 @@ function lianSpeak(text, options = {}) {
           utterance.rate = LIAN_VOICE_RATE;
           utterance.pitch = LIAN_VOICE_PITCH;
           utterance.volume = LIAN_VOICE_VOLUME;
+          utterance.onstart = () => {
+            publishText();
+          };
           utterance.onend = () => {
             if (fallbackTimer) clearTimeout(fallbackTimer);
             fallbackTimer = null;
@@ -4572,10 +5343,28 @@ function lianSpeak(text, options = {}) {
         console.warn("Lian speech fallback:", error);
         finishSpeaking();
       }
-      return;
-    }
+      return true;
+    };
 
-    fallbackTimer = setTimeout(finishSpeaking, 260);
+    void (async () => {
+      if (!state.isMuted) {
+        try {
+          if (state.lianAudioUnlockPromise) await state.lianAudioUnlockPromise;
+          const speechText = prepareLianSpeechText(text);
+          const playedCloud = await playCloudLianSpeech(speechText, speechRequestId, publishText);
+          if (playedCloud) {
+            finishSpeaking();
+            return;
+          }
+        } catch (error) {
+          console.warn("Cloud Lian speech fallback:", error);
+        }
+      }
+      if (finished) return;
+      if (playBrowserSpeech()) return;
+      publishText();
+      fallbackTimer = setTimeout(finishSpeaking, 260);
+    })();
   });
 }
 
@@ -4662,6 +5451,8 @@ async function verifyBoardAndCompleteQuestion(options = {}) {
         ? `${feedback} 板书里也有正确的关键步骤，这道题可以结束。`
         : "最终答案和板书里的关键步骤都核对好了，这道题可以结束。"
     );
+    dom.recognitionPill.classList.add("hidden");
+    await new Promise((resolve) => setTimeout(resolve, 160));
     await saveCurrentQuestionAndContinue();
     return true;
   } catch (error) {
@@ -4677,7 +5468,7 @@ async function verifyBoardAndCompleteQuestion(options = {}) {
   }
 }
 
-async function handleFinalAnswerSubmission(answer) {
+async function handleFinalAnswerSubmission(answer, options = {}) {
   const question = currentPageQuestion();
   if (!question || !answer.trim()) return;
   const requestId = ++state.finalAnswerRequestId;
@@ -4690,7 +5481,7 @@ async function handleFinalAnswerSubmission(answer) {
   dom.finishQuestionBtn.disabled = true;
   dom.recognitionPill.textContent = "正在核对最后答案";
   dom.recognitionPill.classList.remove("hidden");
-  addLog("我", answer);
+  if (!options.silentLog) addLog("我", answer);
 
   try {
     const result = await requestFinalAnswerCheck(answer);
@@ -4700,11 +5491,22 @@ async function handleFinalAnswerSubmission(answer) {
       state.finalAnswerVerified = true;
       state.verifiedFinalAnswerText = answer.trim();
       state.awaitingFinalAnswer = false;
-      state.boardCompletionVerified = false;
+      state.boardCompletionVerified = Boolean(options.boardAlreadyVerified);
       state.currentQuestionCompleted = false;
       dom.finishQuestionBtn.disabled = false;
       setGuideState(GUIDE_STATES.INTERACTIVE);
       const feedback = String(result.feedback || "").trim();
+      if (state.boardCompletionVerified) {
+        if (markCurrentQuestionComplete()) {
+          await lianSpeak(feedback || "答案和板书都核对好了。", {
+            dedupeKey: `final-answer-board-correct:${question.id}:${answer.trim()}`,
+            cooldownMs: 0,
+            allowRepeat: true
+          });
+          await saveCurrentQuestionAndContinue({ feedback });
+        }
+        return;
+      }
       await lianSpeak(
         `${
           feedback || "最后答案正确。"
@@ -4906,6 +5708,52 @@ function buildMistakePoints(question, lectureText) {
   return points.slice(0, 3);
 }
 
+function normalizeArchiveDedupeText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/题图中的原错痕迹[:：]?/g, "")
+    .replace(/原错痕迹[:：]?/g, "")
+    .replace(/[“”"'‘’\s，。；;：:、（）()【】\[\]{}<>《》.!?？]/g, "")
+    .toLowerCase();
+}
+
+function cleanLianSummaryText(summary, fallbackSummary = "") {
+  const value = String(summary || "").trim();
+  if (!value) return fallbackSummary;
+  const withoutMistakeTail = value
+    .replace(/[；;。]?\s*易错点(?:是|在于|为)?[^。；;]*[。；;]?/g, "")
+    .replace(/[；;。]?\s*(?:原错痕迹|之前错在|容易错在|误以为|错选|被叉掉|被红笔划去|多选了)[^。；;]*[。；;]?/g, "")
+    .trim();
+  const parts = withoutMistakeTail
+    .split(/(?<=[。！？!?；;])/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .filter((part) => !/(?:易错点|原错痕迹|之前错在|容易错在|误以为|错选|被叉掉|被红笔划去|多选了)/.test(part));
+  const cleaned = (parts.join("") || withoutMistakeTail).trim();
+  return cleaned || fallbackSummary || value;
+}
+
+function dedupeMistakePoints(points = [], lianSummary = "") {
+  const summaryKey = normalizeArchiveDedupeText(lianSummary);
+  const unique = [];
+  const seen = new Set();
+  (Array.isArray(points) ? points : []).forEach((point) => {
+    const text = String(point || "").trim();
+    if (!text) return;
+    const key = normalizeArchiveDedupeText(text).slice(0, 48);
+    if (!key || seen.has(key)) return;
+    if (summaryKey && key.length >= 12 && summaryKey.includes(key)) return;
+    const overlapsExisting = unique.some((existing) => {
+      const existingKey = normalizeArchiveDedupeText(existing);
+      return key.length >= 16 && (existingKey.includes(key) || key.includes(existingKey.slice(0, 48)));
+    });
+    if (overlapsExisting) return;
+    seen.add(key);
+    unique.push(text);
+  });
+  return unique.slice(0, 4);
+}
+
 async function requestArchiveSummary(question, lectureText, boardImage) {
   const response = await fetch("/api/archive-summary", {
     method: "POST",
@@ -4931,10 +5779,12 @@ async function requestArchiveSummary(question, lectureText, boardImage) {
   if (observedWrongTrace && !mistakePoints.some((point) => point.includes(observedWrongTrace.slice(0, 8)))) {
     mistakePoints.unshift(`题图中的原错痕迹：${observedWrongTrace}`);
   }
+  const fallbackSummary = buildLianArchiveSummary(question, lectureText);
+  const lianSummary = cleanLianSummaryText(result.lianSummary, fallbackSummary);
 
   return {
-    lianSummary: String(result.lianSummary || "").trim(),
-    mistakePoints: mistakePoints.slice(0, 4),
+    lianSummary,
+    mistakePoints: dedupeMistakePoints(mistakePoints, lianSummary),
     observedWrongTrace,
     reviewFocus: String(result.reviewFocus || "").trim(),
     archiveProvider: result.provider || "",
@@ -4969,6 +5819,18 @@ async function buildNotebookRecord(question) {
   const now = new Date();
   const reviewAt = new Date(now.getTime() + 4 * 60 * 60 * 1000);
   const boardImage = getBoardImageForGuide();
+  const verifiedAnswerKey =
+    state.answerKeysByQuestion[question.id] ||
+    (await prefetchVerifiedAnswerKey(question)) ||
+    {
+      ready: false,
+      status: "not-fetched",
+      confidence: 0,
+      canonicalAnswer: "",
+      acceptedAnswers: [],
+      solutionOutline: [],
+      verificationChecks: []
+    };
   let archiveSummary = {
     lianSummary: buildLianArchiveSummary(question, lectureText),
     mistakePoints: buildMistakePoints(question, lectureText),
@@ -4994,6 +5856,10 @@ async function buildNotebookRecord(question) {
     strokeImages,
     lectureText,
     transcript: lectureText,
+    answerKey: verifiedAnswerKey,
+    verifiedAnswer: verifiedAnswerKey.ready ? verifiedAnswerKey.canonicalAnswer : state.verifiedFinalAnswerText,
+    answerKeyStatus: verifiedAnswerKey.status,
+    answerKeyConfidence: verifiedAnswerKey.confidence,
     lianSummary: archiveSummary.lianSummary,
     mistakePoints: archiveSummary.mistakePoints,
     observedWrongTrace: archiveSummary.observedWrongTrace,
@@ -5429,14 +6295,15 @@ function getRecordLectureText(record) {
 
 function getRecordLianSummary(record) {
   const saved = String(record?.lianSummary || record?.aiSummary || "").trim();
-  if (saved) return saved;
-  return buildLianArchiveSummary(
+  const fallback = buildLianArchiveSummary(
     {
       title: record?.title || "这道错题",
       knowledge: record?.knowledge || ""
     },
     getRecordLectureText(record)
   );
+  if (saved) return cleanLianSummaryText(saved, fallback);
+  return fallback;
 }
 
 function getRecordMistakePoints(record) {
@@ -5447,12 +6314,12 @@ function getRecordMistakePoints(record) {
     if (observedWrongTrace && !normalized.some((point) => point.includes(observedWrongTrace.slice(0, 8)))) {
       normalized.unshift(`题图中的原错痕迹：${observedWrongTrace}`);
     }
-    return normalized.slice(0, 4);
+    return dedupeMistakePoints(normalized, getRecordLianSummary(record));
   }
   const text = getRecordLectureText(record);
   const fallback = buildMistakePoints({ title: record?.title || "", problemText: "" }, text);
   if (observedWrongTrace) fallback.unshift(`题图中的原错痕迹：${observedWrongTrace}`);
-  return fallback.slice(0, 4);
+  return dedupeMistakePoints(fallback, getRecordLianSummary(record));
 }
 
 function getRecordReviewPlan(record) {

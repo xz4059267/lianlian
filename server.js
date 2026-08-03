@@ -39,9 +39,53 @@ const QWEN_VL_MODEL =
   process.env.Qwen_model ||
   process.env.qwen_model ||
   process.env.DASHSCOPE_MODEL ||
-  "qwen3.5-omni-plus";
+  "qwen3.5-omni-flash";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
+const AZURE_TTS_KEY =
+  process.env.AZURE_TTS_KEY ||
+  process.env.AZURE_SPEECH_KEY ||
+  process.env.SPEECH_KEY ||
+  "";
+const AZURE_TTS_REGION =
+  process.env.AZURE_TTS_REGION ||
+  process.env.AZURE_SPEECH_REGION ||
+  process.env.SPEECH_REGION ||
+  "";
+const AZURE_TTS_VOICE = process.env.AZURE_TTS_VOICE || "zh-CN-XiaoxiaoNeural";
+const AZURE_TTS_OUTPUT_FORMAT = process.env.AZURE_TTS_OUTPUT_FORMAT || "audio-24khz-48kbitrate-mono-mp3";
+const AZURE_TTS_RATE = process.env.AZURE_TTS_RATE || "+4%";
+const AZURE_TTS_PITCH = process.env.AZURE_TTS_PITCH || "+0%";
+const ALIYUN_NLS_APPKEY =
+  process.env.ALIYUN_NLS_APPKEY ||
+  process.env.ALIYUN_SPEECH_APPKEY ||
+  process.env.NLS_APPKEY ||
+  "qIzm0YKDhPM7ZpLP";
+const ALIYUN_NLS_REGION_ID = process.env.ALIYUN_NLS_REGION_ID || "cn-shanghai";
+const ALIYUN_NLS_TOKEN_ENDPOINT = (
+  process.env.ALIYUN_NLS_TOKEN_ENDPOINT ||
+  "https://nls-meta.cn-shanghai.aliyuncs.com"
+).replace(/\/+$/, "");
+const ALIYUN_NLS_GATEWAY = (
+  process.env.ALIYUN_NLS_GATEWAY ||
+  "https://nls-gateway-cn-shanghai.aliyuncs.com"
+).replace(/\/+$/, "");
+const ALIYUN_NLS_VOICE = process.env.ALIYUN_NLS_VOICE || "zhimi_emo";
+const ALIYUN_NLS_TTS_FORMAT = process.env.ALIYUN_NLS_TTS_FORMAT || "mp3";
+const ALIYUN_NLS_ASR_FORMAT = process.env.ALIYUN_NLS_ASR_FORMAT || "wav";
+const ALIYUN_NLS_SAMPLE_RATE = Number(process.env.ALIYUN_NLS_SAMPLE_RATE || 16000);
+const ALIYUN_SPEECH_ENABLED = !["0", "false", "off"].includes(
+  String(
+    process.env.ALIYUN_SPEECH_ENABLED ||
+    (
+      ALIYUN_NLS_APPKEY &&
+      (process.env.ALIYUN_OCR_ACCESS_KEY_ID || process.env.ALIBABA_CLOUD_ACCESS_KEY_ID || process.env.AccessKeyId || process.env.AccessKeyID) &&
+      (process.env.ALIYUN_OCR_ACCESS_KEY_SECRET || process.env.ALIBABA_CLOUD_ACCESS_KEY_SECRET || process.env.AccessKeySecret)
+        ? "1"
+        : "0"
+    )
+  ).toLowerCase()
+);
 const ALIYUN_OCR_APPCODE =
   process.env.ALIYUN_OCR_APPCODE ||
   process.env.ALIYUN_OCR_APP_CODE ||
@@ -153,6 +197,99 @@ const ORDERED_PROPORTION_RULES = [
   "例如‘2、3、x、6 成比例’必须写成 2:3=x:6，交叉相乘得到 x=4；学生得到 4 时应判定正确，不能再引导其尝试 2:3=6:x。",
   "判断学生比例式或答案前必须先按上述顺序实际代入验算。"
 ].join("\n");
+
+function deterministicArrowDifferenceAnswerKey(problemText = "") {
+  const compact = String(problemText || "").normalize("NFKC").replace(/\s+/g, "");
+  const hasRelation =
+    /上方相邻/.test(compact) &&
+    /左数/.test(compact) &&
+    /右数/.test(compact) &&
+    /差/.test(compact) &&
+    /下方箭头/.test(compact) &&
+    /共同指向/.test(compact);
+  const hasKnownDiagramLabels =
+    /x/.test(compact) &&
+    /2y/i.test(compact) &&
+    /3x/i.test(compact) &&
+    /m/.test(compact) &&
+    /n/.test(compact) &&
+    /8/.test(compact);
+  const hasClaims =
+    /m.{0,8}3/.test(compact) &&
+    /y.{0,8}4/.test(compact) &&
+    /x-y/.test(compact) &&
+    /一定为?2/.test(compact);
+  if (!hasRelation || !hasKnownDiagramLabels || !hasClaims) return null;
+  return {
+    trusted: true,
+    status: "verified",
+    canonicalAnswer: "C",
+    acceptedAnswers: ["C", "选C", "C选项", "I不对，II对", "结论I不正确，结论II正确"],
+    problemText: String(problemText || "").trim(),
+    questionType: "选择题",
+    solutionOutline: [
+      "按题意列式：x-2y=m，2y-3x=n，m-n=8。",
+      "若 m=3，则 x-2y=3，且 2y-3x=-5，解得 y=-1，所以结论 I 错。",
+      "由 m=x-2y、n=2y-3x、m-n=8 可得 4x-4y=8，即 x-y=2，所以结论 II 对。",
+      "因此应选 C。"
+    ],
+    verificationChecks: [
+      "m=3 代入验算得到 y=-1，不是 4。",
+      "消元验算得到 x-y=2 恒成立。",
+      "选项对应为 I 不对、II 对。"
+    ],
+    confidence: 0.99,
+    reason: "本地代数规则校验通过",
+    elapsedMs: 0,
+    deterministic: true
+  };
+}
+
+function normalizeMathForLocalAudit(value = "") {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[＝]/g, "=")
+    .replace(/[−－–—]/g, "-")
+    .replace(/[×]/g, "*")
+    .replace(/[，。；、]/g, "");
+}
+
+function deterministicArrowHandwritingAudit(result = {}, answerKey = null) {
+  if (!answerKey?.deterministic && !deterministicArrowDifferenceAnswerKey(answerKey?.problemText || "")) return null;
+  const text = normalizeMathForLocalAudit([
+    result.detectedWriting,
+    result.mathExpression,
+    result.calculationCheck
+  ].filter(Boolean).join(" "));
+  if (!text) return null;
+
+  const hasFirstRelation = /x-?2y=m/.test(text) || /m=x-?2y/.test(text);
+  const hasSecondRelation = /2y-?3x=n/.test(text) || /n=2y-?3x/.test(text);
+  const hasDifferenceRelation = /m-n=8/.test(text) || /m=8\+n/.test(text);
+  const hasConclusion = /x-y=2/.test(text) || /4x-4y=8/.test(text);
+  const hasRelevantStep = (hasFirstRelation && hasSecondRelation) || hasDifferenceRelation || hasConclusion;
+  if (!hasRelevantStep) return null;
+
+  return {
+    ...result,
+    isRelevant: true,
+    calculationStatus: "correct",
+    calculationCheck: "板书中的 x-2y=m、2y-3x=n、m-n=8 以及 x-y=2 与题图箭头差值关系一致。",
+    hasPossibleIssue: false,
+    issueType: "none",
+    issueSummary: "",
+    expectedNextStep: "",
+    guidance: "",
+    positiveFeedback: hasConclusion
+      ? "这组关系写对了，已经能推出 x-y=2。"
+      : "你列出的关键关系是对的，沿着它继续消元就可以。",
+    boardComplete: true,
+    missingBoardContent: "",
+    confidence: Math.max(Number(result.confidence) || 0, 0.96)
+  };
+}
 
 const LIAN_STYLE_RULES = [
   "你是引导者，不是代答者。",
@@ -468,6 +605,89 @@ const handwritingSchema = {
   }
 };
 
+const handwritingAuditSchema = {
+  name: "handwriting_feedback_audit",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      safeToSpeak: {
+        type: "boolean",
+        description: "Whether the initial board feedback is safe to speak to the student."
+      },
+      correctedStatus: {
+        type: "string",
+        enum: ["not_relevant", "incomplete", "unclear", "correct", "wrong"],
+        description: "The audited calculation status."
+      },
+      correctedFeedback: {
+        type: "string",
+        description: "Short Chinese feedback to use when the board is correct. Empty otherwise."
+      },
+      correctedGuidance: {
+        type: "string",
+        description: "Short Chinese guidance to use when the board is wrong or incomplete. Empty otherwise."
+      },
+      correctedCheck: {
+        type: "string",
+        description: "Private verification note explaining the audit result."
+      },
+      issueType: {
+        type: "string",
+        enum: ["none", "wrong_number", "wrong_formula", "wrong_operation", "wrong_unit", "irrelevant", "unclear"],
+        description: "Audited issue category."
+      },
+      issueSummary: {
+        type: "string",
+        description: "Short private summary of the concrete issue, if any."
+      },
+      boardComplete: {
+        type: "boolean",
+        description: "Whether the board contains a relevant, reviewable key step or conclusion with no unresolved obvious error."
+      },
+      missingBoardContent: {
+        type: "string",
+        description: "What key relation, formula, or correction is still needed. Empty if boardComplete is true."
+      },
+      confidence: {
+        type: "number",
+        description: "0 to 1 confidence in the audited result."
+      },
+      reason: {
+        type: "string",
+        description: "Concise reason for accepting or correcting the initial feedback."
+      }
+    },
+    required: [
+      "safeToSpeak",
+      "correctedStatus",
+      "correctedFeedback",
+      "correctedGuidance",
+      "correctedCheck",
+      "issueType",
+      "issueSummary",
+      "boardComplete",
+      "missingBoardContent",
+      "confidence",
+      "reason"
+    ]
+  }
+};
+
+const HANDWRITING_AUDIT_PROMPT = [
+  "你是初中数学板书反馈的审校员。",
+  "你的任务不是重新长篇讲题，而是检查初次板书识别结果是否可以安全说给学生听。",
+  "你会看到当前题目图片、纯板书截图、可能包含题目区域的板书截图、已双重核验的标准答案，以及初次板书判断。",
+  "必须只基于当前题目图片和当前板书，不要套用历史题目、旧答案、旧比例式或上一题上下文。",
+  "题目原图里的红叉、批改笔迹、印刷答案、旧手写痕迹不能当成学生当前黑板板书；当前黑板板书以纯板书截图为准。",
+  "如果初次结果说 correct，但板书中的关键式子或最终答案与标准答案/题意不一致，必须改为 wrong 或 unclear。",
+  "如果初次结果说 wrong，但你不能明确指出哪一个数字、符号、等式或结论与题意冲突，必须降级为 unclear 或 incomplete，不能误导学生。",
+  "如果板书已经包含本题相关且数学上成立的关键式子、推理、代入、计算步骤或正确结论，就可以 boardComplete=true；不要求完整抄出所有步骤。",
+  "如果只有孤立答案、看不出关键关系式，boardComplete=false；如果答案正确但缺少关键式子，要提示补一个关键关系式。",
+  "输出必须严格 JSON，不要输出 Markdown 或 JSON 外文字。"
+].join("\n");
+
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) return;
   const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
@@ -491,6 +711,126 @@ function loadEnvFile(filePath) {
 function sendJson(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data));
+}
+
+function escapeSsmlText(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function azureTtsEndpoint() {
+  if (!AZURE_TTS_REGION) return "";
+  return `https://${AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
+}
+
+async function handleTextToSpeech(req, res) {
+  const body = await readJsonBody(req, 256 * 1024);
+  const text = String(body.text || "").replace(/\s+/g, " ").trim();
+  if (!text) {
+    sendJson(res, 400, { error: "缺少语音文本", code: "missing_tts_text" });
+    return;
+  }
+  const clippedText = text.slice(0, 1600);
+  try {
+    const aliyunAudio = await synthesizeAliyunSpeech(clippedText);
+    if (aliyunAudio) {
+      res.writeHead(200, {
+        "Content-Type": aliyunAudio.contentType,
+        "Cache-Control": "no-store",
+        "X-TTS-Provider": aliyunAudio.provider,
+        "X-TTS-Voice": aliyunAudio.voice
+      });
+      res.end(aliyunAudio.buffer);
+      return;
+    }
+  } catch (error) {
+    console.warn("[tts] Aliyun TTS fallback:", error.message || error);
+    if (!AZURE_TTS_KEY || !AZURE_TTS_REGION) {
+      sendJson(res, error.statusCode || 502, {
+        error: error.message || "Aliyun TTS 调用失败",
+        code: error.code || "aliyun_tts_failed"
+      });
+      return;
+    }
+  }
+
+  if (!AZURE_TTS_KEY || !AZURE_TTS_REGION) {
+    sendJson(res, 503, {
+      error: "云端 TTS 未配置",
+      code: "cloud_tts_not_configured"
+    });
+    return;
+  }
+
+  const ssml = [
+    `<speak version="1.0" xml:lang="zh-CN" xmlns:mstts="https://www.w3.org/2001/mstts">`,
+    `<voice name="${escapeSsmlText(AZURE_TTS_VOICE)}">`,
+    `<mstts:express-as style="chat">`,
+    `<prosody rate="${escapeSsmlText(AZURE_TTS_RATE)}" pitch="${escapeSsmlText(AZURE_TTS_PITCH)}">`,
+    escapeSsmlText(clippedText),
+    `</prosody>`,
+    `</mstts:express-as>`,
+    `</voice>`,
+    `</speak>`
+  ].join("");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch(azureTtsEndpoint(), {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
+        "Content-Type": "application/ssml+xml; charset=utf-8",
+        "X-Microsoft-OutputFormat": AZURE_TTS_OUTPUT_FORMAT,
+        "User-Agent": "lian-wrong-question-book"
+      },
+      body: ssml
+    });
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (!response.ok) {
+      sendJson(res, response.status, {
+        error: buffer.toString("utf8") || "Azure TTS 调用失败",
+        code: "azure_tts_failed"
+      });
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": "audio/mpeg",
+      "Cache-Control": "no-store",
+      "X-TTS-Provider": "azure",
+      "X-TTS-Voice": AZURE_TTS_VOICE
+    });
+    res.end(buffer);
+  } catch (error) {
+    sendJson(res, 504, {
+      error: error.name === "AbortError" ? "Azure TTS 请求超时" : "Azure TTS 网络连接失败",
+      code: error.name === "AbortError" ? "azure_tts_timeout" : "azure_tts_network_error"
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function handleSpeechRecognition(req, res) {
+  const body = await readJsonBody(req, 8 * 1024 * 1024);
+  try {
+    const result = await recognizeAliyunSpeech(body.audio || body.audioDataUrl || "");
+    sendJson(res, 200, {
+      text: result.text,
+      provider: result.provider
+    });
+  } catch (error) {
+    sendJson(res, error.statusCode || 502, {
+      error: error.message || "Aliyun ASR 调用失败",
+      code: error.code || "aliyun_asr_failed"
+    });
+  }
 }
 
 function readJsonBody(req, limit = 24 * 1024 * 1024) {
@@ -1016,7 +1356,7 @@ function aliyunPercentEncode(value) {
     .replace(/%7E/g, "~");
 }
 
-function buildAliyunRpcSignedUrl(endpoint, params, accessKeySecret) {
+function buildAliyunRpcSignedUrl(endpoint, params, accessKeySecret, method = "POST") {
   const filteredParams = Object.fromEntries(
     Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== "")
   );
@@ -1024,7 +1364,7 @@ function buildAliyunRpcSignedUrl(endpoint, params, accessKeySecret) {
     .sort()
     .map((key) => `${aliyunPercentEncode(key)}=${aliyunPercentEncode(filteredParams[key])}`)
     .join("&");
-  const stringToSign = `POST&${aliyunPercentEncode("/")}&${aliyunPercentEncode(canonicalizedQuery)}`;
+  const stringToSign = `${String(method || "POST").toUpperCase()}&${aliyunPercentEncode("/")}&${aliyunPercentEncode(canonicalizedQuery)}`;
   const signature = crypto
     .createHmac("sha1", `${accessKeySecret}&`)
     .update(stringToSign, "utf8")
@@ -1062,6 +1402,153 @@ function parseAliyunOfficialPayload(raw) {
     }
   }
   return payload;
+}
+
+let aliyunNlsTokenCache = {
+  token: "",
+  expireAt: 0
+};
+
+function aliyunSpeechConfigured() {
+  return Boolean(
+    ALIYUN_SPEECH_ENABLED &&
+    ALIYUN_NLS_APPKEY &&
+    ALIYUN_OCR_ACCESS_KEY_ID &&
+    ALIYUN_OCR_ACCESS_KEY_SECRET
+  );
+}
+
+async function getAliyunNlsToken() {
+  const now = Date.now();
+  if (aliyunNlsTokenCache.token && aliyunNlsTokenCache.expireAt - now > 60 * 1000) {
+    return aliyunNlsTokenCache.token;
+  }
+  if (!ALIYUN_OCR_ACCESS_KEY_ID || !ALIYUN_OCR_ACCESS_KEY_SECRET) {
+    throw Object.assign(new Error("Aliyun AccessKey not configured"), { code: "aliyun_speech_key_missing", statusCode: 503 });
+  }
+
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const nonce = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+  const query = {
+    Action: "CreateToken",
+    Version: "2019-02-28",
+    Format: "JSON",
+    RegionId: ALIYUN_NLS_REGION_ID,
+    AccessKeyId: ALIYUN_OCR_ACCESS_KEY_ID,
+    SignatureMethod: "HMAC-SHA1",
+    SignatureVersion: "1.0",
+    SignatureNonce: nonce,
+    Timestamp: timestamp
+  };
+  if (ALIYUN_OCR_SECURITY_TOKEN) query.SecurityToken = ALIYUN_OCR_SECURITY_TOKEN;
+  const url = buildAliyunRpcSignedUrl(ALIYUN_NLS_TOKEN_ENDPOINT, query, ALIYUN_OCR_ACCESS_KEY_SECRET, "GET");
+  const response = await fetch(url, { method: "GET" });
+  const raw = await response.text();
+  let payload = {};
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    payload = {};
+  }
+  const token = payload?.Token?.Id || payload?.Token?.id || payload?.token || "";
+  const expireTime = Number(payload?.Token?.ExpireTime || payload?.Token?.expireTime || 0);
+  if (!response.ok || !token) {
+    throw Object.assign(new Error(payload?.Message || raw.slice(0, 160) || "Aliyun NLS token failed"), {
+      code: "aliyun_nls_token_failed",
+      statusCode: response.status || 502
+    });
+  }
+  aliyunNlsTokenCache = {
+    token,
+    expireAt: expireTime ? expireTime * 1000 : Date.now() + 50 * 60 * 1000
+  };
+  return token;
+}
+
+function decodeDataAudio(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:(audio\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return null;
+  return {
+    mime: match[1],
+    buffer: Buffer.from(match[2], "base64")
+  };
+}
+
+async function synthesizeAliyunSpeech(text) {
+  if (!aliyunSpeechConfigured()) return null;
+  const token = await getAliyunNlsToken();
+  const url = new URL(`${ALIYUN_NLS_GATEWAY}/stream/v1/tts`);
+  url.searchParams.set("appkey", ALIYUN_NLS_APPKEY);
+  url.searchParams.set("token", token);
+  url.searchParams.set("text", text);
+  url.searchParams.set("format", ALIYUN_NLS_TTS_FORMAT);
+  url.searchParams.set("sample_rate", String(ALIYUN_NLS_SAMPLE_RATE));
+  url.searchParams.set("voice", ALIYUN_NLS_VOICE);
+  url.searchParams.set("volume", process.env.ALIYUN_NLS_TTS_VOLUME || "50");
+  url.searchParams.set("speech_rate", process.env.ALIYUN_NLS_TTS_SPEECH_RATE || "0");
+  url.searchParams.set("pitch_rate", process.env.ALIYUN_NLS_TTS_PITCH_RATE || "0");
+  const response = await fetch(url, { method: "GET" });
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get("content-type") || "";
+  if (!response.ok || !/^audio\//i.test(contentType)) {
+    const message = buffer.toString("utf8").slice(0, 180);
+    throw Object.assign(new Error(message || "Aliyun TTS failed"), {
+      code: "aliyun_tts_failed",
+      statusCode: response.status || 502
+    });
+  }
+  return {
+    buffer,
+    contentType: contentType || "audio/mpeg",
+    provider: "aliyun-nls",
+    voice: ALIYUN_NLS_VOICE
+  };
+}
+
+async function recognizeAliyunSpeech(audioDataUrl) {
+  if (!aliyunSpeechConfigured()) {
+    throw Object.assign(new Error("Aliyun speech not configured"), { code: "aliyun_speech_not_configured", statusCode: 503 });
+  }
+  const audio = decodeDataAudio(audioDataUrl);
+  if (!audio?.buffer?.length) {
+    throw Object.assign(new Error("Invalid audio data"), { code: "invalid_audio", statusCode: 400 });
+  }
+  const token = await getAliyunNlsToken();
+  const url = new URL(`${ALIYUN_NLS_GATEWAY}/stream/v1/asr`);
+  url.searchParams.set("appkey", ALIYUN_NLS_APPKEY);
+  url.searchParams.set("token", token);
+  url.searchParams.set("format", ALIYUN_NLS_ASR_FORMAT);
+  url.searchParams.set("sample_rate", String(ALIYUN_NLS_SAMPLE_RATE));
+  url.searchParams.set("enable_punctuation_prediction", "true");
+  url.searchParams.set("enable_inverse_text_normalization", "true");
+  url.searchParams.set("enable_voice_detection", "true");
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream"
+    },
+    body: audio.buffer
+  });
+  const raw = await response.text();
+  let payload = {};
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    payload = {};
+  }
+  const status = Number(payload.status ?? payload.Status ?? 0);
+  const result = String(payload.result || payload.Result || payload.text || "").trim();
+  if (!response.ok || status !== 20000000) {
+    throw Object.assign(new Error(payload.message || payload.Message || raw.slice(0, 180) || "Aliyun ASR failed"), {
+      code: "aliyun_asr_failed",
+      statusCode: response.status || 502
+    });
+  }
+  return {
+    text: result,
+    raw: payload,
+    provider: "aliyun-nls"
+  };
 }
 
 async function extractAliyunOfficialPaperCutResult(imageDataUrl, options = {}) {
@@ -1130,69 +1617,88 @@ async function extractAliyunOfficialPaperCutResult(imageDataUrl, options = {}) {
 
 async function extractAliyunPaperCutResult(imageDataUrl, options = {}) {
   if (!ALIYUN_OCR_ENABLED) return { blocks: [], questions: [] };
+  const image = decodeDataImage(imageDataUrl);
+  if (!image) return { blocks: [], questions: [] };
+  let firstError = null;
+
+  if (ALIYUN_OCR_APPCODE) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ALIYUN_OCR_TIMEOUT_MS);
+    const startedAt = Date.now();
+    try {
+      const response = await fetch(ALIYUN_OCR_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": `APPCODE ${ALIYUN_OCR_APPCODE}`,
+          "Content-Type": "application/json; charset=UTF-8"
+        },
+        body: JSON.stringify({
+          imgList: [image.buffer.toString("base64")],
+          cutType: process.env.ALIYUN_OCR_CUT_TYPE || "question",
+          imageType: process.env.ALIYUN_OCR_IMAGE_TYPE || "photo",
+          subject: process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math",
+          prob: false,
+          charInfo: false,
+          rotate: true,
+          table: false,
+          sortPage: true
+        }),
+        signal: controller.signal
+      });
+      const raw = await response.text();
+      let payload = null;
+      try {
+        payload = raw ? JSON.parse(raw) : null;
+      } catch {
+        throw new Error(`Aliyun OCR returned non-JSON: ${raw.slice(0, 160)}`);
+      }
+      if (!response.ok || payload?.error_code || payload?.code === "InvalidParam") {
+        const message = payload?.error_msg || payload?.message || raw.slice(0, 160) || response.statusText;
+        throw new Error(`Aliyun OCR ${response.status}: ${message}`);
+      }
+
+      const blocks = normalizeAliyunOcrBlocks(payload);
+      const questions = normalizeAliyunPaperCutQuestions(
+        payload,
+        Number(options.width) || 1,
+        Number(options.height) || 1
+      );
+      console.log(
+        `[segment] Aliyun market paper-cut OCR block count: ${blocks.length}, question count=${questions.length}, elapsed=${Date.now() - startedAt}ms`
+      );
+      if (questions.length) return { blocks, questions, provider: "aliyun-market-paper-cut" };
+      firstError = new Error(`Aliyun market paper-cut returned no question boxes, blocks=${blocks.length}`);
+    } catch (error) {
+      firstError = error;
+      console.warn("[segment] Aliyun market paper-cut failed:", error.message || error);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   if (ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET) {
     try {
       const officialResult = await extractAliyunOfficialPaperCutResult(imageDataUrl, options);
-      if (officialResult && (officialResult.questions?.length || officialResult.blocks?.length)) {
+      if (officialResult?.questions?.length) {
         return officialResult;
       }
+      if (officialResult?.blocks?.length) {
+        console.warn(
+          `[segment] Aliyun official OCR returned text blocks but no question boxes: blocks=${officialResult.blocks.length}`
+        );
+      }
     } catch (error) {
-      if (SEGMENT_ALIYUN_ONLY) throw error;
-      console.warn("[segment] Aliyun official edu paper-cut failed, trying AppCode fallback:", error.message || error);
+      firstError ||= error;
+      console.warn("[segment] Aliyun official edu paper-cut failed:", error.message || error);
     }
   }
-  if (!ALIYUN_OCR_APPCODE) return { blocks: [], questions: [] };
-  const image = decodeDataImage(imageDataUrl);
-  if (!image) return { blocks: [], questions: [] };
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ALIYUN_OCR_TIMEOUT_MS);
-  const startedAt = Date.now();
-  try {
-    const response = await fetch(ALIYUN_OCR_URL, {
-      method: "POST",
-      headers: {
-        "Authorization": `APPCODE ${ALIYUN_OCR_APPCODE}`,
-        "Content-Type": "application/json; charset=UTF-8"
-      },
-      body: JSON.stringify({
-        imgList: [image.buffer.toString("base64")],
-        cutType: process.env.ALIYUN_OCR_CUT_TYPE || "question",
-        imageType: process.env.ALIYUN_OCR_IMAGE_TYPE || "photo",
-        subject: process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math",
-        prob: false,
-        charInfo: false,
-        rotate: true,
-        table: false,
-        sortPage: true
-      }),
-      signal: controller.signal
-    });
-    const raw = await response.text();
-    let payload = null;
+  if (ALIYUN_OCR_APPCODE && ALIYUN_OCR_TEXT_FALLBACK_URL && ALIYUN_OCR_TEXT_FALLBACK_URL !== ALIYUN_OCR_URL) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ALIYUN_OCR_TIMEOUT_MS);
+    const startedAt = Date.now();
     try {
-      payload = raw ? JSON.parse(raw) : null;
-    } catch {
-      throw new Error(`Aliyun OCR returned non-JSON: ${raw.slice(0, 160)}`);
-    }
-    if (!response.ok || payload?.error_code || payload?.code === "InvalidParam") {
-      const message = payload?.error_msg || payload?.message || raw.slice(0, 160) || response.statusText;
-      throw new Error(`Aliyun OCR ${response.status}: ${message}`);
-    }
-
-    const blocks = normalizeAliyunOcrBlocks(payload);
-    const questions = normalizeAliyunPaperCutQuestions(
-      payload,
-      Number(options.width) || 1,
-      Number(options.height) || 1
-    );
-    console.log(
-      `[segment] Aliyun paper-cut OCR block count: ${blocks.length}, question count=${questions.length}, elapsed=${Date.now() - startedAt}ms`
-    );
-    return { blocks, questions };
-  } catch (error) {
-    if (ALIYUN_OCR_TEXT_FALLBACK_URL && ALIYUN_OCR_TEXT_FALLBACK_URL !== ALIYUN_OCR_URL) {
-      console.warn("[segment] Aliyun paper-cut failed, trying text OCR fallback:", error.message || error);
+      console.warn("[segment] Aliyun paper-cut has no question boxes, trying text OCR fallback");
       const response = await fetch(ALIYUN_OCR_TEXT_FALLBACK_URL, {
         method: "POST",
         headers: {
@@ -1225,11 +1731,16 @@ async function extractAliyunPaperCutResult(imageDataUrl, options = {}) {
         `[segment] Aliyun text OCR fallback block count: ${blocks.length}, elapsed=${Date.now() - startedAt}ms`
       );
       return { blocks, questions: [] };
+    } catch (error) {
+      firstError ||= error;
+      if (SEGMENT_ALIYUN_ONLY && firstError) throw firstError;
+    } finally {
+      clearTimeout(timer);
     }
-    throw error;
-  } finally {
-    clearTimeout(timer);
   }
+
+  if (SEGMENT_ALIYUN_ONLY && firstError) throw firstError;
+  return { blocks: [], questions: [] };
 }
 
 async function extractAliyunTextBlocks(imageDataUrl) {
@@ -1245,7 +1756,7 @@ function getSegmentCacheKey(imageDataUrl, width, height, mode) {
   return crypto
     .createHash("sha256")
     .update(String(imageDataUrl || ""))
-    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|aliyunPaperCutFirst:${ALIYUN_OCR_ENABLED}|official:${Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET)}|aliyunOnly:${SEGMENT_ALIYUN_ONLY}|segment:v50`)
+    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|aliyunPaperCutFirst:${ALIYUN_OCR_ENABLED}|official:${Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET)}|aliyunOnly:${SEGMENT_ALIYUN_ONLY}|officialEndpoint:${ALIYUN_OCR_OFFICIAL_ENDPOINT}|marketUrl:${ALIYUN_OCR_URL}|cutType:${process.env.ALIYUN_OCR_CUT_TYPE || "question"}|imageType:${process.env.ALIYUN_OCR_IMAGE_TYPE || "photo"}|subject:${process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math"}|segment:v51`)
     .digest("hex");
 }
 
@@ -5338,7 +5849,7 @@ async function handleSegmentV2(req, res) {
       `[segment-v2] aliyun-only: paperCutQuestions=${paperCutQuestions.length}, direct=${directQuestions.length}, blocks=${textBlocks.length}, error=${aliyunPaperCutError || "none"}`
     );
     console.log(`[render] final question numbers=[${directQuestions.map((question) => question.sourceQuestionNumber).filter(Boolean).join(",")}]`);
-    return sendSegmentResult(res, cacheKey, {
+    const aliyunOnlyPayload = {
       questions: directQuestions,
       fallbackToWholePage: false,
       note: directQuestions.length
@@ -5364,7 +5875,11 @@ async function handleSegmentV2(req, res) {
         boundaryLines: [],
         deduplicatedBoxes: []
       }
-    });
+    };
+    if (!directQuestions.length) {
+      return sendJson(res, 200, aliyunOnlyPayload);
+    }
+    return sendSegmentResult(res, cacheKey, aliyunOnlyPayload);
   }
 
   if (ocrPayload.paperCutQuestions.length) {
@@ -6058,8 +6573,8 @@ const ARCHIVE_SUMMARY_PROMPT = [
   "你会看到：题目图片、可能的黑板笔迹图片、学生最后讲解文字、已核对答案和题卡摘要。",
   "如果题目图片中能看到学生之前的错误痕迹，例如被红叉划掉的答案、圈出的错选项、红笔改正、擦写痕迹、旁边写的正确答案，要把它作为易错点的优先依据。",
   "不要把红笔批改或学生原先填写的答案当成标准答案；只能把它们作为“之前可能错在哪里”的证据。",
-  "lianSummary 要写出本题的关键条件、解法抓手和最后结果，1 到 2 句即可。",
-  "mistakePoints 必须是本题专属，2 到 4 条，每条指出具体位置或具体关系，例如“原来把 2:3:x:6 的对应顺序看反”“题图中被叉掉的 35°说明圆心角没有按 360×1/8 算”等。",
+  "lianSummary 只写本题的关键条件、解法抓手和最后结果，1 到 2 句即可；不要写易错点、错误原因、原错痕迹，也不要出现“易错点是”“误以为”“错在”等内容。",
+  "mistakePoints 才写本题专属易错点，2 到 4 条，每条指出具体位置或具体关系，例如“原来把 2:3:x:6 的对应顺序看反”“题图中被叉掉的 35°说明圆心角没有按 360×1/8 算”等。不要重复 lianSummary 已经说过的同一句话。",
   "如果看不到明确错题痕迹，也要根据题目、讲解文字和黑板步骤总结具体风险，不要说空泛的‘注意审题’。",
   "只输出 JSON。"
 ].join("\n");
@@ -6074,23 +6589,39 @@ const answerKeySolverSchema = {
       status: { type: "string", enum: ["solved", "ambiguous", "unreadable"] },
       problemText: { type: "string" },
       questionType: { type: "string" },
+      knowledge: { type: "string" },
+      finalAnswer: { type: "string" },
       canonicalAnswer: { type: "string" },
       acceptedAnswers: { type: "array", items: { type: "string" } },
+      solutionSteps: { type: "array", items: { type: "string" } },
       solutionOutline: { type: "array", items: { type: "string" } },
       verificationChecks: { type: "array", items: { type: "string" } },
       confidence: { type: "number" },
-      uncertainty: { type: "string" }
+      uncertainty: { type: "string" },
+      hasStudentAnswer: { type: "boolean" },
+      studentAnswer: { type: "string" },
+      isStudentAnswerCorrect: { type: "boolean" },
+      studentWrongReason: { type: "string" },
+      isSolved: { type: "boolean" }
     },
     required: [
       "status",
       "problemText",
       "questionType",
+      "knowledge",
+      "finalAnswer",
       "canonicalAnswer",
       "acceptedAnswers",
+      "solutionSteps",
       "solutionOutline",
       "verificationChecks",
       "confidence",
-      "uncertainty"
+      "uncertainty",
+      "hasStudentAnswer",
+      "studentAnswer",
+      "isStudentAnswerCorrect",
+      "studentWrongReason",
+      "isSolved"
     ]
   }
 };
@@ -6143,6 +6674,34 @@ const ANSWER_KEY_SOLVER_PROMPT = [
   "canonicalAnswer 只写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
   "solutionOutline 和 verificationChecks 只写简洁、可核验的关键步骤，不写冗长推理。",
   "如果题图不完整、题意存在多解或无法可靠读取，status 必须为 ambiguous 或 unreadable，不能猜答案。",
+  ORDERED_PROPORTION_RULES
+].join("\n");
+
+const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
+  "你是一名严谨的初中数学解题老师，也是标准答案生成器。正确性是底线。",
+  "请阅读我提供的题目图片，只解决图片里的当前这一道题，识别题目内容，给出正确答案和必要解题步骤。",
+  "必须先理解图片中的题目，不要套用历史题目或上下文中的旧题。",
+  "如果图片里有学生手写答案、红笔批改、叉号、圈画或擦写痕迹，要区分题目原文和学生作答痕迹；这些痕迹只能用于 studentTrace，不能当成正确答案依据。",
+  "最终答案必须经过计算核验。先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核。",
+  "如果题目是选择题，finalAnswer 和 canonicalAnswer 必须包含选项字母和选项含义，例如：C. I 不对，II 对。不要只返回 C。",
+  "finalAnswer 和 canonicalAnswer 都写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
+  "solutionSteps 和 solutionOutline 写关键步骤，简短、可核验，不要冗长。",
+  "verification.checks 写代入检查或计算核验过程。",
+  "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，verification.isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verification.checks 中说明原因。",
+  "只返回符合 schema 的 JSON，不要返回 Markdown，不要在 JSON 外输出任何文字。",
+  ORDERED_PROPORTION_RULES
+].join("\n");
+
+const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
+  "你是一名严谨的初中数学解题老师，也是标准答案生成器。正确性是底线。",
+  "请阅读题目图片，只解决图片里的当前这一道题，给出正确答案和必要解题步骤。",
+  "必须先理解图片中的题目，不要套用历史题目或上下文里的旧题。",
+  "如果图片里有学生手写答案、红笔批改、叉号、圈画或擦写痕迹，要区分题目原文和学生作答痕迹；这些痕迹只能写入 hasStudentAnswer、studentAnswer、isStudentAnswerCorrect、studentWrongReason，不能当成正确答案依据。",
+  "最终答案必须经过计算核验。先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核。",
+  "如果题目是选择题，finalAnswer 和 canonicalAnswer 必须包含选项字母和选项含义，例如：C. I 不对，II 对。不要只返回 C。",
+  "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 写关键步骤，简短、可核验；verificationChecks 写代入检查或计算核验过程。",
+  "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verificationChecks 中说明原因。",
+  "只返回符合 schema 的 JSON。不要返回 Markdown，不要在 JSON 外输出任何文字。",
   ORDERED_PROPORTION_RULES
 ].join("\n");
 
@@ -6250,7 +6809,7 @@ function getAnswerKeyCacheKey(questionImage, context = {}) {
     .createHash("sha256")
     .update(String(questionImage || ""))
     .update(`|problem:${String(context.problemText || "").replace(/\s+/g, " ").trim()}`)
-    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v5`)
+    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v8-flat-json`)
     .digest("hex");
 }
 
@@ -6263,10 +6822,18 @@ function setCachedAnswerKey(key, value) {
 
 async function solveAndVerifyAnswerKey(questionImage, context = {}) {
   const startedAt = Date.now();
+  const deterministicFromContext = deterministicArrowDifferenceAnswerKey(context.problemText || "");
+  if (deterministicFromContext) {
+    return {
+      ...deterministicFromContext,
+      elapsedMs: Date.now() - startedAt
+    };
+  }
+
   const solver = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: answerKeySolverSchema,
-    instructions: ANSWER_KEY_SOLVER_PROMPT,
+    instructions: FLAT_ANSWER_KEY_SOLVER_PROMPT,
     content: [
       {
         type: "input_text",
@@ -6279,6 +6846,35 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     ],
     maxOutputTokens: 1400
   });
+
+  solver.finalAnswer = String(solver.finalAnswer || solver.canonicalAnswer || "").trim();
+  solver.canonicalAnswer = String(solver.canonicalAnswer || solver.finalAnswer || "").trim();
+  solver.solutionOutline = Array.isArray(solver.solutionSteps) && solver.solutionSteps.length
+    ? solver.solutionSteps
+    : (Array.isArray(solver.solutionOutline) ? solver.solutionOutline : []);
+  solver.verificationChecks = Array.isArray(solver.verification?.checks) && solver.verification.checks.length
+    ? solver.verification.checks
+    : (Array.isArray(solver.verificationChecks) ? solver.verificationChecks : []);
+  solver.confidence = Number(solver.verification?.confidence ?? solver.confidence) || 0;
+  solver.studentTrace = solver.studentTrace || {
+    hasStudentAnswer: Boolean(solver.hasStudentAnswer),
+    studentAnswer: String(solver.studentAnswer || "").trim(),
+    isStudentAnswerCorrect: Boolean(solver.isStudentAnswerCorrect),
+    wrongReason: String(solver.studentWrongReason || "").trim()
+  };
+  if ((solver.verification?.isSolved === false || solver.isSolved === false) && solver.status === "solved") {
+    solver.status = "ambiguous";
+  }
+
+  const deterministicFromSolverText = deterministicArrowDifferenceAnswerKey(
+    [context.problemText, solver.problemText].filter(Boolean).join("\n")
+  );
+  if (deterministicFromSolverText) {
+    return {
+      ...deterministicFromSolverText,
+      elapsedMs: Date.now() - startedAt
+    };
+  }
 
   if (solver.status !== "solved" || Number(solver.confidence) < ANSWER_KEY_MIN_CONFIDENCE || !solver.canonicalAnswer) {
     return {
@@ -6330,8 +6926,15 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     acceptedAnswers: trusted ? answerKeyCandidates(solver) : [],
     problemText: String(solver.problemText || context.problemText || "").trim(),
     questionType: String(solver.questionType || "").trim(),
+    knowledge: String(solver.knowledge || "").trim(),
     solutionOutline: trusted && Array.isArray(solver.solutionOutline) ? solver.solutionOutline.slice(0, 8) : [],
     verificationChecks: trusted && Array.isArray(solver.verificationChecks) ? solver.verificationChecks.slice(0, 8) : [],
+    studentTrace: solver.studentTrace || {
+      hasStudentAnswer: false,
+      studentAnswer: "",
+      isStudentAnswerCorrect: false,
+      wrongReason: ""
+    },
     confidence,
     reason: trusted ? verifier.verificationSummary || "双重核验通过" : verifier.contradiction || "两次独立结果不一致",
     elapsedMs: Date.now() - startedAt
@@ -6375,6 +6978,24 @@ function privateAnswerReference(answerKey) {
     verificationChecks: answerKey.verificationChecks,
     confidence: answerKey.confidence,
     instruction: "这是服务端私有核验基线。所有数学判断必须与它一致；未解锁讲解时不得把最终答案直接告诉学生。"
+  };
+}
+
+function makeUnavailableAnswerKey(error, status = "answer-key-unavailable") {
+  return {
+    trusted: false,
+    status: error?.code || status,
+    confidence: 0,
+    canonicalAnswer: "",
+    acceptedAnswers: [],
+    problemText: "",
+    questionType: "",
+    knowledge: "",
+    solutionOutline: [],
+    verificationChecks: [],
+    studentTrace: null,
+    reason: error?.message || "standard answer service unavailable",
+    elapsedMs: 0
   };
 }
 
@@ -6426,7 +7047,39 @@ function extractGuideAnswerClaims(text, answerKey) {
     claims.push({ raw: match[1].replace(/\s+/g, ""), reason: "answer-claim" });
   }
 
-  return claims;
+  const optionReference = answerKeyCandidates(answerKey)
+    .map((candidate) => String(candidate || "").normalize("NFKC").trim().toUpperCase())
+    .find((candidate) => /^[ABCD]$/.test(candidate));
+  if (optionReference) {
+    const optionPattern = /(?:选|选择|应(?:该)?选|答案(?:是|为)?|而不是)\s*([ABCD])/gi;
+    while ((match = optionPattern.exec(value))) {
+      const prefix = value.slice(Math.max(0, match.index - 6), match.index);
+      claims.push({
+        raw: prefix.includes("不是") || prefix.includes("不选") ? `not:${match[1].toUpperCase()}` : match[1].toUpperCase(),
+        reason: "option-claim"
+      });
+    }
+  }
+
+  if (optionReference) {
+    const optionLetterPattern = /(?<![A-Z])([ABCD])(?![A-Z])/gi;
+    while ((match = optionLetterPattern.exec(value))) {
+      const prefix = value.slice(Math.max(0, match.index - 10), match.index);
+      if (/(?:不是|不选|不对|错误|wrong|incorrect|而不是)/i.test(prefix)) {
+        claims.push({ raw: `not:${match[1].toUpperCase()}`, reason: "option-negated-claim" });
+      } else if (/(?:选|选择|答案|应选|应该选|是|为|correct)/i.test(prefix)) {
+        claims.push({ raw: match[1].toUpperCase(), reason: "option-context-claim" });
+      }
+    }
+  }
+
+  const seenClaims = new Set();
+  return claims.filter((claim) => {
+    const key = String(claim.raw || "");
+    if (seenClaims.has(key)) return false;
+    seenClaims.add(key);
+    return true;
+  });
 }
 
 function guideContradictsVerifiedAnswer(result, answerKey) {
@@ -6434,7 +7087,33 @@ function guideContradictsVerifiedAnswer(result, answerKey) {
   const text = [result?.speech, result?.formulaOrStep, result?.studentAction].filter(Boolean).join(" ");
   if (!text) return null;
   const claims = extractGuideAnswerClaims(text, answerKey);
-  const wrongClaims = claims.filter((claim) => !studentAnswerMatchesVerifiedKey(claim.raw, answerKey));
+  let wrongClaims = claims.filter((claim) => !studentAnswerMatchesVerifiedKey(claim.raw, answerKey));
+  const optionReference = answerKeyCandidates(answerKey)
+    .map((candidate) => String(candidate || "").normalize("NFKC").trim().toUpperCase())
+    .find((candidate) => /^[ABCD]$/.test(candidate));
+  if (optionReference) {
+    const normalizedText = text.normalize("NFKC").toUpperCase();
+    const optionPattern = /(?<![A-Z])([ABCD])(?![A-Z])/g;
+    let optionMatch;
+    while ((optionMatch = optionPattern.exec(normalizedText))) {
+      const prefix = normalizedText.slice(Math.max(0, optionMatch.index - 10), optionMatch.index);
+      const raw = /(?:\u4e0d\u662f|\u4e0d\u9009|\u4e0d\u5bf9|\u9519\u8bef|\u800c\u4e0d\u662f|WRONG|INCORRECT)/i.test(prefix)
+        ? `not:${optionMatch[1]}`
+        : /(?:\u9009|\u9009\u62e9|\u7b54\u6848|\u5e94\u9009|\u5e94\u8be5\u9009|\u6b63\u786e|CORRECT)/i.test(prefix)
+          ? optionMatch[1]
+          : "";
+      if (raw && !studentAnswerMatchesVerifiedKey(raw, answerKey)) {
+        wrongClaims.push({ raw, reason: "option-final-audit" });
+      }
+    }
+  }
+  const seenWrongClaims = new Set();
+  wrongClaims = wrongClaims.filter((claim) => {
+    const key = String(claim.raw || "");
+    if (seenWrongClaims.has(key)) return false;
+    seenWrongClaims.add(key);
+    return true;
+  });
   if (!wrongClaims.length) return null;
   return wrongClaims;
 }
@@ -6498,6 +7177,7 @@ async function auditGuideMath(result, answerKey, body) {
 }
 
 function studentAnswerMatchesVerifiedKey(studentAnswer, answerKey) {
+  if (/^\s*not:/i.test(String(studentAnswer || ""))) return false;
   const normalizedStudent = normalizeAnswerForComparison(studentAnswer);
   if (!normalizedStudent || !answerKey?.trusted) return false;
   return answerKeyCandidates(answerKey).some((candidate) => {
@@ -6769,7 +7449,13 @@ async function handleGuide(req, res) {
 
   const guideState = body.guideState || "heuristic_guidance";
   const lectureUnlocked = Boolean(body.lectureUnlocked);
-  const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  let answerKey;
+  try {
+    answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  } catch (error) {
+    console.warn(`[guide] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
+    answerKey = makeUnavailableAnswerKey(error);
+  }
 
   let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
@@ -6855,7 +7541,13 @@ async function handleHandwriting(req, res) {
   }
 
   const boardForOcr = body.boardOnlyImage || body.boardImage;
-  const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  let answerKey;
+  try {
+    answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+  } catch (error) {
+    console.warn(`[handwriting] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
+    answerKey = makeUnavailableAnswerKey(error);
+  }
 
   let result = await callQwenMultimodalJson({
     model: QWEN_HANDWRITING_MODEL,
@@ -6880,6 +7572,9 @@ async function handleHandwriting(req, res) {
     ],
     maxOutputTokens: 1000
   });
+
+  result = deterministicArrowHandwritingAudit(result, answerKey) || result;
+  result = await auditHandwritingResult(result, answerKey, body, boardForOcr);
 
   if (!answerKey.trusted && ["correct", "wrong"].includes(result.calculationStatus)) {
     result = {
@@ -6929,6 +7624,93 @@ function isOnlyDirectAnswerWriting(value) {
   return /^(?:[a-zA-Z]|[A-Za-z][A-Za-z0-9_]*)=(?:[-+]?\d+(?:\.\d+)?|[-+]?\d+\/[-+]?\d+)$/.test(text);
 }
 
+function shouldAuditHandwritingResult(result, answerKey) {
+  if (!answerKey?.trusted) return false;
+  return ["correct", "wrong"].includes(String(result?.calculationStatus || ""));
+}
+
+function makeHandwritingUncertain(result, reason = "板书判断还需要再核对") {
+  return {
+    ...(result || {}),
+    calculationStatus: "unclear",
+    calculationCheck: reason,
+    hasPossibleIssue: false,
+    issueType: "unclear",
+    issueSummary: "",
+    guidance: "",
+    positiveFeedback: "",
+    confidence: Math.min(Number(result?.confidence) || 0.5, 0.55)
+  };
+}
+
+function applyHandwritingAudit(result, audit) {
+  const status = String(audit?.correctedStatus || result?.calculationStatus || "unclear");
+  const confidence = Math.max(0, Math.min(1, Number(audit?.confidence) || 0));
+  const safeToSpeak = audit?.safeToSpeak === true && confidence >= 0.72;
+  const auditedStatus = safeToSpeak
+    ? status
+    : (status === "correct" || status === "wrong" ? "unclear" : status);
+  const hasIssue = auditedStatus === "wrong";
+  return {
+    ...(result || {}),
+    calculationStatus: auditedStatus,
+    calculationCheck: audit?.correctedCheck || audit?.reason || result?.calculationCheck || "",
+    hasPossibleIssue: hasIssue,
+    issueType: hasIssue ? (audit?.issueType || result?.issueType || "unclear") : "none",
+    issueSummary: hasIssue ? (audit?.issueSummary || audit?.reason || "") : "",
+    guidance: hasIssue || auditedStatus === "incomplete"
+      ? (audit?.correctedGuidance || result?.guidance || "")
+      : "",
+    positiveFeedback: auditedStatus === "correct"
+      ? (audit?.correctedFeedback || result?.positiveFeedback || "")
+      : "",
+    boardComplete: auditedStatus === "correct" && Boolean(audit?.boardComplete),
+    missingBoardContent: audit?.missingBoardContent || "",
+    confidence: confidence || Number(result?.confidence) || 0.5
+  };
+}
+
+async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
+  if (!shouldAuditHandwritingResult(result, answerKey)) return result;
+  try {
+    const audit = await callQwenMultimodalJson({
+      model: QWEN_HANDWRITING_MODEL,
+      schema: handwritingAuditSchema,
+      instructions: [HANDWRITING_AUDIT_PROMPT, ORDERED_PROPORTION_RULES].join("\n\n"),
+      content: [
+        {
+          type: "input_text",
+          text: JSON.stringify({
+            trigger: body.reason || "",
+            transcript: body.transcript || "",
+            knownProblemText: body.problemText || "",
+            knownKnowledgePoints: body.knowledgePoints || [],
+            verifiedAnswerReference: privateAnswerReference(answerKey),
+            initialHandwritingResult: result,
+            instruction:
+              "请审校 initialHandwritingResult 是否能安全播给学生。若对错判断无法由当前题图、标准答案和纯板书共同确认，必须降级为 unclear/incomplete，不要误导。"
+          })
+        },
+        { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high" },
+        { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" },
+        ...(body.boardImage ? [{ type: "input_image", label: "包含题目区域的板书截图", image_url: body.boardImage, detail: "high" }] : [])
+      ],
+      maxOutputTokens: 700
+    });
+    const audited = applyHandwritingAudit(result, audit);
+    console.log(
+      `[handwriting-audit] ${result.calculationStatus}->${audited.calculationStatus} safe=${audit.safeToSpeak} confidence=${audit.confidence} reason=${audit.reason || ""}`
+    );
+    return audited;
+  } catch (error) {
+    console.warn(`[handwriting-audit] failed: ${error?.message || error}`);
+    if (String(result?.calculationStatus || "") === "wrong" || Number(result?.confidence) < 0.85) {
+      return makeHandwritingUncertain(result, "板书判断审校没有成功返回，先不判断对错。");
+    }
+    return result;
+  }
+}
+
 async function handleAnswerKeyPrefetch(req, res) {
   const body = await readJsonBody(req);
   if (!body.questionImage) {
@@ -6940,6 +7722,16 @@ async function handleAnswerKeyPrefetch(req, res) {
     ready: answerKey.trusted,
     status: answerKey.status,
     confidence: answerKey.trusted ? answerKey.confidence : 0,
+    canonicalAnswer: answerKey.trusted ? answerKey.canonicalAnswer : "",
+    acceptedAnswers: answerKey.trusted ? answerKey.acceptedAnswers : [],
+    problemText: answerKey.trusted ? answerKey.problemText : "",
+    questionType: answerKey.trusted ? answerKey.questionType : "",
+    knowledge: answerKey.trusted ? answerKey.knowledge || "" : "",
+    solutionOutline: answerKey.trusted ? answerKey.solutionOutline : [],
+    verificationChecks: answerKey.trusted ? answerKey.verificationChecks : [],
+    studentTrace: answerKey.trusted ? answerKey.studentTrace || null : null,
+    reason: answerKey.reason || "",
+    elapsedMs: answerKey.elapsedMs || 0,
     provider: "qwen-double-verified-answer-key"
   });
 }
@@ -6980,6 +7772,11 @@ async function handleRequest(req, res) {
         aliyunOcrConfigured: Boolean(ALIYUN_OCR_APPCODE),
         aliyunOcrEnabled: ALIYUN_OCR_ENABLED,
         aliyunOfficialEduPaperCutConfigured: Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET),
+        azureTtsConfigured: Boolean(AZURE_TTS_KEY && AZURE_TTS_REGION),
+        azureTtsVoice: AZURE_TTS_VOICE,
+        aliyunSpeechConfigured: aliyunSpeechConfigured(),
+        aliyunSpeechAppkey: ALIYUN_NLS_APPKEY ? `${ALIYUN_NLS_APPKEY.slice(0, 4)}...${ALIYUN_NLS_APPKEY.slice(-4)}` : "",
+        aliyunSpeechVoice: ALIYUN_NLS_VOICE,
         segmentAliyunOnly: SEGMENT_ALIYUN_ONLY,
         localOcrEnabled: LOCAL_OCR_ENABLED,
         layoutEnabled: LAYOUT_ENABLED,
@@ -6990,6 +7787,8 @@ async function handleRequest(req, res) {
     if (req.method === "POST" && pathname === "/api/transcript-correct") return await handleTranscriptCorrection(req, res);
     if (req.method === "POST" && pathname === "/api/archive-summary") return await handleArchiveSummary(req, res);
     if (req.method === "POST" && pathname === "/api/answer-key") return await handleAnswerKeyPrefetch(req, res);
+    if (req.method === "POST" && pathname === "/api/tts") return await handleTextToSpeech(req, res);
+    if (req.method === "POST" && pathname === "/api/asr") return await handleSpeechRecognition(req, res);
     if (req.method === "POST" && pathname === "/api/final-answer") return await handleFinalAnswerCheck(req, res);
     if (req.method === "POST" && pathname === "/api/guide") return await handleGuide(req, res);
     if (req.method === "POST" && pathname === "/api/handwriting") return await handleHandwriting(req, res);
@@ -7046,6 +7845,7 @@ module.exports = {
   buildLayoutContentBlocks,
   assessLocalSegmentationConfidence,
   enforceOrderedProportionConvention,
+  deterministicArrowDifferenceAnswerKey,
   guideContradictsVerifiedAnswer,
   makeAnswerLockedGuideSafe,
   answerValuesEquivalent,

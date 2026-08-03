@@ -20,6 +20,8 @@ const {
   buildLayoutContentBlocks,
   assessLocalSegmentationConfidence,
   enforceOrderedProportionConvention,
+  deterministicArrowDifferenceAnswerKey,
+  guideContradictsVerifiedAnswer,
   answerValuesEquivalent,
   answerKeyResultsAgree,
   makeUnverifiedGuideSafe,
@@ -853,6 +855,31 @@ test("accepts only equivalent answers from the independent solver and verifier",
       { independentlySolvedAnswer: "x=-4", acceptedAnswers: [] }
     ),
     false
+  );
+});
+
+test("derives the correct answer for arrow difference relation questions", () => {
+  const key = deterministicArrowDifferenceAnswerKey(
+    "如图，约定：上方相邻的左数与右数之差等于这两数下方箭头共同指向的数。图中有 x、2y、3x、m、n 和 8。结论 I：若 m 的值为 3，则 y 的值为 4；结论 II：不论 m、n 取何值，x-y 的值一定为 2。下列说法正确的是 A. I，II 都对 B. I 对，II 不对 C. I 不对，II 对 D. I，II 都不对"
+  );
+
+  assert.equal(key.trusted, true);
+  assert.equal(key.canonicalAnswer, "C");
+  assert.equal(studentAnswerMatchesVerifiedKey("选C", key), true);
+  assert.equal(studentAnswerMatchesVerifiedKey("选A", key), false);
+  assert.deepEqual(
+    guideContradictsVerifiedAnswer(
+      { speech: "两个结论都对，应该选 A，而不是 C。" },
+      key
+    ).map((claim) => claim.raw),
+    ["A", "not:C"]
+  );
+  assert.deepEqual(
+    guideContradictsVerifiedAnswer(
+      { speech: "\u800c\u4e0d\u662f C" },
+      key
+    ).map((claim) => claim.raw),
+    ["not:C"]
   );
 });
 

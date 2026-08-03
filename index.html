@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>恋恋错题本</title>
-    <link rel="stylesheet" href="styles.css?v=20260728-01" />
+    <link rel="stylesheet" href="styles.css?v=20260802-tts-unlock" />
   </head>
   <body>
     <div class="app-shell">
@@ -58,7 +58,7 @@
                 </div>
               </div>
               <div class="welcome-companion" aria-hidden="true">
-                <img src="assets/lian-avatar.svg" alt="" />
+                <img src="assets/lian-avatar.svg?v=classic-20260802" alt="" />
                 <div>
                   <strong>恋恋</strong>
                   <span>我会先听你讲，再慢慢提示。</span>
@@ -77,7 +77,7 @@
               </div>
 
               <label class="drop-zone" id="dropZone">
-                <input id="imageInput" type="file" accept="image/*" />
+                <input id="imageInput" type="file" accept="image/*" multiple />
                 <span class="drop-icon" data-icon="image"></span>
                 <strong>选择或拖入错题图片</strong>
                 <span>支持一页或一组初中数学错题</span>
@@ -95,7 +95,13 @@
                   </button>
                 </div>
                 <div class="preview-stage" id="manualStage">
+                  <button class="page-nav page-nav-left hidden" id="previewPrevImageBtn" type="button" title="上一张图片" aria-label="上一张图片">
+                    <span data-icon="chevron-left"></span>
+                  </button>
                   <img id="sourcePreview" alt="已上传的错题图片预览" />
+                  <button class="page-nav page-nav-right hidden" id="previewNextImageBtn" type="button" title="下一张图片" aria-label="下一张图片">
+                    <span data-icon="chevron-right"></span>
+                  </button>
                   <canvas class="segment-debug-canvas hidden" id="segmentDebugCanvas" aria-hidden="true"></canvas>
                   <div class="selection-rect hidden" id="selectionRect">
                     <div class="selection-actions" aria-label="框选确认">
@@ -155,7 +161,15 @@
                 <span>正在整理题目区域</span>
               </div>
 
-              <div class="question-list" id="questionList" aria-live="polite"></div>
+              <div class="question-page-shell">
+                <button class="page-nav page-nav-left hidden" id="questionsPrevImageBtn" type="button" title="上一张图片" aria-label="上一张图片">
+                  <span data-icon="chevron-left"></span>
+                </button>
+                <div class="question-list" id="questionList" aria-live="polite"></div>
+                <button class="page-nav page-nav-right hidden" id="questionsNextImageBtn" type="button" title="下一张图片" aria-label="下一张图片">
+                  <span data-icon="chevron-right"></span>
+                </button>
+              </div>
 
               <div class="start-row">
                 <div>
@@ -255,7 +269,7 @@
                     </div>
                   </article>
                   <article class="avatar-card listening" id="lianAvatar">
-                    <img src="assets/lian-avatar.svg" alt="恋恋头像" />
+                    <img src="assets/lian-avatar.svg?v=classic-20260802" alt="恋恋头像" />
                     <div>
                       <strong>恋恋</strong>
                       <span id="lianState">在听你讲</span>
@@ -389,6 +403,6 @@
       </article>
     </template>
 
-    <script src="app.js?v=20260728-01"></script>
+    <script src="app.js?v=20260803-segment-note-visible"></script>
   </body>
 </html>
