@@ -133,6 +133,13 @@ const ALIYUN_OCR_ENABLED = !["0", "false", "off"].includes(
 const SEGMENT_ALIYUN_ONLY = !["0", "false", "off"].includes(
   String(process.env.SEGMENT_ALIYUN_ONLY || "0").toLowerCase()
 );
+const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_SERVICE_KEY ||
+  process.env.SUPABASE_SECRET_KEY ||
+  "";
+const SUPABASE_NOTEBOOK_TABLE = process.env.SUPABASE_NOTEBOOK_TABLE || "wrong_questions";
 const ALIYUN_OCR_TIMEOUT_MS = Number(process.env.ALIYUN_OCR_TIMEOUT_MS || 18000);
 const OCR_PYTHON = process.env.OCR_PYTHON || path.join(ROOT, ".venv", "Scripts", "python.exe");
 const PADDLE_OCR_SCRIPT = path.join(ROOT, "tools", "paddle_ocr.py");
@@ -7736,6 +7743,139 @@ async function handleAnswerKeyPrefetch(req, res) {
   });
 }
 
+function supabaseNotebookConfigured() {
+  return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+}
+
+function getNotebookClientId(req) {
+  const raw = String(req.headers["x-lian-client-id"] || "").trim();
+  const cleaned = raw.replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128);
+  if (cleaned.length < 8) {
+    const error = new Error("missing notebook sync id");
+    error.statusCode = 400;
+    error.code = "missing_notebook_client_id";
+    throw error;
+  }
+  return cleaned;
+}
+
+function normalizeNotebookRecord(record) {
+  const data = record && typeof record === "object" ? record : {};
+  const id = String(data.id || "").trim().slice(0, 160);
+  if (!id) return null;
+  return {
+    client_id: "",
+    record_id: id,
+    title: String(data.title || "").slice(0, 240),
+    status: String(data.status || "").slice(0, 80),
+    review_at: data.reviewAt || null,
+    created_at: data.createdAt || new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    data
+  };
+}
+
+async function callSupabaseNotebook(pathSuffix, options = {}) {
+  if (!supabaseNotebookConfigured()) {
+    const error = new Error("Supabase is not configured");
+    error.statusCode = 503;
+    error.code = "supabase_not_configured";
+    throw error;
+  }
+  if (!/^[A-Za-z0-9_]+$/.test(SUPABASE_NOTEBOOK_TABLE)) {
+    const error = new Error("Invalid Supabase notebook table name");
+    error.statusCode = 500;
+    error.code = "invalid_supabase_table";
+    throw error;
+  }
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${SUPABASE_NOTEBOOK_TABLE}${pathSuffix}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = text;
+  }
+  if (!response.ok) {
+    const error = new Error(
+      (payload && typeof payload === "object" && (payload.message || payload.error)) ||
+        text ||
+        `Supabase request failed: ${response.status}`
+    );
+    error.statusCode = response.status;
+    error.code = "supabase_request_failed";
+    throw error;
+  }
+  return payload;
+}
+
+async function handleNotebookList(req, res) {
+  if (!supabaseNotebookConfigured()) {
+    sendJson(res, 200, { configured: false, records: [] });
+    return;
+  }
+  const clientId = getNotebookClientId(req);
+  const query = [
+    `client_id=eq.${encodeURIComponent(clientId)}`,
+    "select=record_id,data,updated_at,created_at",
+    "order=created_at.desc"
+  ].join("&");
+  const rows = await callSupabaseNotebook(`?${query}`, { method: "GET" });
+  sendJson(res, 200, {
+    configured: true,
+    records: Array.isArray(rows) ? rows.map((row) => row.data).filter(Boolean) : []
+  });
+}
+
+async function handleNotebookSync(req, res) {
+  if (!supabaseNotebookConfigured()) {
+    sendJson(res, 200, { configured: false, synced: 0 });
+    return;
+  }
+  const clientId = getNotebookClientId(req);
+  const body = await readJsonBody(req, 32 * 1024 * 1024);
+  const records = Array.isArray(body.records) ? body.records : [];
+  const rows = records
+    .map(normalizeNotebookRecord)
+    .filter(Boolean)
+    .map((row) => ({ ...row, client_id: clientId }));
+  if (!rows.length) {
+    sendJson(res, 200, { configured: true, synced: 0 });
+    return;
+  }
+  await callSupabaseNotebook("", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(rows)
+  });
+  sendJson(res, 200, { configured: true, synced: rows.length });
+}
+
+async function handleNotebookDelete(req, res, recordId) {
+  if (!supabaseNotebookConfigured()) {
+    sendJson(res, 200, { configured: false, deleted: false });
+    return;
+  }
+  const clientId = getNotebookClientId(req);
+  const query = [
+    `client_id=eq.${encodeURIComponent(clientId)}`,
+    `record_id=eq.${encodeURIComponent(recordId)}`
+  ].join("&");
+  await callSupabaseNotebook(`?${query}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" }
+  });
+  sendJson(res, 200, { configured: true, deleted: true });
+}
+
 function serveStatic(req, res) {
   const urlPath = decodeURIComponent(new URL(req.url, `http://localhost:${PORT}`).pathname);
   const safePath = path.normalize(urlPath === "/" ? "/index.html" : urlPath).replace(/^(\.\.[/\\])+/, "");
@@ -7777,11 +7917,19 @@ async function handleRequest(req, res) {
         aliyunSpeechConfigured: aliyunSpeechConfigured(),
         aliyunSpeechAppkey: ALIYUN_NLS_APPKEY ? `${ALIYUN_NLS_APPKEY.slice(0, 4)}...${ALIYUN_NLS_APPKEY.slice(-4)}` : "",
         aliyunSpeechVoice: ALIYUN_NLS_VOICE,
+        supabaseConfigured: supabaseNotebookConfigured(),
+        supabaseNotebookTable: SUPABASE_NOTEBOOK_TABLE,
         segmentAliyunOnly: SEGMENT_ALIYUN_ONLY,
         localOcrEnabled: LOCAL_OCR_ENABLED,
         layoutEnabled: LAYOUT_ENABLED,
         uptimeSeconds: Math.round(process.uptime())
       });
+    }
+    if (req.method === "GET" && pathname === "/api/notebook") return await handleNotebookList(req, res);
+    if (req.method === "PUT" && pathname === "/api/notebook") return await handleNotebookSync(req, res);
+    if (req.method === "DELETE" && pathname.startsWith("/api/notebook/")) {
+      const recordId = decodeURIComponent(pathname.slice("/api/notebook/".length));
+      return await handleNotebookDelete(req, res, recordId);
     }
     if (req.method === "POST" && pathname === "/api/segment") return await handleSegmentV2(req, res);
     if (req.method === "POST" && pathname === "/api/transcript-correct") return await handleTranscriptCorrection(req, res);

@@ -478,18 +478,128 @@ function safeNowId(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+const NOTEBOOK_STORAGE_KEY = "lian-notebook";
+const NOTEBOOK_CLIENT_ID_KEY = "lian-notebook-client-id";
+let notebookCloudSyncTimer = null;
+let notebookCloudSyncInFlight = false;
+let notebookCloudSyncPending = false;
+
+function getNotebookClientId() {
+  let id = localStorage.getItem(NOTEBOOK_CLIENT_ID_KEY);
+  if (!id) {
+    const random =
+      window.crypto && window.crypto.randomUUID
+        ? window.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    id = `client-${random}`;
+    localStorage.setItem(NOTEBOOK_CLIENT_ID_KEY, id);
+  }
+  return id;
+}
+
+function notebookCloudHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "X-Lian-Client-Id": getNotebookClientId()
+  };
+}
+
 function loadNotebook() {
   try {
-    return JSON.parse(localStorage.getItem("lian-notebook") || "[]");
+    return JSON.parse(localStorage.getItem(NOTEBOOK_STORAGE_KEY) || "[]");
   } catch {
     return [];
   }
 }
 
-function saveNotebook() {
-  localStorage.setItem("lian-notebook", JSON.stringify(state.notebook));
+function saveNotebook(options = {}) {
+  localStorage.setItem(NOTEBOOK_STORAGE_KEY, JSON.stringify(state.notebook));
   updateNotebookCount();
   if (views.reviewView?.classList.contains("active")) renderReviewPage();
+  if (!options.localOnly) scheduleNotebookCloudSync();
+}
+
+function getRecordUpdatedAt(record) {
+  return new Date(record?.updatedAt || record?.createdAt || 0).getTime() || 0;
+}
+
+function mergeNotebookRecords(localRecords, cloudRecords) {
+  const byId = new Map();
+  [...cloudRecords, ...localRecords].forEach((record) => {
+    if (!record?.id) return;
+    const existing = byId.get(record.id);
+    if (!existing || getRecordUpdatedAt(record) >= getRecordUpdatedAt(existing)) {
+      byId.set(record.id, record);
+    }
+  });
+  return [...byId.values()].sort((a, b) => getRecordUpdatedAt(b) - getRecordUpdatedAt(a));
+}
+
+async function hydrateNotebookFromCloud() {
+  try {
+    const response = await fetch("/api/notebook", {
+      method: "GET",
+      cache: "no-store",
+      headers: notebookCloudHeaders()
+    });
+    if (!response.ok) throw new Error(`notebook cloud load failed: ${response.status}`);
+    const payload = await response.json();
+    if (!payload.configured) return;
+    const cloudRecords = Array.isArray(payload.records) ? payload.records : [];
+    const merged = mergeNotebookRecords(state.notebook, cloudRecords);
+    const changed = JSON.stringify(merged.map((record) => record.id)) !== JSON.stringify(state.notebook.map((record) => record.id));
+    state.notebook = merged;
+    saveNotebook({ localOnly: true });
+    renderNotebook();
+    if (state.notebook.length && (changed || cloudRecords.length < state.notebook.length)) {
+      scheduleNotebookCloudSync(0);
+    }
+  } catch (error) {
+    console.warn("[notebook-cloud] load skipped:", error);
+  }
+}
+
+function scheduleNotebookCloudSync(delay = 700) {
+  clearTimeout(notebookCloudSyncTimer);
+  notebookCloudSyncTimer = setTimeout(syncNotebookToCloud, delay);
+}
+
+async function syncNotebookToCloud() {
+  if (notebookCloudSyncInFlight) {
+    notebookCloudSyncPending = true;
+    return;
+  }
+  notebookCloudSyncInFlight = true;
+  try {
+    const response = await fetch("/api/notebook", {
+      method: "PUT",
+      headers: notebookCloudHeaders(),
+      body: JSON.stringify({ records: state.notebook })
+    });
+    if (!response.ok) throw new Error(`notebook cloud sync failed: ${response.status}`);
+    const payload = await response.json();
+    if (payload.configured) console.log(`[notebook-cloud] synced ${payload.synced || 0} records`);
+  } catch (error) {
+    console.warn("[notebook-cloud] sync skipped:", error);
+  } finally {
+    notebookCloudSyncInFlight = false;
+    if (notebookCloudSyncPending) {
+      notebookCloudSyncPending = false;
+      scheduleNotebookCloudSync(1200);
+    }
+  }
+}
+
+async function deleteNotebookRecordFromCloud(id) {
+  try {
+    const response = await fetch(`/api/notebook/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      headers: notebookCloudHeaders()
+    });
+    if (!response.ok) throw new Error(`notebook cloud delete failed: ${response.status}`);
+  } catch (error) {
+    console.warn("[notebook-cloud] delete skipped:", error);
+  }
 }
 
 function updateNotebookCount() {
@@ -5870,7 +5980,8 @@ async function buildNotebookRecord(question) {
     reviewPlan,
     reviewAt: reviewAt.toISOString(),
     status: "还要复习",
-    createdAt: now.toISOString()
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString()
   };
 }
 
@@ -6329,7 +6440,9 @@ function getRecordReviewPlan(record) {
 }
 
 function updateRecordStatus(id, status) {
-  state.notebook = state.notebook.map((record) => (record.id === id ? { ...record, status } : record));
+  state.notebook = state.notebook.map((record) =>
+    record.id === id ? { ...record, status, updatedAt: new Date().toISOString() } : record
+  );
   saveNotebook();
   renderNotebook();
 }
@@ -6338,8 +6451,10 @@ function deleteRecord(id) {
   state.notebook = state.notebook.filter((record) => record.id !== id);
   if (state.activeNotebookId === id) state.activeNotebookId = state.notebook[0]?.id || null;
   saveNotebook();
+  deleteNotebookRecordFromCloud(id);
   renderNotebook();
 }
 
 renderQuestions();
 renderNotebook();
+hydrateNotebookFromCloud();
