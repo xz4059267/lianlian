@@ -42,6 +42,7 @@ const QWEN_VL_MODEL =
   "qwen3.5-omni-flash";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
+const HANDWRITING_FAST_CONFIDENCE = Number(process.env.HANDWRITING_FAST_CONFIDENCE || 0.94);
 const AZURE_TTS_KEY =
   process.env.AZURE_TTS_KEY ||
   process.env.AZURE_SPEECH_KEY ||
@@ -7557,6 +7558,7 @@ async function handleGuide(req, res) {
 }
 
 async function handleHandwriting(req, res) {
+  const requestStartedAt = Date.now();
   const body = await readJsonBody(req);
   if (!body.questionImage || !(body.boardOnlyImage || body.boardImage)) {
     sendJson(res, 400, { error: "缺少 questionImage 或 boardOnlyImage" });
@@ -7567,6 +7569,7 @@ async function handleHandwriting(req, res) {
   let answerKey;
   try {
     answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+    console.log(`[handwriting-timing] answer-key=${Date.now() - requestStartedAt}ms trusted=${answerKey.trusted}`);
   } catch (error) {
     console.warn(`[handwriting] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
     answerKey = makeUnavailableAnswerKey(error);
@@ -7595,6 +7598,7 @@ async function handleHandwriting(req, res) {
     ],
     maxOutputTokens: 1000
   });
+  console.log(`[handwriting-timing] initial=${Date.now() - requestStartedAt}ms`);
 
   result = await auditHandwritingResult(result, answerKey, body, boardForOcr);
   result = applyStatementEvaluationSafety(result, answerKey);
@@ -7627,11 +7631,14 @@ async function handleHandwriting(req, res) {
     };
   }
 
+  const timingMs = Date.now() - requestStartedAt;
+  console.log(`[handwriting-timing] total=${timingMs}ms`);
   sendJson(res, 200, {
     ...result,
     answerVerification: answerKey.trusted ? "double-verified" : answerKey.status,
     model: QWEN_HANDWRITING_MODEL,
-    provider: "qwen-double-verified-handwriting"
+    provider: "qwen-double-verified-handwriting",
+    timingMs
   });
 }
 
@@ -7647,9 +7654,14 @@ function isOnlyDirectAnswerWriting(value) {
   return /^(?:[a-zA-Z]|[A-Za-z][A-Za-z0-9_]*)=(?:[-+]?\d+(?:\.\d+)?|[-+]?\d+\/[-+]?\d+)$/.test(text);
 }
 
-function shouldAuditHandwritingResult(result, answerKey) {
+function shouldAuditHandwritingResult(result, answerKey, body = {}) {
   if (!answerKey?.trusted) return false;
-  return ["correct", "wrong"].includes(String(result?.calculationStatus || ""));
+  const status = String(result?.calculationStatus || "");
+  if (!["correct", "wrong"].includes(status)) return false;
+  if (status === "wrong") return true;
+  if (/完成讲解前检查/.test(String(body.reason || ""))) return true;
+  if (looksLikeStatementEvaluationQuestion(answerKey)) return true;
+  return Number(result?.confidence) < HANDWRITING_FAST_CONFIDENCE;
 }
 
 function makeHandwritingUncertain(result, reason = "板书判断还需要再核对") {
@@ -7730,7 +7742,12 @@ function applyHandwritingAudit(result, audit) {
 }
 
 async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
-  if (!shouldAuditHandwritingResult(result, answerKey)) return result;
+  if (!shouldAuditHandwritingResult(result, answerKey, body)) {
+    console.log(
+      `[handwriting-audit] skipped status=${result?.calculationStatus || ""} confidence=${result?.confidence || 0}`
+    );
+    return result;
+  }
   try {
     const audit = await callQwenMultimodalJson({
       model: QWEN_HANDWRITING_MODEL,

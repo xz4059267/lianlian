@@ -2994,15 +2994,16 @@ async function runHandwritingRecognition(reason) {
 }
 
 async function requestHandwritingAnalysis(question, reason) {
-  const boardImage = await createCurrentBoardSnapshot();
   const boardOnlyImage = await createCurrentBoardOnlySnapshot();
+  const isCompletionCheck = /完成讲解前检查/.test(String(reason || ""));
+  const boardImage = isCompletionCheck ? await createCurrentBoardSnapshot() : "";
   const response = await fetch("/api/handwriting", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       questionImage: question.image,
       boardOnlyImage,
-      boardImage,
+      ...(boardImage ? { boardImage } : {}),
       reason,
       transcript: dom.transcriptInput.value.trim(),
       problemText: question.problemText || "",
@@ -3075,7 +3076,8 @@ async function createCurrentBoardOnlySnapshot() {
 async function composeStrokeOcrSnapshot(strokesDataUrl) {
   if (!strokesDataUrl) return "";
   const strokes = await loadImage(strokesDataUrl);
-  const maxWidth = 1280;
+  // Keep the handwriting payload readable while avoiding a large PNG upload.
+  const maxWidth = 1024;
   const scale = Math.min(1, maxWidth / strokes.naturalWidth);
   const width = Math.max(1, Math.round(strokes.naturalWidth * scale));
   const height = Math.max(1, Math.round(strokes.naturalHeight * scale));
@@ -3109,7 +3111,7 @@ async function composeStrokeOcrSnapshot(strokesDataUrl) {
     }
   }
   ocrCtx.putImageData(imageData, 0, 0);
-  return canvas.toDataURL("image/png");
+  return canvas.toDataURL("image/jpeg", 0.84);
 }
 
 function isIncompleteHandwritingIssue(result) {
