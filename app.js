@@ -207,6 +207,7 @@ const state = {
   recognitionTimer: null,
   handwritingRequestId: 0,
   latestHandwritingResult: null,
+  lastHandwritingRecognizedAt: 0,
   handwritingDisabledUntil: 0,
   lastHandwritingServiceError: "",
   lastHandwritingPauseNoticeAt: 0,
@@ -227,6 +228,7 @@ const state = {
   cloudAsrSampleRate: 16000,
   cloudAsrFlushTimer: null,
   cloudAsrRequestInFlight: false,
+  cloudAsrPreviewActive: false,
   speechDraftText: "",
   speechDraftBase: "",
   speechNoResultTimer: null,
@@ -2117,12 +2119,8 @@ function initCurrentQuestion() {
   dom.eventLog.innerHTML = "";
   dom.studentState.textContent = "准备讲题";
   setGuideState(GUIDE_STATES.HEURISTIC);
-  dom.lianBubble.textContent = pickPrompt("lecture-opening", [
-    "我们开始讲解这道错题吧。你慢慢说，我会陪你一起理清思路。",
-    "现在来看看这道错题。你按自己的节奏讲，我会跟着你的思路听。",
-    "我们先从这道题开始，不用着急，你想到哪一步就说到哪一步。",
-    "来，我们一起把这道题理一遍。你先说说自己看到了什么。"
-  ]);
+  // 开场提示由 lianSpeak 统一发布，避免文字先出现但对应语音尚未播放。
+  dom.lianBubble.textContent = "";
   const now = Date.now();
   state.lastGuideAt = 0;
   state.lastSpeechAt = now;
@@ -2788,6 +2786,7 @@ function resetQuestionGuideState() {
   clearTimeout(state.recognitionTimer);
   state.lastSpeechAt = now;
   state.lastBoardWriteAt = 0;
+  state.lastHandwritingRecognizedAt = 0;
   state.lastUserInputAt = now;
   state.lastEncourageAt = now;
   state.normalSpeechCount = 0;
@@ -2940,6 +2939,7 @@ async function runHandwritingRecognition(reason) {
     const result = normalizeHandwritingResult(await requestHandwritingAnalysis(question, reason));
     if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) return;
     state.latestHandwritingResult = result;
+    state.lastHandwritingRecognizedAt = Date.now();
     state.handwritingResults[question.id] = result;
     state.boardCompletionVerified = isBoardCompletionVerified(result);
 
@@ -3046,6 +3046,7 @@ async function verifyCurrentBoardForCompletion(question) {
   }
 
   state.latestHandwritingResult = result;
+  state.lastHandwritingRecognizedAt = Date.now();
   state.handwritingResults[question.id] = result;
   const verified = shouldPromptSaveFromHandwriting(result);
   state.boardCompletionVerified = verified;
@@ -3690,6 +3691,15 @@ function getSpeechRecognition() {
       clearTimeout(state.recognitionTimer);
       state.lastSpeechAt = Date.now();
     }
+    if (state.cloudAsrActive && state.cloudAsrPreviewActive) {
+      const previewText = interimText || finalText;
+      if (previewText) {
+        dom.studentAvatar.classList.add("speaking");
+        dom.studentState.textContent = "正在实时转写";
+        showSpeechDraft(previewText);
+      }
+      return;
+    }
     if (interimText) {
       interruptGuideForStudentSpeech();
       dom.studentAvatar.classList.add("speaking");
@@ -3757,6 +3767,17 @@ function getSpeechRecognition() {
     if (state.lianSpeechPausedRecognition) {
       dom.studentAvatar.classList.remove("speaking");
       dom.studentState.textContent = "听恋恋说";
+      return;
+    }
+    if (state.cloudAsrActive && state.cloudAsrPreviewActive) {
+      dom.studentState.textContent = "正在实时转写";
+      if (state.isListening) {
+        try {
+          recognition.start();
+        } catch {
+          state.cloudAsrPreviewActive = false;
+        }
+      }
       return;
     }
     if (state.ignoreNextRecognitionEnd) {
@@ -3900,7 +3921,7 @@ async function flushCloudAsrBuffer({ final = false } = {}) {
   if (!state.cloudAsrBuffers.length || state.cloudAsrRequestInFlight) return;
   const buffers = state.cloudAsrBuffers.splice(0);
   const length = buffers.reduce((sum, buffer) => sum + buffer.length, 0);
-  if (length < state.cloudAsrSampleRate * (final ? 0.2 : 0.7)) return;
+  if (length < state.cloudAsrSampleRate * (final ? 0.2 : 0.45)) return;
   const merged = new Float32Array(length);
   let offset = 0;
   buffers.forEach((buffer) => {
@@ -3960,6 +3981,7 @@ async function startCloudAsrListening() {
   source.connect(processor);
   processor.connect(audioContext.destination);
   state.cloudAsrActive = true;
+  state.cloudAsrPreviewActive = Boolean(getSpeechRecognition());
   state.isListening = true;
   state.resumeListeningAfterNavigation = false;
   dom.micBtn.innerHTML = `${iconMap.mic}停止收听`;
@@ -3969,7 +3991,14 @@ async function startCloudAsrListening() {
   resetSilenceTimer(false);
   state.cloudAsrFlushTimer = setInterval(() => {
     void flushCloudAsrBuffer();
-  }, 2800);
+  }, 1600);
+  if (state.cloudAsrPreviewActive) {
+    try {
+      state.speechRecognition.start();
+    } catch {
+      state.cloudAsrPreviewActive = false;
+    }
+  }
   return true;
 }
 
@@ -3977,8 +4006,16 @@ function stopCloudAsrListening() {
   stopSpeechNoResultTimer();
   clearInterval(state.cloudAsrFlushTimer);
   state.cloudAsrFlushTimer = null;
+  const hadPreview = state.cloudAsrPreviewActive;
   state.cloudAsrActive = false;
+  state.cloudAsrPreviewActive = false;
   state.isListening = false;
+  if (hadPreview) clearSpeechDraft();
+  try {
+    state.speechRecognition?.stop();
+  } catch {
+    // Browser preview recognition may already be stopped.
+  }
   try {
     state.cloudAsrProcessor?.disconnect();
     state.cloudAsrSource?.disconnect();
@@ -4884,8 +4921,15 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       latestStudentSpeech,
       lianQuestion: options.lianQuestion || "",
       problemText: question.problemText || "",
+      questionType: question.problemType || question.questionType || question.type || "",
       knowledgePoints: question.knowledgePoints || [],
       boardImage: getBoardImageForGuide(),
+      hasBoardInk: Boolean(hasCurrentBoardInk(question)),
+      latestHandwritingResult: state.latestHandwritingResult || null,
+      boardPendingRecognition: Boolean(
+        state.lastBoardWriteAt &&
+        state.lastBoardWriteAt > (state.lastHandwritingRecognizedAt || 0)
+      ),
       guideState: options.guideState || state.guideState,
       lectureUnlocked: (options.guideState || state.guideState) === GUIDE_STATES.INTERACTIVE,
       silenceSeconds: options.silenceSeconds || Math.round((Date.now() - getLastUserInputAt()) / 1000),

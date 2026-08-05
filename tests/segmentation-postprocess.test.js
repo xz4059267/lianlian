@@ -26,7 +26,8 @@ const {
   makeUnverifiedGuideSafe,
   studentAnswerMatchesVerifiedKey,
   isOnlyDirectAnswerWriting,
-  applyStatementEvaluationSafety
+  applyStatementEvaluationSafety,
+  applyLatestHandwritingConsistency
 } = require("../server.js");
 
 test("clips layout regions to OCR question-number intervals", () => {
@@ -953,6 +954,112 @@ test("allows a correct verdict only when the student answer matches the verified
   assert.equal(studentAnswerMatchesVerifiedKey("最后答案是-4", key), false);
   assert.equal(studentAnswerMatchesVerifiedKey("最后答案是5", key), false);
   assert.equal(studentAnswerMatchesVerifiedKey("最后答案是4", { ...key, trusted: false }), false);
+});
+
+test("uses the latest wrong handwriting result to guide from the actual mistake", () => {
+  const result = applyLatestHandwritingConsistency(
+    {
+      shouldSpeak: true,
+      speech: "这个比例式是正确的，继续算 x=4。",
+      hintLevel: "light",
+      formulaOrStep: "x=4",
+      lectureComplete: false
+    },
+    {
+      eventType: "check",
+      latestHandwritingResult: {
+        calculationStatus: "wrong",
+        issueSummary: "减法符号写反了",
+        guidance: "先重新检查两边相减时的符号。",
+        expectedNextStep: "重新检查符号"
+      }
+    }
+  );
+
+  assert.equal(result.speech, "先重新检查两边相减时的符号。");
+  assert.equal(result.askStudentToRepeat, true);
+  assert.equal(result.lectureComplete, false);
+});
+
+test("asks for board evidence when the student only speaks", () => {
+  const result = applyLatestHandwritingConsistency(
+    {
+      shouldSpeak: true,
+      speech: "可以直接算出答案。",
+      hintLevel: "light",
+      lectureComplete: false
+    },
+    {
+      eventType: "thought_complete",
+      hasBoardInk: false,
+      latestStudentSpeech: "我算出答案等于4"
+    }
+  );
+
+  assert.match(result.speech, /写在黑板上/);
+  assert.equal(result.lectureComplete, false);
+});
+
+test("also asks for board evidence when a choice answer is spoken", () => {
+  const result = applyLatestHandwritingConsistency(
+    {
+      shouldSpeak: true,
+      speech: "我来核对这个选项。",
+      hintLevel: "light",
+      lectureComplete: false
+    },
+    {
+      eventType: "answer_to_lian_question",
+      questionType: "选择题",
+      hasBoardInk: false,
+      latestStudentSpeech: "答案是C选项"
+    }
+  );
+
+  assert.match(result.speech, /写在黑板上/);
+  assert.equal(result.lectureComplete, false);
+});
+
+test("does not contradict a latest correct handwriting result", () => {
+  const result = applyLatestHandwritingConsistency(
+    {
+      shouldSpeak: true,
+      speech: "这一步算错了，需要重新检查。",
+      hintLevel: "light",
+      lectureComplete: false
+    },
+    {
+      eventType: "check",
+      latestHandwritingResult: {
+        calculationStatus: "correct",
+        positiveFeedback: "这一步和题目条件吻合，可以继续。"
+      }
+    }
+  );
+
+  assert.equal(result.speech, "这一步和题目条件吻合，可以继续。");
+  assert.equal(result.hintLevel, "encourage");
+});
+
+test("avoids a definitive judgment while new board strokes await recognition", () => {
+  const result = applyLatestHandwritingConsistency(
+    {
+      shouldSpeak: true,
+      speech: "你的最后一步是错误的。",
+      lectureComplete: false
+    },
+    {
+      eventType: "silence",
+      boardPendingRecognition: true,
+      latestHandwritingResult: {
+        calculationStatus: "correct"
+      }
+    }
+  );
+
+  assert.match(result.speech, /等板书识别更新/);
+  assert.equal(result.hintLevel, "light");
+  assert.equal(result.lectureComplete, false);
 });
 
 test("accepts a real board step but rejects an isolated final answer", () => {

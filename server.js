@@ -199,6 +199,20 @@ const LIAN_GUIDE_PROMPT = [
   "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
 ].join("\n");
 
+// The structured handwriting result is the freshest interpretation of the board.
+// Keep these rules separate from the long legacy prompt so they are easy to audit.
+const HANDWRITING_CONSISTENCY_RULES = [
+  "Use latestHandwritingResult as the freshest structured reading of the current board.",
+  "Never praise, correct, or extend an equation, variable, answer, or method that is not supported by the current question, current board image, latestHandwritingResult, or the student's latest speech.",
+  "If latestHandwritingResult.calculationStatus is wrong, guide from its guidance, issueSummary, or expectedNextStep. State the specific mismatch briefly and do not replace it with an unrelated old equation.",
+  "If latestHandwritingResult.calculationStatus is correct, do not claim that the visible step is wrong. Give concise content-based encouragement or ask for the next relevant step.",
+  "If calculationStatus is unclear or incomplete, avoid definitive claims about correctness and ask the student to continue or restate the latest visible relation.",
+  "The board has higher priority than speech for mathematical judgment. When board evidence and speech conflict, use the latest board status to judge the written calculation; use speech only to understand the student's intended explanation.",
+  "If hasBoardInk is false, speech alone is not evidence that any question's step or final answer is correct, including choice questions. Ask the student to write the key relation, option, or calculation on the board before checking it.",
+  "If boardPendingRecognition is true, the board may have changed after the last recognition. Do not make a definitive judgment about the new strokes; ask the student to continue while recognition updates.",
+  "When the structured result and the generated guidance conflict, prefer a short uncertainty response over guessing."
+].join("\n");
+
 const ORDERED_PROPORTION_RULES = [
   "比例题必须遵守给定顺序：题目说‘a、b、c、d 成比例’时，标准含义是 a:b=c:d，也就是第一项比第二项等于第三项比第四项。",
   "除非题目明确要求重新排列，否则禁止交换四个比例项，禁止声称‘没有规定顺序’，也禁止为了得到另一个结果而改成 a:b=d:c。",
@@ -1509,7 +1523,7 @@ async function synthesizeAliyunSpeech(text) {
   url.searchParams.set("sample_rate", String(ALIYUN_NLS_SAMPLE_RATE));
   url.searchParams.set("voice", ALIYUN_NLS_VOICE);
   url.searchParams.set("volume", process.env.ALIYUN_NLS_TTS_VOLUME || "50");
-  url.searchParams.set("speech_rate", process.env.ALIYUN_NLS_TTS_SPEECH_RATE || "0");
+  url.searchParams.set("speech_rate", process.env.ALIYUN_NLS_TTS_SPEECH_RATE || "-30");
   url.searchParams.set("pitch_rate", process.env.ALIYUN_NLS_TTS_PITCH_RATE || "0");
   const response = await fetch(url, { method: "GET" });
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -7449,6 +7463,97 @@ function enforceOrderedProportionConvention(result, context = {}) {
   return output;
 }
 
+function applyLatestHandwritingConsistency(result, body = {}) {
+  const output = result && typeof result === "object" ? { ...result } : {};
+  const handwriting = body.latestHandwritingResult;
+  const eventType = String(body.eventType || "");
+  const latestSpeech = String(body.latestStudentSpeech || body.transcript || "").trim();
+  const speechContainsMathOrHelp = /[=＋+\-−*/÷:：]|x|y|m|n|\u7b54\u6848|\u7ed3\u679c|\u7b49\u4e8e|\u4e0d\u4f1a|\u4e0d\u61c2|\u6ca1\u601d\u8def|\u600e\u4e48/i.test(latestSpeech);
+
+  const questionType = String(body.questionType || body.problemType || body.type || "");
+  const isChoiceQuestion = /选择|判断|单选|多选/.test(questionType);
+  const hasExplicitChoiceSpeech = /(?:答案\s*(?:是|为)?|选|选择|应选|选项)\s*[:：]?\s*[A-DＡ-Ｄ]/i.test(latestSpeech)
+    || /(?:^|\s)[A-DＡ-Ｄ](?:\s*选项)?(?:$|\s)/i.test(latestSpeech);
+  const speechCanStandInForMissingBoard = isChoiceQuestion && hasExplicitChoiceSpeech;
+
+  if (body.hasBoardInk === false && latestSpeech && speechContainsMathOrHelp && eventType !== "question_start") {
+    return {
+      ...output,
+      shouldSpeak: true,
+      speech: "我听到你的思路了，请把关键式子或计算过程写在黑板上，我再结合题目帮你核对。",
+      hintLevel: "light",
+      formulaOrStep: "",
+      askStudentToRepeat: false,
+      lectureComplete: false
+    };
+  }
+
+  if (!handwriting || typeof handwriting !== "object") return output;
+
+  const status = String(handwriting.calculationStatus || "").trim().toLowerCase();
+  const pending = Boolean(body.boardPendingRecognition);
+  const speech = String(output.speech || "");
+
+  if (pending && eventType !== "question_start") {
+    return {
+      ...output,
+      shouldSpeak: true,
+      speech: "我先不急着判断刚写的这一步，等板书识别更新后再核对。你可以先把刚才的思路接着说。",
+      hintLevel: "light",
+      formulaOrStep: "",
+      askStudentToRepeat: false,
+      lectureComplete: false
+    };
+  }
+
+  if (status === "wrong") {
+    const correction = String(
+      handwriting.guidance || handwriting.expectedNextStep || handwriting.issueSummary || ""
+    ).trim();
+    if (correction) {
+      return {
+        ...output,
+        shouldSpeak: true,
+        speech: correction,
+        hintLevel: output.hintLevel === "worked_step" ? output.hintLevel : "light",
+        formulaOrStep: String(handwriting.expectedNextStep || "").trim(),
+        askStudentToRepeat: true,
+        lectureComplete: false
+      };
+    }
+  }
+
+  if (status === "correct") {
+    const contradictory = /错|错误|不对|不一致|算错|不符合|wrong|incorrect/i.test(speech);
+    if (contradictory) {
+      return {
+        ...output,
+        shouldSpeak: true,
+        speech: String(handwriting.positiveFeedback || "这一步和题目条件是吻合的，可以接着讲下一步。").trim(),
+        hintLevel: "encourage",
+        formulaOrStep: "",
+        lectureComplete: false
+      };
+    }
+  }
+
+  if (status === "unclear" || status === "incomplete") {
+    const definitive = /正确|错误|不对|答案是|结果是|wrong|incorrect/i.test(speech);
+    if (definitive) {
+      return {
+        ...output,
+        shouldSpeak: true,
+        speech: "我先不急着判断刚才这一步。你把黑板上最后写的关系式再说一遍，我按题目条件帮你核对。",
+        hintLevel: "light",
+        formulaOrStep: "",
+        lectureComplete: false
+      };
+    }
+  }
+
+  return output;
+}
+
 async function handleGuide(req, res) {
   const body = await readJsonBody(req);
   if (!body.questionImage) {
@@ -7484,7 +7589,7 @@ async function handleGuide(req, res) {
   let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
-    instructions: [LIAN_GUIDE_PROMPT, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
+    instructions: [LIAN_GUIDE_PROMPT, HANDWRITING_CONSISTENCY_RULES, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
     content: [
       {
         type: "input_text",
@@ -7512,7 +7617,11 @@ async function handleGuide(req, res) {
           transcript: body.transcript || "",
           latestStudentSpeech: body.latestStudentSpeech || "",
           knownProblemText: body.problemText || "",
+          questionType: body.questionType || body.problemType || body.type || "",
           knownKnowledgePoints: body.knowledgePoints || [],
+          hasBoardInk: body.hasBoardInk === true,
+          latestHandwritingResult: body.latestHandwritingResult || null,
+          boardPendingRecognition: Boolean(body.boardPendingRecognition),
           verifiedAnswerReference: privateAnswerReference(answerKey),
           boundaryRules: [
             "如果 eventType=answer_to_lian_question，必须优先回应 lianQuestion 和 latestStudentSpeech 的对应关系，shouldSpeak=true，通常一句话确认后再给一个很小的下一步。",
@@ -7547,6 +7656,7 @@ async function handleGuide(req, res) {
     knowledgePoints: body.knowledgePoints || []
   });
   guideResult = await auditGuideMath(guideResult, answerKey, body);
+  guideResult = applyLatestHandwritingConsistency(guideResult, body);
 
   sendJson(res, 200, {
     ...guideResult,
@@ -8069,5 +8179,6 @@ module.exports = {
   makeUnverifiedGuideSafe,
   studentAnswerMatchesVerifiedKey,
   isOnlyDirectAnswerWriting,
-  applyStatementEvaluationSafety
+  applyStatementEvaluationSafety,
+  applyLatestHandwritingConsistency
 };
