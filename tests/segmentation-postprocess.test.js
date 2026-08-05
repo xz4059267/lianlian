@@ -20,13 +20,13 @@ const {
   buildLayoutContentBlocks,
   assessLocalSegmentationConfidence,
   enforceOrderedProportionConvention,
-  deterministicArrowDifferenceAnswerKey,
   guideContradictsVerifiedAnswer,
   answerValuesEquivalent,
   answerKeyResultsAgree,
   makeUnverifiedGuideSafe,
   studentAnswerMatchesVerifiedKey,
-  isOnlyDirectAnswerWriting
+  isOnlyDirectAnswerWriting,
+  applyStatementEvaluationSafety
 } = require("../server.js");
 
 test("clips layout regions to OCR question-number intervals", () => {
@@ -858,7 +858,7 @@ test("accepts only equivalent answers from the independent solver and verifier",
   );
 });
 
-test("derives the correct answer for arrow difference relation questions", () => {
+test.skip("legacy single-problem local answer override is disabled", () => {
   const key = deterministicArrowDifferenceAnswerKey(
     "如图，约定：上方相邻的左数与右数之差等于这两数下方箭头共同指向的数。图中有 x、2y、3x、m、n 和 8。结论 I：若 m 的值为 3，则 y 的值为 4；结论 II：不论 m、n 取何值，x-y 的值一定为 2。下列说法正确的是 A. I，II 都对 B. I 对，II 不对 C. I 不对，II 对 D. I，II 都不对"
   );
@@ -893,6 +893,37 @@ test("treats spoken Chinese zero as equivalent to m=0", () => {
   assert.equal(answerValuesEquivalent("M等于零", "m=0"), true);
   assert.equal(studentAnswerMatchesVerifiedKey("M等于零", answerKey), true);
   assert.equal(answerValuesEquivalent("m为负二", "m=-2"), true);
+});
+
+test("does not mark statement-check refutation steps wrong on vague condition mismatch", () => {
+  const answerKey = {
+    trusted: true,
+    problemText: "\u4e0b\u5217\u8bf4\u6cd5\u6b63\u786e\u7684\u662f\uff1a\u7ed3\u8bba I\uff0c\u7ed3\u8bba II\u3002",
+    canonicalAnswer: "C",
+    acceptedAnswers: ["I\u4e0d\u5bf9\uff0cII\u5bf9"],
+    solutionOutline: ["\u5bf9\u7ed3\u8bba I \u4ee3\u5165\u68c0\u67e5\uff0c\u63a8\u51fa\u53cd\u4f8b\u503c\u3002"],
+    verificationChecks: ["\u53cd\u4f8b\u63a8\u5bfc\u53ef\u7528\u6765\u5224\u65ad\u7ed3\u8bba\u4e0d\u6210\u7acb\u3002"]
+  };
+
+  const vague = applyStatementEvaluationSafety(
+    {
+      calculationStatus: "wrong",
+      calculationCheck: "\u677f\u4e66\u63a8\u51fa y=-1\uff0c\u4e0e\u9898\u76ee\u6761\u4ef6\u4e0d\u7b26\u3002",
+      confidence: 0.92
+    },
+    answerKey
+  );
+  assert.equal(vague.calculationStatus, "unclear");
+
+  const concrete = applyStatementEvaluationSafety(
+    {
+      calculationStatus: "wrong",
+      calculationCheck: "\u8fd9\u4e00\u6b65\u7b26\u53f7\u9519\uff0c\u6b63\u8d1f\u53f7\u5904\u7406\u6709\u95ee\u9898\u3002",
+      confidence: 0.92
+    },
+    answerKey
+  );
+  assert.equal(concrete.calculationStatus, "wrong");
 });
 
 test("fails closed when a math judgment has no verified answer key", () => {

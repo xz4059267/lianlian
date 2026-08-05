@@ -205,7 +205,20 @@ const ORDERED_PROPORTION_RULES = [
   "判断学生比例式或答案前必须先按上述顺序实际代入验算。"
 ].join("\n");
 
+const STATEMENT_EVALUATION_RULES = [
+  "General rule for statement / option / conclusion checking questions:",
+  "A board value that contradicts a proposed statement is not automatically wrong; it may be a valid refutation.",
+  "Distinguish the original problem conditions from statements/options that the student is testing.",
+  "Only say the board conflicts with the problem when you can name the exact original condition it violates.",
+  "For choice questions, judge both the student's calculations and the final option/truth-values against the verified answer reference.",
+  "If a visible equation, substitution, elimination, counterexample, or option check is mathematically valid and relevant, treat it as a key step even if the final option is not written yet.",
+  "Do not reuse variables, equations, proportions, answer choices, or conclusions from another problem."
+].join("\n");
+
 function deterministicArrowDifferenceAnswerKey(problemText = "") {
+  // Disabled: answer keys must come from the generic multimodal solver/verifier,
+  // not a local override for one specific problem pattern.
+  return null;
   const compact = String(problemText || "").normalize("NFKC").replace(/\s+/g, "");
   const hasRelation =
     /上方相邻/.test(compact) &&
@@ -264,6 +277,9 @@ function normalizeMathForLocalAudit(value = "") {
 }
 
 function deterministicArrowHandwritingAudit(result = {}, answerKey = null) {
+  // Disabled: handwriting judgment must use the generic verified-answer audit,
+  // not a local override for one specific problem pattern.
+  return null;
   if (!answerKey?.deterministic && !deterministicArrowDifferenceAnswerKey(answerKey?.problemText || "")) return null;
   const text = normalizeMathForLocalAudit([
     result.detectedWriting,
@@ -7160,7 +7176,7 @@ async function auditGuideMath(result, answerKey, body) {
     const audit = await callQwenMultimodalJson({
       model: QWEN_GUIDE_MODEL,
       schema: guideMathAuditSchema,
-      instructions: GUIDE_MATH_AUDIT_PROMPT,
+      instructions: [GUIDE_MATH_AUDIT_PROMPT, STATEMENT_EVALUATION_RULES].join("\n\n"),
       content: [
         {
           type: "input_text",
@@ -7467,7 +7483,7 @@ async function handleGuide(req, res) {
   let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
-    instructions: [LIAN_GUIDE_PROMPT, ORDERED_PROPORTION_RULES, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
+    instructions: [LIAN_GUIDE_PROMPT, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
     content: [
       {
         type: "input_text",
@@ -7559,7 +7575,7 @@ async function handleHandwriting(req, res) {
   let result = await callQwenMultimodalJson({
     model: QWEN_HANDWRITING_MODEL,
     schema: handwritingSchema,
-    instructions: [HANDWRITING_PROMPT, ORDERED_PROPORTION_RULES].join("\n\n"),
+    instructions: [HANDWRITING_PROMPT, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES].join("\n\n"),
     content: [
       {
         type: "input_text",
@@ -7580,8 +7596,8 @@ async function handleHandwriting(req, res) {
     maxOutputTokens: 1000
   });
 
-  result = deterministicArrowHandwritingAudit(result, answerKey) || result;
   result = await auditHandwritingResult(result, answerKey, body, boardForOcr);
+  result = applyStatementEvaluationSafety(result, answerKey);
 
   if (!answerKey.trusted && ["correct", "wrong"].includes(result.calculationStatus)) {
     result = {
@@ -7650,6 +7666,42 @@ function makeHandwritingUncertain(result, reason = "板书判断还需要再核�
   };
 }
 
+function answerKeyTextForSafety(answerKey) {
+  const parts = [
+    answerKey?.problemText,
+    answerKey?.canonicalAnswer,
+    answerKey?.questionType,
+    answerKey?.knowledge,
+    ...(Array.isArray(answerKey?.acceptedAnswers) ? answerKey.acceptedAnswers : []),
+    ...(Array.isArray(answerKey?.solutionOutline) ? answerKey.solutionOutline : []),
+    ...(Array.isArray(answerKey?.verificationChecks) ? answerKey.verificationChecks : [])
+  ];
+  return parts.filter(Boolean).join(" ").normalize("NFKC");
+}
+
+function looksLikeStatementEvaluationQuestion(answerKey) {
+  const text = answerKeyTextForSafety(answerKey);
+  return /(?:\u7ed3\u8bba|\u8bf4\u6cd5|\u5224\u65ad|\u6b63\u786e\u7684\u662f|\u4e0d\u6b63\u786e|\u9009\u9879|I{1,3}|[ABCD][\.\u3001\uff0e]?|[\u2160\u2161\u2162])/i.test(text);
+}
+
+function applyStatementEvaluationSafety(result, answerKey) {
+  if (!looksLikeStatementEvaluationQuestion(answerKey)) return result;
+  if (String(result?.calculationStatus || "") !== "wrong") return result;
+  const issueText = [
+    result?.calculationCheck,
+    result?.issueSummary,
+    result?.expectedNextStep,
+    result?.guidance
+  ].filter(Boolean).join(" ").normalize("NFKC");
+  const saysConditionMismatch = /(?:\u4e0d\u7b26|\u4e0d\u7b26\u5408|\u4e0d\u4e00\u81f4|\u51b2\u7a81|inconsistent|conflict|violate)/i.test(issueText);
+  const hasConcreteArithmeticFault = /(?:\u7b97\u9519|\u8fd0\u7b97\u9519|\u7b26\u53f7\u9519|\u6b63\u8d1f|\u7b49\u53f7\u9519|\u4ee3\u5165\u9519|\u5217\u5f0f\u9519|arithmetic|sign error|wrong equation)/i.test(issueText);
+  if (!saysConditionMismatch || hasConcreteArithmeticFault) return result;
+  return makeHandwritingUncertain(
+    result,
+    "\u8fd9\u662f\u7ed3\u8bba/\u9009\u9879\u6838\u5bf9\u9898\uff0c\u677f\u4e66\u53ef\u80fd\u662f\u5728\u53cd\u9a73\u67d0\u4e2a\u7ed3\u8bba\uff0c\u6682\u4e0d\u64ad\u51fa\u7b3c\u7edf\u7684\u9519\u8bef\u5224\u65ad\u3002"
+  );
+}
+
 function applyHandwritingAudit(result, audit) {
   const status = String(audit?.correctedStatus || result?.calculationStatus || "unclear");
   const confidence = Math.max(0, Math.min(1, Number(audit?.confidence) || 0));
@@ -7683,7 +7735,7 @@ async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
     const audit = await callQwenMultimodalJson({
       model: QWEN_HANDWRITING_MODEL,
       schema: handwritingAuditSchema,
-      instructions: [HANDWRITING_AUDIT_PROMPT, ORDERED_PROPORTION_RULES].join("\n\n"),
+      instructions: [HANDWRITING_AUDIT_PROMPT, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES].join("\n\n"),
       content: [
         {
           type: "input_text",
@@ -7993,12 +8045,12 @@ module.exports = {
   buildLayoutContentBlocks,
   assessLocalSegmentationConfidence,
   enforceOrderedProportionConvention,
-  deterministicArrowDifferenceAnswerKey,
   guideContradictsVerifiedAnswer,
   makeAnswerLockedGuideSafe,
   answerValuesEquivalent,
   answerKeyResultsAgree,
   makeUnverifiedGuideSafe,
   studentAnswerMatchesVerifiedKey,
-  isOnlyDirectAnswerWriting
+  isOnlyDirectAnswerWriting,
+  applyStatementEvaluationSafety
 };
