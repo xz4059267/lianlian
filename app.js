@@ -228,7 +228,12 @@ const state = {
   cloudAsrSampleRate: 16000,
   cloudAsrFlushTimer: null,
   cloudAsrRequestInFlight: false,
+  cloudAsrPendingFlush: false,
+  cloudAsrRequestId: 0,
   cloudAsrPreviewActive: false,
+  speechInterpretationPromise: Promise.resolve(),
+  lastCloudAsrText: "",
+  lastCloudAsrTextAt: 0,
   speechDraftText: "",
   speechDraftBase: "",
   speechNoResultTimer: null,
@@ -275,6 +280,7 @@ const state = {
   guideState: GUIDE_STATES.HEURISTIC,
   lastGuideAt: 0,
   lastSpeechAt: 0,
+  lastRecognizedSpeechAt: 0,
   lastBoardWriteAt: 0,
   lastUserInputAt: 0,
   lastEncourageAt: 0,
@@ -630,6 +636,42 @@ function getLastUserInputAt() {
   return Math.max(state.lastUserInputAt || 0, state.lastSpeechAt || 0, state.lastBoardWriteAt || 0);
 }
 
+function getStudentInputSnapshot() {
+  return {
+    boardWriteAt: state.lastBoardWriteAt || 0,
+    speechAt: state.lastRecognizedSpeechAt || 0
+  };
+}
+
+function hasStudentInputSince(snapshot) {
+  if (!snapshot) return false;
+  return Boolean(
+    (state.lastBoardWriteAt || 0) > (snapshot.boardWriteAt || 0) ||
+    (state.lastRecognizedSpeechAt || 0) > (snapshot.speechAt || 0)
+  );
+}
+
+function hasStudentInputSinceHandwritingRecognition() {
+  const recognizedAt = state.lastHandwritingRecognizedAt || 0;
+  if (!recognizedAt) return false;
+  return Boolean(
+    (state.lastBoardWriteAt || 0) > recognizedAt ||
+      (state.lastRecognizedSpeechAt || 0) > recognizedAt
+  );
+}
+
+function skipStaleHandwritingFeedback(stage, snapshot) {
+  if (!hasStudentInputSince(snapshot)) return false;
+  console.log("[handwriting] feedback skipped", {
+    stage,
+    reason: "new student board or speech input",
+    startedAt: snapshot,
+    current: getStudentInputSnapshot()
+  });
+  dom.lianState.textContent = guideIdleText();
+  return true;
+}
+
 function clearSilenceFollowup() {
   state.awaitingSilenceFollowup = false;
   state.silenceCareAskedAt = 0;
@@ -637,7 +679,10 @@ function clearSilenceFollowup() {
 
 function markUserInput(type) {
   const now = Date.now();
-  if (type === "speech") state.lastSpeechAt = now;
+  if (type === "speech") {
+    state.lastSpeechAt = now;
+    state.lastRecognizedSpeechAt = now;
+  }
   if (type === "board") {
     state.lastBoardWriteAt = now;
     state.currentQuestionCompleted = false;
@@ -2124,6 +2169,7 @@ function initCurrentQuestion() {
   const now = Date.now();
   state.lastGuideAt = 0;
   state.lastSpeechAt = now;
+  state.lastRecognizedSpeechAt = 0;
   state.lastBoardWriteAt = now;
   state.lastUserInputAt = now;
   state.lastEncourageAt = now;
@@ -2779,12 +2825,13 @@ dom.nextPageBtn.addEventListener("click", () => {
   updatePageLabel();
 });
 
-function resetQuestionGuideState() {
+function resetQuestionGuideState(options = {}) {
   const now = Date.now();
   setGuideState(GUIDE_STATES.HEURISTIC);
   clearPendingThought();
   clearTimeout(state.recognitionTimer);
   state.lastSpeechAt = now;
+  state.lastRecognizedSpeechAt = 0;
   state.lastBoardWriteAt = 0;
   state.lastHandwritingRecognizedAt = 0;
   state.lastUserInputAt = now;
@@ -2802,6 +2849,7 @@ function resetQuestionGuideState() {
   state.transcriptCorrectionRequestId += 1;
   state.handwritingRequestId += 1;
   if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+  stopLianSpeechOutput();
   dom.lianAvatar.classList.remove("speaking");
   dom.lianAvatar.classList.add("listening");
   state.awaitingFinalAnswer = false;
@@ -2826,13 +2874,17 @@ function resetQuestionGuideState() {
     "题目换好了，你先讲你的想法，我先跟着听。",
     "现在讲这道题，你不用急着算，先把思路说出来。"
   ]);
-  void lianSpeak(dom.lianBubble.textContent, {
-    dedupeKey: `question-change:${currentPageQuestion()?.id || state.boardPageIndex}`,
-    cooldownMs: 0,
-    allowRepeat: true,
-    log: false,
-    trackQuestion: false
-  });
+  if (options.speak !== false) {
+    void lianSpeak(dom.lianBubble.textContent, {
+      dedupeKey: `question-change:${currentPageQuestion()?.id || state.boardPageIndex}`,
+      cooldownMs: 0,
+      allowRepeat: true,
+      log: false,
+      trackQuestion: false
+    });
+  } else {
+    dom.lianBubble.textContent = "";
+  }
   if (state.isListening) resetSilenceTimer();
 }
 
@@ -2931,6 +2983,7 @@ async function runHandwritingRecognition(reason) {
 
   const requestId = ++state.handwritingRequestId;
   const questionId = question.id;
+  const recognitionInputSnapshot = getStudentInputSnapshot();
   saveCurrentPage();
   dom.recognitionPill.textContent = "板书识别中";
   dom.recognitionPill.classList.remove("hidden");
@@ -2938,6 +2991,7 @@ async function runHandwritingRecognition(reason) {
   try {
     const result = normalizeHandwritingResult(await requestHandwritingAnalysis(question, reason));
     if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) return;
+    if (skipStaleHandwritingFeedback("recognition-result", recognitionInputSnapshot)) return;
     state.latestHandwritingResult = result;
     state.lastHandwritingRecognizedAt = Date.now();
     state.handwritingResults[question.id] = result;
@@ -3034,6 +3088,7 @@ async function verifyCurrentBoardForCompletion(question) {
 
   const requestId = ++state.handwritingRequestId;
   const questionId = question.id;
+  const recognitionInputSnapshot = getStudentInputSnapshot();
   saveCurrentPage();
   dom.recognitionPill.textContent = "正在检查板书步骤";
   dom.recognitionPill.classList.remove("hidden");
@@ -3043,6 +3098,15 @@ async function verifyCurrentBoardForCompletion(question) {
   );
   if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) {
     return { verified: false, stale: true, result: null, guidance: "题目已经切换，本次板书检查已取消。" };
+  }
+
+  if (hasStudentInputSince(recognitionInputSnapshot)) {
+    console.log("[handwriting] completion check skipped", {
+      reason: "new student board or speech input",
+      startedAt: recognitionInputSnapshot,
+      current: getStudentInputSnapshot()
+    });
+    return { verified: false, stale: true, newerInput: true, result: null, guidance: "" };
   }
 
   state.latestHandwritingResult = result;
@@ -3310,6 +3374,7 @@ async function maybeVerifyFinalAnswerFromHandwriting(result) {
   if (!shouldVerifyHandwritingFinalAnswer(result)) return false;
   const question = currentPageQuestion();
   if (!question || state.currentQuestionCompleted || state.completionCheckInProgress) return false;
+  if (hasStudentInputSinceHandwritingRecognition()) return false;
 
   const answer = extractHandwritingFinalAnswerCandidate(result);
   await lianSpeak("我来核对答案。", {
@@ -3318,6 +3383,7 @@ async function maybeVerifyFinalAnswerFromHandwriting(result) {
     allowRepeat: true
   });
 
+  if (hasStudentInputSinceHandwritingRecognition()) return false;
   if (shouldPromptSaveFromHandwriting(result)) {
     return await maybePromptSaveFromHandwriting(result);
   }
@@ -3371,6 +3437,7 @@ async function maybePromptSaveFromHandwriting(result) {
   const question = currentPageQuestion();
   if (!question || state.currentQuestionCompleted || state.completionCheckInProgress) return false;
   if (!shouldPromptSaveFromHandwriting(result)) return false;
+  if (hasStudentInputSinceHandwritingRecognition()) return false;
   if (state.autoSavePromptedQuestionId === question.id) return false;
 
   state.autoSavePromptedQuestionId = question.id;
@@ -3386,6 +3453,7 @@ async function maybePromptSaveFromHandwriting(result) {
   await new Promise((resolve) => setTimeout(resolve, 320));
   dom.recognitionPill.classList.add("hidden");
   await new Promise((resolve) => setTimeout(resolve, 120));
+  if (hasStudentInputSinceHandwritingRecognition()) return false;
   const feedback = String(result.positiveFeedback || "").trim();
   await lianSpeak(
     feedback
@@ -3394,6 +3462,7 @@ async function maybePromptSaveFromHandwriting(result) {
   );
   setTimeout(() => {
     if (currentPageQuestion()?.id !== question.id) return;
+    if (hasStudentInputSinceHandwritingRecognition()) return;
     if (!state.finalAnswerVerified || !state.boardCompletionVerified) return;
     void saveCurrentQuestionAndContinue({ feedback });
   }, 1500);
@@ -3417,6 +3486,7 @@ function getBoardCompletionGuidance(result) {
 function maybeSpeakHandwritingSuccess(result) {
   if (!isHandwritingCalculationCorrect(result)) return false;
   if (isIncompleteHandwritingIssue(result)) return false;
+  if (hasStudentInputSinceHandwritingRecognition()) return false;
 
   const now = Date.now();
   const successKey = `${result.mathExpression || ""}:${result.calculationCheck || result.detectedWriting || ""}`
@@ -3465,6 +3535,7 @@ function shouldAskForHandwritingConfirmation(result) {
 
 function maybeSpeakHandwritingUnclear(result) {
   if (!shouldAskForHandwritingConfirmation(result)) return false;
+  if (hasStudentInputSinceHandwritingRecognition()) return false;
 
   const now = Date.now();
   const unclearKey = [
@@ -3535,6 +3606,7 @@ function buildIncompleteHandwritingGuidance(result) {
 }
 
 function maybeSpeakHandwritingGuidance(result) {
+  if (hasStudentInputSinceHandwritingRecognition()) return false;
   const now = Date.now();
   if (isIncompleteHandwritingIssue(result) && hasHandwritingProgressForGuidance(result)) {
     const issueKey = `incomplete:${result.expectedNextStep || result.missingBoardContent || result.mathExpression || result.detectedWriting || ""}`
@@ -3694,6 +3766,7 @@ function getSpeechRecognition() {
     if (state.cloudAsrActive && state.cloudAsrPreviewActive) {
       const previewText = interimText || finalText;
       if (previewText) {
+        interruptGuideForStudentSpeech();
         dom.studentAvatar.classList.add("speaking");
         dom.studentState.textContent = "正在实时转写";
         showSpeechDraft(previewText);
@@ -3708,7 +3781,7 @@ function getSpeechRecognition() {
       tryHandleImmediateStuckSpeech(interimText);
     }
     if (finalText) {
-      void handleRecognizedSpeech(finalText);
+      void enqueueRecognizedSpeech(finalText);
       resetSilenceTimer();
     }
   };
@@ -3794,7 +3867,7 @@ function getSpeechRecognition() {
     }
     const draft = clearSpeechDraft();
     if (draft) {
-      void handleRecognizedSpeech(draft);
+      void enqueueRecognizedSpeech(draft);
       resetSilenceTimer();
     }
     dom.studentAvatar.classList.remove("speaking");
@@ -3918,7 +3991,12 @@ function encodeWavDataUrl(samples, sampleRate = 16000) {
 }
 
 async function flushCloudAsrBuffer({ final = false } = {}) {
-  if (!state.cloudAsrBuffers.length || state.cloudAsrRequestInFlight) return;
+  if (!state.cloudAsrBuffers.length || state.cloudAsrRequestInFlight) {
+    if (state.cloudAsrBuffers.length && state.cloudAsrRequestInFlight) {
+      state.cloudAsrPendingFlush = true;
+    }
+    return;
+  }
   const buffers = state.cloudAsrBuffers.splice(0);
   const length = buffers.reduce((sum, buffer) => sum + buffer.length, 0);
   if (length < state.cloudAsrSampleRate * (final ? 0.2 : 0.45)) return;
@@ -3930,6 +4008,8 @@ async function flushCloudAsrBuffer({ final = false } = {}) {
   });
   const wavDataUrl = encodeWavDataUrl(merged, state.cloudAsrSampleRate);
   state.cloudAsrRequestInFlight = true;
+  state.cloudAsrPendingFlush = false;
+  const requestId = ++state.cloudAsrRequestId;
   try {
     const response = await fetch("/api/asr", {
       method: "POST",
@@ -3938,14 +4018,24 @@ async function flushCloudAsrBuffer({ final = false } = {}) {
     });
     const result = await response.json().catch(() => ({}));
     const text = String(result.text || "").trim();
-    if (response.ok && text) {
-      await handleRecognizedSpeech(text);
+    if (response.ok && text && requestId === state.cloudAsrRequestId) {
+      const committedText = commitCloudAsrText(text);
+      if (committedText) {
+        // Commit cloud recognition before optional correction or guide requests.
+        void enqueueRecognizedSpeech(committedText, {
+          alreadyCommitted: true,
+          rawAsrText: text
+        });
+      }
       resetSilenceTimer();
     }
   } catch (error) {
     console.warn("Aliyun ASR failed:", error);
   } finally {
     state.cloudAsrRequestInFlight = false;
+    if (state.cloudAsrPendingFlush) {
+      void flushCloudAsrBuffer({ final: final || !state.cloudAsrActive });
+    }
   }
 }
 
@@ -3966,6 +4056,10 @@ async function startCloudAsrListening() {
   const processor = audioContext.createScriptProcessor(4096, 1, 1);
   state.cloudAsrSampleRate = 16000;
   state.cloudAsrBuffers = [];
+  state.cloudAsrPendingFlush = false;
+  state.cloudAsrRequestId += 1;
+  state.lastCloudAsrText = "";
+  state.lastCloudAsrTextAt = 0;
   state.cloudAsrStream = stream;
   state.cloudAsrAudioContext = audioContext;
   state.cloudAsrSource = source;
@@ -4048,7 +4142,7 @@ async function toggleListening() {
     stopSpeechNoResultTimer();
     const draft = clearSpeechDraft();
     if (draft) {
-      void handleRecognizedSpeech(draft);
+      void enqueueRecognizedSpeech(draft);
     }
     state.isListening = false;
     state.silenceGuidePending = false;
@@ -4259,13 +4353,18 @@ function normalizeQuestionAwareSpeechText(text) {
 
 function replaceLastTranscriptSegment(originalText, correctedText) {
   const current = dom.transcriptInput.value;
-  if (current === originalText) {
-    dom.transcriptInput.value = correctedText;
-  } else if (current.endsWith(`\n${originalText}`)) {
-    dom.transcriptInput.value = `${current.slice(0, -originalText.length)}${correctedText}`;
-  } else {
-    return false;
+  const lines = current.split("\n");
+  const original = String(originalText || "").trim();
+  let lineIndex = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index].trim() === original) {
+      lineIndex = index;
+      break;
+    }
   }
+  if (lineIndex < 0) return false;
+  lines[lineIndex] = correctedText;
+  dom.transcriptInput.value = lines.join("\n");
   dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
   return true;
 }
@@ -4306,6 +4405,32 @@ async function correctLatestTranscript(text, options = {}) {
   }
 }
 
+function commitCloudAsrText(text) {
+  const normalized = normalizeMathSpeechText(cleanSpeechText(text));
+  if (!normalized) return "";
+  const compact = compactSpeechForCompare(normalized);
+  const now = Date.now();
+  const previous = compactSpeechForCompare(state.lastCloudAsrText);
+  if (previous && now - state.lastCloudAsrTextAt < 6000 && compact === previous) {
+    return "";
+  }
+  clearSpeechDraft();
+  appendTranscript(normalized);
+  markUserInput("speech");
+  state.lastCloudAsrText = normalized;
+  state.lastCloudAsrTextAt = now;
+  dom.studentAvatar.classList.add("speaking");
+  dom.studentState.textContent = "姝ｅ湪瀹炴椂杞啓";
+  return normalized;
+}
+
+function enqueueRecognizedSpeech(text, options = {}) {
+  state.speechInterpretationPromise = state.speechInterpretationPromise
+    .catch(() => {})
+    .then(() => handleRecognizedSpeech(text, options));
+  return state.speechInterpretationPromise;
+}
+
 function commitSpeechText(text) {
   clearSpeechDraft();
   const finalText = normalizeMathSpeechText(text);
@@ -4322,7 +4447,7 @@ async function commitSpeechTextWithCorrection(text) {
   return await correctLatestTranscript(finalText);
 }
 
-async function handleRecognizedSpeech(text) {
+async function handleRecognizedSpeech(text, options = {}) {
   clearSpeechDraft();
   const rawText = cleanSpeechText(text);
   const immediateText = normalizeMathSpeechText(rawText);
@@ -4335,7 +4460,7 @@ async function handleRecognizedSpeech(text) {
     void correctLatestTranscript(immediateText, { rawAsrText: rawText, localNormalizedText: immediateText });
     return;
   }
-  appendTranscript(immediateText);
+  if (!options.alreadyCommitted) appendTranscript(immediateText);
 
   // Direct questions and explicit final answers must not wait for the optional
   // transcript-correction request.
@@ -4863,15 +4988,18 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   const fallbackText = options.fallbackText || buildFallbackGuide(eventType, question);
   const requestId = ++state.activeGuideRequestId;
   const questionId = question?.id || "";
+  const guideInputSnapshot = getStudentInputSnapshot();
+  const guideOptions = { ...options, inputSnapshot: guideInputSnapshot };
   setGuideState(targetGuideState);
   dom.lianState.textContent = targetGuideState === GUIDE_STATES.INTERACTIVE ? "准备分步讲解" : "在想提示";
   if (isSilenceGuide) state.silenceGuidePending = true;
 
   try {
-    const result = await requestAIGuide(eventType, latestStudentSpeech, options);
+    const result = await requestAIGuide(eventType, latestStudentSpeech, guideOptions);
     if (state.teachSessionPaused || requestId !== state.activeGuideRequestId || currentPageQuestion()?.id !== questionId) {
       return false;
     }
+    if (skipStaleHandwritingFeedback("guide-result", guideInputSnapshot)) return false;
     const lectureComplete = shouldCompleteCurrentLecture(result, latestStudentSpeech);
     const speech = formatGuideSpeech(eventType, result, fallbackText);
     if (result.shouldSpeak === false && !options.force) {
@@ -4880,11 +5008,13 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       return false;
     }
 
+    if (hasStudentInputSince(guideInputSnapshot)) return false;
     await lianSpeak(speech);
     if (
       state.teachSessionPaused ||
       requestId !== state.activeGuideRequestId ||
-      currentPageQuestion()?.id !== questionId
+      currentPageQuestion()?.id !== questionId ||
+      hasStudentInputSince(guideInputSnapshot)
     ) {
       return false;
     }
@@ -4893,7 +5023,12 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     return true;
   } catch (error) {
     console.warn("AI guide fallback:", error);
-    if (state.teachSessionPaused || requestId !== state.activeGuideRequestId || currentPageQuestion()?.id !== questionId) {
+    if (
+      state.teachSessionPaused ||
+      requestId !== state.activeGuideRequestId ||
+      currentPageQuestion()?.id !== questionId ||
+      hasStudentInputSince(guideInputSnapshot)
+    ) {
       return false;
     }
     lianSpeak(fallbackText);
@@ -4944,7 +5079,8 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       hasMathStep: Boolean(options.hasMathStep),
       studentFinalAnswerEvidence: state.hasExplicitFinalAnswer,
       answerVerified: state.finalAnswerVerified,
-      boardCompletionVerified: state.boardCompletionVerified
+      boardCompletionVerified: state.boardCompletionVerified,
+      inputSnapshot: options.inputSnapshot || getStudentInputSnapshot()
     })
   });
   const result = await response.json().catch(() => ({}));
@@ -5799,7 +5935,7 @@ function goToLectureQuestion(index, openingText = "") {
   if (index < 0 || index >= state.lecture.length) return false;
   state.boardPageIndex = index;
   state.currentLectureIndex = index;
-  resetQuestionGuideState();
+  resetQuestionGuideState({ speak: !openingText });
   loadCurrentPage();
   updatePageLabel();
   dom.finishQuestionBtn.disabled = false;
