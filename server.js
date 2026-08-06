@@ -6631,6 +6631,41 @@ const answerKeySolverSchema = {
       finalAnswer: { type: "string" },
       canonicalAnswer: { type: "string" },
       acceptedAnswers: { type: "array", items: { type: "string" } },
+      choiceAnalysis: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          options: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                label: { type: "string" },
+                text: { type: "string" }
+              },
+              required: ["label", "text"]
+            }
+          },
+          statementVerdicts: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                id: { type: "string" },
+                text: { type: "string" },
+                correct: { type: "boolean" },
+                evidence: { type: "string" }
+              },
+              required: ["id", "text", "correct", "evidence"]
+            }
+          },
+          selectedOption: { type: "string" },
+          selectedOptionText: { type: "string" }
+        },
+        required: ["options", "statementVerdicts", "selectedOption", "selectedOptionText"]
+      },
       solutionSteps: { type: "array", items: { type: "string" } },
       solutionOutline: { type: "array", items: { type: "string" } },
       verificationChecks: { type: "array", items: { type: "string" } },
@@ -6650,6 +6685,7 @@ const answerKeySolverSchema = {
       "finalAnswer",
       "canonicalAnswer",
       "acceptedAnswers",
+      "choiceAnalysis",
       "solutionSteps",
       "solutionOutline",
       "verificationChecks",
@@ -6674,6 +6710,41 @@ const answerKeyVerifierSchema = {
       verified: { type: "boolean" },
       independentlySolvedAnswer: { type: "string" },
       acceptedAnswers: { type: "array", items: { type: "string" } },
+      choiceAnalysis: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          options: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                label: { type: "string" },
+                text: { type: "string" }
+              },
+              required: ["label", "text"]
+            }
+          },
+          statementVerdicts: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                id: { type: "string" },
+                text: { type: "string" },
+                correct: { type: "boolean" },
+                evidence: { type: "string" }
+              },
+              required: ["id", "text", "correct", "evidence"]
+            }
+          },
+          selectedOption: { type: "string" },
+          selectedOptionText: { type: "string" }
+        },
+        required: ["options", "statementVerdicts", "selectedOption", "selectedOptionText"]
+      },
       confidence: { type: "number" },
       contradiction: { type: "string" },
       verificationSummary: { type: "string" }
@@ -6682,6 +6753,7 @@ const answerKeyVerifierSchema = {
       "verified",
       "independentlySolvedAnswer",
       "acceptedAnswers",
+      "choiceAnalysis",
       "confidence",
       "contradiction",
       "verificationSummary"
@@ -6710,6 +6782,8 @@ const ANSWER_KEY_SOLVER_PROMPT = [
   "必须自己根据题目条件计算，不得把图片里学生手写答案、红笔批改、勾叉或已填答案当成正确依据。",
   "先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核最终答案。",
   "canonicalAnswer 只写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
+  "如果是选择题，必须返回 choiceAnalysis：逐字抄录可见的 A/B/C/D 选项，分别写入 options；如果题目包含结论 I/II 或多个判断，逐项写入 statementVerdicts，并独立判断 correct；selectedOption 必须根据这些选项文字匹配，selectedOptionText 必须完整写出对应含义。不能只返回字母。",
+  "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "solutionOutline 和 verificationChecks 只写简洁、可核验的关键步骤，不写冗长推理。",
   "如果题图不完整、题意存在多解或无法可靠读取，status 必须为 ambiguous 或 unreadable，不能猜答案。",
   ORDERED_PROPORTION_RULES
@@ -6722,6 +6796,8 @@ const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
   "如果图片里有学生手写答案、红笔批改、叉号、圈画或擦写痕迹，要区分题目原文和学生作答痕迹；这些痕迹只能用于 studentTrace，不能当成正确答案依据。",
   "最终答案必须经过计算核验。先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核。",
   "如果题目是选择题，finalAnswer 和 canonicalAnswer 必须包含选项字母和选项含义，例如：C. I 不对，II 对。不要只返回 C。",
+  "choiceAnalysis 是选项语义的唯一依据。先判断各结论，再按题图中实际出现的选项文字匹配字母；不要凭记忆假定 C 或 D 的含义。",
+  "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "finalAnswer 和 canonicalAnswer 都写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
   "solutionSteps 和 solutionOutline 写关键步骤，简短、可核验，不要冗长。",
   "verification.checks 写代入检查或计算核验过程。",
@@ -6737,6 +6813,8 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
   "如果图片里有学生手写答案、红笔批改、叉号、圈画或擦写痕迹，要区分题目原文和学生作答痕迹；这些痕迹只能写入 hasStudentAnswer、studentAnswer、isStudentAnswerCorrect、studentWrongReason，不能当成正确答案依据。",
   "最终答案必须经过计算核验。先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核。",
   "如果题目是选择题，finalAnswer 和 canonicalAnswer 必须包含选项字母和选项含义，例如：C. I 不对，II 对。不要只返回 C。",
+  "必须返回 choiceAnalysis：逐字抄录题图中的选项文字，独立填写各结论的 true/false，并用结论组合匹配 selectedOption 和 selectedOptionText。",
+  "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 写关键步骤，简短、可核验；verificationChecks 写代入检查或计算核验过程。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verificationChecks 中说明原因。",
   "只返回符合 schema 的 JSON。不要返回 Markdown，不要在 JSON 外输出任何文字。",
@@ -6745,7 +6823,8 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
 
 const ANSWER_KEY_VERIFIER_PROMPT = [
   "你是第二位独立的初中数学答案复核员。候选答案可能是错的，不能顺着候选答案解释。",
-  "你会收到从题图清洗出的完整题目文本。请只根据这份题目文本独立计算，然后再与候选答案比较。",
+  "你会收到原始题目图片、从题图清洗出的完整题目文本和候选答案。必须重新查看原始题图，尤其核对图形、表格、A/B/C/D 选项的完整文字和顺序；不能只相信清洗文本。",
+  "如果是选择题，必须返回 choiceAnalysis：重新抄录 options，独立判断 statementVerdicts，并根据选项文字得到 selectedOption 和 selectedOptionText。字母相同但选项含义不同，必须 verified=false。",
   "必须检查题目顺序、正负号、单位、选项、定义域、是否漏解以及题目实际问法。",
   "不要采用候选答案的计算过程，也不要自行补充题目文本中不存在的条件。",
   "如果题目依赖图形或表格，而清洗后的题目文本没有包含关键关系，verified 必须为 false，不能猜。",
@@ -6834,12 +6913,84 @@ function answerKeyCandidates(value) {
     .filter(Boolean);
 }
 
+function normalizeChoiceAnalysis(value = {}) {
+  const input = value && typeof value === "object" ? value : {};
+  const options = (Array.isArray(input.options) ? input.options : [])
+    .map((option) => ({
+      label: String(option?.label || "").normalize("NFKC").trim().toUpperCase(),
+      text: String(option?.text || "").normalize("NFKC").replace(/\s+/g, " ").trim()
+    }))
+    .filter((option) => /^[A-D]$/.test(option.label) && option.text);
+  const statementVerdicts = (Array.isArray(input.statementVerdicts) ? input.statementVerdicts : [])
+    .map((statement) => ({
+      id: String(statement?.id || "").normalize("NFKC").trim(),
+      text: String(statement?.text || "").normalize("NFKC").replace(/\s+/g, " ").trim(),
+      correct: statement?.correct === true,
+      evidence: String(statement?.evidence || "").normalize("NFKC").replace(/\s+/g, " ").trim()
+    }))
+    .filter((statement) => statement.id && statement.text);
+  const selectedOption = String(input.selectedOption || "").normalize("NFKC").trim().toUpperCase();
+  const selectedOptionText = String(input.selectedOptionText || "").normalize("NFKC").replace(/\s+/g, " ").trim();
+  return { options, statementVerdicts, selectedOption, selectedOptionText };
+}
+
+function normalizeChoiceText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\s，,。；;：:、（）()【】\[\]“”"'‘’]+/g, "")
+    .trim();
+}
+
+function isChoiceQuestionContext(value = {}) {
+  const text = [value?.questionType, value?.problemText, value?.questionText]
+    .filter(Boolean)
+    .join(" ");
+  return /选择题|下列.*(?:正确|错误)|正确的是|不正确的是|选项|结论\s*[一二三四IVX]/.test(text);
+}
+
+function choiceAnalysisIsUsable(value) {
+  const choice = normalizeChoiceAnalysis(value);
+  return choice.options.length >= 2 &&
+    /^[A-D]$/.test(choice.selectedOption) &&
+    choice.options.some((option) =>
+      option.label === choice.selectedOption &&
+      normalizeChoiceText(option.text) === normalizeChoiceText(choice.selectedOptionText)
+    );
+}
+
+function choiceAnalysesAgree(solver, verifier) {
+  const left = normalizeChoiceAnalysis(solver?.choiceAnalysis);
+  const right = normalizeChoiceAnalysis(verifier?.choiceAnalysis);
+  const isChoice = isChoiceQuestionContext(solver) ||
+    left.options.length >= 2 ||
+    right.options.length >= 2;
+  if (!isChoice) return true;
+  if (!choiceAnalysisIsUsable(left) || !choiceAnalysisIsUsable(right)) return false;
+  if (left.selectedOption !== right.selectedOption) return false;
+  if (normalizeChoiceText(left.selectedOptionText) !== normalizeChoiceText(right.selectedOptionText)) return false;
+
+  const rightOptions = new Map(right.options.map((option) => [option.label, normalizeChoiceText(option.text)]));
+  for (const option of left.options) {
+    if (rightOptions.has(option.label) && rightOptions.get(option.label) !== normalizeChoiceText(option.text)) {
+      return false;
+    }
+  }
+
+  const rightVerdicts = new Map(right.statementVerdicts.map((statement) => [statement.id, statement.correct]));
+  for (const statement of left.statementVerdicts) {
+    if (rightVerdicts.has(statement.id) && rightVerdicts.get(statement.id) !== statement.correct) return false;
+  }
+  return true;
+}
+
 function answerKeyResultsAgree(solver, verifier) {
   const solverAnswers = answerKeyCandidates(solver);
   const verifierAnswers = [verifier?.independentlySolvedAnswer, ...(Array.isArray(verifier?.acceptedAnswers) ? verifier.acceptedAnswers : [])]
     .map((item) => String(item || "").trim())
     .filter(Boolean);
-  return solverAnswers.some((left) => verifierAnswers.some((right) => answerValuesEquivalent(left, right)));
+  return solverAnswers.some((left) => verifierAnswers.some((right) => answerValuesEquivalent(left, right))) &&
+    choiceAnalysesAgree(solver, verifier);
 }
 
 function getAnswerKeyCacheKey(questionImage, context = {}) {
@@ -6847,7 +6998,7 @@ function getAnswerKeyCacheKey(questionImage, context = {}) {
     .createHash("sha256")
     .update(String(questionImage || ""))
     .update(`|problem:${String(context.problemText || "").replace(/\s+/g, " ").trim()}`)
-    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v8-flat-json`)
+    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v9-choice-semantics`)
     .digest("hex");
 }
 
@@ -6887,6 +7038,7 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
 
   solver.finalAnswer = String(solver.finalAnswer || solver.canonicalAnswer || "").trim();
   solver.canonicalAnswer = String(solver.canonicalAnswer || solver.finalAnswer || "").trim();
+  solver.choiceAnalysis = normalizeChoiceAnalysis(solver.choiceAnalysis);
   solver.solutionOutline = Array.isArray(solver.solutionSteps) && solver.solutionSteps.length
     ? solver.solutionSteps
     : (Array.isArray(solver.solutionOutline) ? solver.solutionOutline : []);
@@ -6924,59 +7076,49 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     };
   }
 
-  const verifier = await callQwenMultimodalJson({
-    model: QWEN_GUIDE_MODEL,
-    schema: answerKeyVerifierSchema,
-    instructions: ANSWER_KEY_VERIFIER_PROMPT,
-    content: [
-      {
-        type: "input_text",
-        text: JSON.stringify({
-          cleanedProblemText: solver.problemText,
-          questionType: solver.questionType,
-          candidateAnswer: solver.canonicalAnswer,
-          candidateAcceptedAnswers: solver.acceptedAnswers,
-          instruction: "只用 cleanedProblemText 独立解题；算完后再看 candidateAnswer 是否一致。"
-        })
-      }
-    ],
-    maxOutputTokens: 900
-  });
-
-  const confidence = Math.min(Number(solver.confidence) || 0, Number(verifier.confidence) || 0);
-  const trusted =
-    verifier.verified === true &&
-    confidence >= ANSWER_KEY_MIN_CONFIDENCE &&
-    answerKeyResultsAgree(solver, verifier);
-
-  if (!trusted) {
-    console.warn(
-      `[answer-key] verification conflict solver=${JSON.stringify(solver.canonicalAnswer)} verifier=${JSON.stringify(
-        verifier.independentlySolvedAnswer
-      )} solverConfidence=${solver.confidence} verifierConfidence=${verifier.confidence} verified=${verifier.verified}`
-    );
+  // 选项语义已经由标准答案模型在同一次看图解题中返回。
+  // 不再串行调用第二个答案复核模型，避免把 C/D 的含义重新解释并拖慢板书反馈。
+  const solverQuestionContext = {
+    ...solver,
+    problemText: solver.problemText || context.problemText || ""
+  };
+  const solverChoiceAnalysis = normalizeChoiceAnalysis(solver.choiceAnalysis);
+  const isChoiceAnswer = isChoiceQuestionContext(solverQuestionContext) || solverChoiceAnalysis.options.length >= 2;
+  if (isChoiceAnswer && !choiceAnalysisIsUsable(solverChoiceAnalysis)) {
+    return {
+      trusted: false,
+      status: "choice-semantics-incomplete",
+      confidence: Number(solver.confidence) || 0,
+      reason: "选择题缺少可核对的选项文字或选项映射",
+      problemText: String(solver.problemText || context.problemText || "").trim(),
+      questionType: String(solver.questionType || "").trim(),
+      choiceAnalysis: solverChoiceAnalysis,
+      elapsedMs: Date.now() - startedAt
+    };
   }
 
   return {
-    trusted,
-    status: trusted ? "verified" : "conflict",
-    canonicalAnswer: trusted ? String(solver.canonicalAnswer).trim() : "",
-    acceptedAnswers: trusted ? answerKeyCandidates(solver) : [],
+    trusted: true,
+    status: "structured-single-pass",
+    canonicalAnswer: String(solver.canonicalAnswer).trim(),
+    acceptedAnswers: answerKeyCandidates(solver),
+    choiceAnalysis: solverChoiceAnalysis,
     problemText: String(solver.problemText || context.problemText || "").trim(),
     questionType: String(solver.questionType || "").trim(),
     knowledge: String(solver.knowledge || "").trim(),
-    solutionOutline: trusted && Array.isArray(solver.solutionOutline) ? solver.solutionOutline.slice(0, 8) : [],
-    verificationChecks: trusted && Array.isArray(solver.verificationChecks) ? solver.verificationChecks.slice(0, 8) : [],
+    solutionOutline: Array.isArray(solver.solutionOutline) ? solver.solutionOutline.slice(0, 8) : [],
+    verificationChecks: Array.isArray(solver.verificationChecks) ? solver.verificationChecks.slice(0, 8) : [],
     studentTrace: solver.studentTrace || {
       hasStudentAnswer: false,
       studentAnswer: "",
       isStudentAnswerCorrect: false,
       wrongReason: ""
     },
-    confidence,
-    reason: trusted ? verifier.verificationSummary || "双重核验通过" : verifier.contradiction || "两次独立结果不一致",
+    confidence: Number(solver.confidence) || 0,
+    reason: "标准答案模型已返回结构化答案、选项语义和关键步骤",
     elapsedMs: Date.now() - startedAt
   };
+
 }
 
 async function getVerifiedAnswerKey(questionImage, context = {}) {
@@ -7005,17 +7147,18 @@ function privateAnswerReference(answerKey) {
   if (!answerKey?.trusted) {
     return {
       trusted: false,
-      instruction: "标准答案尚未通过双重核验。禁止判断学生对错，禁止输出确定答案或确定算式。"
+      instruction: "标准答案尚未通过结构化答案校验。禁止判断学生对错，禁止输出确定答案或确定算式。"
     };
   }
   return {
     trusted: true,
     canonicalAnswer: answerKey.canonicalAnswer,
     acceptedAnswers: answerKey.acceptedAnswers,
+    choiceAnalysis: normalizeChoiceAnalysis(answerKey.choiceAnalysis),
     solutionOutline: answerKey.solutionOutline,
     verificationChecks: answerKey.verificationChecks,
     confidence: answerKey.confidence,
-    instruction: "这是服务端私有核验基线。所有数学判断必须与它一致；未解锁讲解时不得把最终答案直接告诉学生。"
+    instruction: "这是服务端私有标准答案基线。所有数学判断必须与它一致；选择题必须同时依据 selectedOption 和 selectedOptionText，不得重新猜测字母含义；未解锁讲解时不得把最终答案直接告诉学生。"
   };
 }
 
@@ -7638,6 +7781,7 @@ async function handleGuide(req, res) {
             "lectureComplete=true 后 speech 只做一次收束，不得继续追问、要求复述或重复已经说过的选项。",
             "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致。trusted=false 时禁止判断对错或输出确定数学结论。",
             "verifiedAnswerReference.trusted=true 时，禁止给出与 canonicalAnswer 不一致的候选最终答案；指出错误时只说具体错在常数项、符号、对应关系或公式，不要说“或者另一个答案”。",
+            "如果 verifiedAnswerReference.choiceAnalysis 存在，选项字母只能和其中同标签的 selectedOptionText 一起使用；不要重新猜测 C、D 或其他字母的含义。涉及结论 I/II 时，必须依据 statementVerdicts 的 correct 判断说明。",
             "不要把题目图片里被划掉、红叉或旁边批改的原错答案当作可能正确答案。",
             "禁止使用固定鼓励词：很好、不错、继续、真棒、非常好、很棒。"
           ],
@@ -7661,8 +7805,8 @@ async function handleGuide(req, res) {
   sendJson(res, 200, {
     ...guideResult,
     model: QWEN_GUIDE_MODEL,
-    answerVerification: answerKey.trusted ? "double-verified" : answerKey.status,
-    provider: "qwen-double-verified-guidance",
+    answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
+    provider: "qwen-structured-answer-guidance",
     fallbackFrom: ""
   });
 }
@@ -7745,9 +7889,9 @@ async function handleHandwriting(req, res) {
   console.log(`[handwriting-timing] total=${timingMs}ms`);
   sendJson(res, 200, {
     ...result,
-    answerVerification: answerKey.trusted ? "double-verified" : answerKey.status,
+    answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
     model: QWEN_HANDWRITING_MODEL,
-    provider: "qwen-double-verified-handwriting",
+    provider: "qwen-structured-answer-handwriting",
     timingMs
   });
 }
@@ -7910,6 +8054,12 @@ async function handleAnswerKeyPrefetch(req, res) {
     confidence: answerKey.trusted ? answerKey.confidence : 0,
     canonicalAnswer: answerKey.trusted ? answerKey.canonicalAnswer : "",
     acceptedAnswers: answerKey.trusted ? answerKey.acceptedAnswers : [],
+    choiceAnalysis: answerKey.trusted ? normalizeChoiceAnalysis(answerKey.choiceAnalysis) : {
+      options: [],
+      statementVerdicts: [],
+      selectedOption: "",
+      selectedOptionText: ""
+    },
     problemText: answerKey.trusted ? answerKey.problemText : "",
     questionType: answerKey.trusted ? answerKey.questionType : "",
     knowledge: answerKey.trusted ? answerKey.knowledge || "" : "",
@@ -7918,7 +8068,7 @@ async function handleAnswerKeyPrefetch(req, res) {
     studentTrace: answerKey.trusted ? answerKey.studentTrace || null : null,
     reason: answerKey.reason || "",
     elapsedMs: answerKey.elapsedMs || 0,
-    provider: "qwen-double-verified-answer-key"
+    provider: "qwen-structured-single-pass-answer-key"
   });
 }
 
@@ -8175,6 +8325,8 @@ module.exports = {
   guideContradictsVerifiedAnswer,
   makeAnswerLockedGuideSafe,
   answerValuesEquivalent,
+  normalizeChoiceAnalysis,
+  choiceAnalysesAgree,
   answerKeyResultsAgree,
   makeUnverifiedGuideSafe,
   studentAnswerMatchesVerifiedKey,

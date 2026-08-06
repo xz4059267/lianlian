@@ -22,6 +22,7 @@ const {
   enforceOrderedProportionConvention,
   guideContradictsVerifiedAnswer,
   answerValuesEquivalent,
+  choiceAnalysesAgree,
   answerKeyResultsAgree,
   makeUnverifiedGuideSafe,
   studentAnswerMatchesVerifiedKey,
@@ -857,6 +858,50 @@ test("accepts only equivalent answers from the independent solver and verifier",
     ),
     false
   );
+});
+
+test("preserves the meaning of a choice letter instead of comparing the letter alone", () => {
+  const solver = {
+    questionType: "选择题",
+    problemText: "下列说法正确的是",
+    choiceAnalysis: {
+      options: [
+        { label: "A", text: "I、II都对" },
+        { label: "B", text: "I对，II不对" },
+        { label: "C", text: "I不对，II对" },
+        { label: "D", text: "I、II都不对" }
+      ],
+      statementVerdicts: [
+        { id: "I", text: "结论I", correct: false, evidence: "代入检验不成立" },
+        { id: "II", text: "结论II", correct: true, evidence: "由定义可得" }
+      ],
+      selectedOption: "C",
+      selectedOptionText: "I不对，II对"
+    }
+  };
+  const sameMeaning = {
+    ...solver,
+    choiceAnalysis: {
+      ...solver.choiceAnalysis,
+      selectedOption: "C",
+      selectedOptionText: "I不对，II对"
+    }
+  };
+  const wrongMeaning = {
+    ...solver,
+    choiceAnalysis: {
+      ...solver.choiceAnalysis,
+      selectedOption: "C",
+      selectedOptionText: "I对，II不对",
+      statementVerdicts: [
+        { id: "I", text: "结论I", correct: true, evidence: "错误复核" },
+        { id: "II", text: "结论II", correct: false, evidence: "错误复核" }
+      ]
+    }
+  };
+
+  assert.equal(choiceAnalysesAgree(solver, sameMeaning), true);
+  assert.equal(choiceAnalysesAgree(solver, wrongMeaning), false);
 });
 
 test.skip("legacy single-problem local answer override is disabled", () => {

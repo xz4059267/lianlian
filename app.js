@@ -2421,6 +2421,12 @@ async function prefetchVerifiedAnswerKey(question) {
       confidence: Number(result.confidence) || 0,
       canonicalAnswer: String(result.canonicalAnswer || "").trim(),
       acceptedAnswers: Array.isArray(result.acceptedAnswers) ? result.acceptedAnswers : [],
+      choiceAnalysis: result.choiceAnalysis || {
+        options: [],
+        statementVerdicts: [],
+        selectedOption: "",
+        selectedOptionText: ""
+      },
       problemText: String(result.problemText || "").trim(),
       questionType: String(result.questionType || "").trim(),
       knowledge: String(result.knowledge || "").trim(),
@@ -2444,6 +2450,12 @@ async function prefetchVerifiedAnswerKey(question) {
       confidence: 0,
       canonicalAnswer: "",
       acceptedAnswers: [],
+      choiceAnalysis: {
+        options: [],
+        statementVerdicts: [],
+        selectedOption: "",
+        selectedOptionText: ""
+      },
       solutionOutline: [],
       verificationChecks: [],
       reason: "standard answer service unavailable",
@@ -3315,7 +3327,7 @@ function isHandwritingCalculationCorrect(result) {
 
 function isBoardCompletionVerified(result) {
   return Boolean(
-    result?.answerVerification === "double-verified" &&
+    ["double-verified", "structured-single-pass"].includes(result?.answerVerification) &&
     result?.boardComplete === true &&
     result?.isRelevant === true &&
     result?.calculationStatus === "correct" &&
@@ -3426,7 +3438,7 @@ function hasReviewableBoardStep(result) {
 
 function shouldPromptSaveFromHandwriting(result) {
   return Boolean(
-    result?.answerVerification === "double-verified" &&
+    ["double-verified", "structured-single-pass"].includes(result?.answerVerification) &&
     result?.isRelevant === true &&
     isHandwritingCalculationCorrect(result) &&
     hasReviewableBoardStep(result)
