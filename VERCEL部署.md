@@ -11,9 +11,9 @@ Vercel 可以让网页获得公网地址和 HTTPS，适合先让别人打开体�
 在 Vercel 项目后台添加：
 
 - `QWEN_API_KEY`
-- `QWEN_VL_MODEL=qwen3.5-omni-flash`
-- `QWEN_GUIDE_MODEL=qwen3.5-omni-flash`
-- `QWEN_HANDWRITING_MODEL=qwen3.5-omni-flash`
+- `QWEN_VL_MODEL=qwen3-omni-flash-realtime`
+- `QWEN_GUIDE_MODEL=qwen3-omni-flash-realtime`
+- `QWEN_HANDWRITING_MODEL=qwen3-omni-flash-realtime`
 - `QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`
 - `ALIYUN_OCR_APPCODE`
 - `ALIYUN_OCR_URL=https://subject2.market.alicloudapi.com/educationservice/papercut`

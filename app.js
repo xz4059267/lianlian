@@ -231,6 +231,8 @@ const state = {
   cloudAsrPendingFlush: false,
   cloudAsrRequestId: 0,
   cloudAsrPreviewActive: false,
+  cloudAsrPreviewFinalText: "",
+  cloudAsrFinalizing: false,
   speechInterpretationPromise: Promise.resolve(),
   lastCloudAsrText: "",
   lastCloudAsrTextAt: 0,
@@ -3776,7 +3778,8 @@ function getSpeechRecognition() {
       state.lastSpeechAt = Date.now();
     }
     if (state.cloudAsrActive && state.cloudAsrPreviewActive) {
-      const previewText = interimText || finalText;
+      if (finalText) rememberCloudAsrPreviewFinal(finalText);
+      const previewText = [state.cloudAsrPreviewFinalText, interimText].filter(Boolean).join(" ");
       if (previewText) {
         interruptGuideForStudentSpeech();
         dom.studentAvatar.classList.add("speaking");
@@ -3863,6 +3866,11 @@ function getSpeechRecognition() {
           state.cloudAsrPreviewActive = false;
         }
       }
+      return;
+    }
+    if (state.cloudAsrFinalizing) {
+      // 停止云端识别后，等待最后一批阿里云结果或本地预览回退，不能在这里清掉草稿。
+      dom.studentState.textContent = "正在整理语音";
       return;
     }
     if (state.ignoreNextRecognitionEnd) {
@@ -4006,12 +4014,17 @@ async function flushCloudAsrBuffer({ final = false } = {}) {
   if (!state.cloudAsrBuffers.length || state.cloudAsrRequestInFlight) {
     if (state.cloudAsrBuffers.length && state.cloudAsrRequestInFlight) {
       state.cloudAsrPendingFlush = true;
+    } else if (final) {
+      commitCloudAsrPreviewFallback();
     }
     return;
   }
   const buffers = state.cloudAsrBuffers.splice(0);
   const length = buffers.reduce((sum, buffer) => sum + buffer.length, 0);
-  if (length < state.cloudAsrSampleRate * (final ? 0.2 : 0.45)) return;
+  if (length < state.cloudAsrSampleRate * (final ? 0.2 : 0.45)) {
+    if (final) commitCloudAsrPreviewFallback();
+    return;
+  }
   const merged = new Float32Array(length);
   let offset = 0;
   buffers.forEach((buffer) => {
@@ -4030,9 +4043,12 @@ async function flushCloudAsrBuffer({ final = false } = {}) {
     });
     const result = await response.json().catch(() => ({}));
     const text = String(result.text || "").trim();
+    let committed = false;
     if (response.ok && text && requestId === state.cloudAsrRequestId) {
       const committedText = commitCloudAsrText(text);
       if (committedText) {
+        committed = true;
+        state.cloudAsrPreviewFinalText = "";
         // Commit cloud recognition before optional correction or guide requests.
         void enqueueRecognizedSpeech(committedText, {
           alreadyCommitted: true,
@@ -4041,8 +4057,13 @@ async function flushCloudAsrBuffer({ final = false } = {}) {
       }
       resetSilenceTimer();
     }
+    if (final) {
+      if (!committed) commitCloudAsrPreviewFallback();
+      else state.cloudAsrFinalizing = false;
+    }
   } catch (error) {
     console.warn("Aliyun ASR failed:", error);
+    if (final) commitCloudAsrPreviewFallback();
   } finally {
     state.cloudAsrRequestInFlight = false;
     if (state.cloudAsrPendingFlush) {
@@ -4072,6 +4093,8 @@ async function startCloudAsrListening() {
   state.cloudAsrRequestId += 1;
   state.lastCloudAsrText = "";
   state.lastCloudAsrTextAt = 0;
+  state.cloudAsrPreviewFinalText = "";
+  state.cloudAsrFinalizing = false;
   state.cloudAsrStream = stream;
   state.cloudAsrAudioContext = audioContext;
   state.cloudAsrSource = source;
@@ -4113,10 +4136,10 @@ function stopCloudAsrListening() {
   clearInterval(state.cloudAsrFlushTimer);
   state.cloudAsrFlushTimer = null;
   const hadPreview = state.cloudAsrPreviewActive;
+  state.cloudAsrFinalizing = hadPreview;
   state.cloudAsrActive = false;
   state.cloudAsrPreviewActive = false;
   state.isListening = false;
-  if (hadPreview) clearSpeechDraft();
   try {
     state.speechRecognition?.stop();
   } catch {
@@ -4245,6 +4268,7 @@ function appendTranscript(text) {
   const prefix = dom.transcriptInput.value.trim() ? "\n" : "";
   dom.transcriptInput.value += `${prefix}${cleaned}`;
   dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
+  syncTranscriptState();
 }
 
 function showSpeechDraft(text) {
@@ -4256,6 +4280,7 @@ function showSpeechDraft(text) {
   const prefix = base.trim() ? "\n" : "";
   dom.transcriptInput.value = `${base}${prefix}${draft}`;
   dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
+  syncTranscriptState();
 }
 
 function clearSpeechDraft() {
@@ -4264,7 +4289,45 @@ function clearSpeechDraft() {
   dom.transcriptInput.value = state.speechDraftBase || "";
   state.speechDraftText = "";
   state.speechDraftBase = "";
+  syncTranscriptState();
   return draft;
+}
+
+function syncTranscriptState() {
+  const question = currentPageQuestion();
+  if (question) state.transcriptsByQuestion[question.id] = dom.transcriptInput.value;
+}
+
+function rememberCloudAsrPreviewFinal(text) {
+  const normalized = cleanSpeechText(text);
+  if (!normalized) return;
+  const next = compactSpeechForCompare(normalized);
+  const previous = compactSpeechForCompare(state.cloudAsrPreviewFinalText);
+  if (previous && (next === previous || previous.includes(next))) return;
+  state.cloudAsrPreviewFinalText = [state.cloudAsrPreviewFinalText, normalized]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function commitCloudAsrPreviewFallback() {
+  const fallback = normalizeMathSpeechText(
+    cleanSpeechText(state.cloudAsrPreviewFinalText || state.speechDraftText)
+  );
+  state.cloudAsrPreviewFinalText = "";
+  state.cloudAsrFinalizing = false;
+  if (!fallback) {
+    clearSpeechDraft();
+    return "";
+  }
+  const previous = compactSpeechForCompare(state.lastCloudAsrText);
+  const current = compactSpeechForCompare(fallback);
+  clearSpeechDraft();
+  if (previous && Date.now() - state.lastCloudAsrTextAt < 6000 && (current === previous || current.includes(previous))) {
+    return "";
+  }
+  markUserInput("speech");
+  void enqueueRecognizedSpeech(fallback);
+  return fallback;
 }
 
 function normalizeMathSpeechText(text) {

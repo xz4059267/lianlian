@@ -39,7 +39,7 @@ const QWEN_VL_MODEL =
   process.env.Qwen_model ||
   process.env.qwen_model ||
   process.env.DASHSCOPE_MODEL ||
-  "qwen3.5-omni-flash";
+  "qwen3-omni-flash-realtime";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
 const HANDWRITING_FAST_CONFIDENCE = Number(process.env.HANDWRITING_FAST_CONFIDENCE || 0.94);
