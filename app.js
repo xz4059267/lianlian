@@ -273,6 +273,10 @@ const state = {
   lianVoiceIdentity: "",
   lianVoiceSelectionLocked: false,
   lianSpeechRequestId: 0,
+  lectureSessionId: 0,
+  inputSequenceId: 0,
+  lastInputEvent: null,
+  lianTtsAbortController: null,
   lianSpeechPausedRecognition: false,
   lianSpeechKeepAliveTimer: null,
   micPermissionGranted: false,
@@ -681,6 +685,21 @@ function clearSilenceFollowup() {
 
 function markUserInput(type) {
   const now = Date.now();
+  state.inputSequenceId += 1;
+  state.lastInputEvent = {
+    sessionId: state.lectureSessionId,
+    sequenceId: state.inputSequenceId,
+    type,
+    questionId: currentPageQuestion()?.id || "",
+    at: now
+  };
+  // A new student input invalidates any response that was based on the
+  // previous board or transcript. This prevents late network/TTS callbacks
+  // from writing an answer after the student has already continued.
+  state.activeGuideRequestId += 1;
+  state.lianSpeechRequestId += 1;
+  state.finalAnswerRequestId += 1;
+  stopLianSpeechOutput();
   if (type === "speech") {
     state.lastSpeechAt = now;
     state.lastRecognizedSpeechAt = now;
@@ -699,6 +718,24 @@ function markUserInput(type) {
   if (state.isListening) resetSilenceTimer(false);
 }
 
+function getInteractionToken() {
+  return {
+    sessionId: state.lectureSessionId,
+    sequenceId: state.inputSequenceId,
+    questionId: currentPageQuestion()?.id || ""
+  };
+}
+
+function isCurrentInteraction(token) {
+  if (!token) return true;
+  return (
+    token.sessionId === state.lectureSessionId &&
+    token.sequenceId === state.inputSequenceId &&
+    token.questionId === (currentPageQuestion()?.id || "") &&
+    !state.teachSessionPaused
+  );
+}
+
 function interruptGuideForStudentSpeech() {
   if (state.currentQuestionCompleted) return;
   clearTimeout(state.pendingThoughtTimer);
@@ -713,6 +750,14 @@ function interruptGuideForStudentSpeech() {
 }
 
 function stopLianSpeechOutput() {
+  if (state.lianTtsAbortController) {
+    try {
+      state.lianTtsAbortController.abort();
+    } catch {
+      // The request may already have completed.
+    }
+    state.lianTtsAbortController = null;
+  }
   clearInterval(state.lianSpeechKeepAliveTimer);
   state.lianSpeechKeepAliveTimer = null;
   const utterance = state.currentLianUtterance;
@@ -2682,6 +2727,9 @@ dom.canvas.addEventListener("pointerdown", (event) => {
   pushHistory();
   state.drawing = true;
   state.strokeHasInk = false;
+  // Invalidate an earlier guide as soon as the student starts a new stroke.
+  // Waiting for pointerup lets stale speech continue while the student is writing.
+  markUserInput("board");
   state.lastPoint = pointerToCanvas(event);
   ctx.beginPath();
   ctx.moveTo(state.lastPoint.x, state.lastPoint.y);
@@ -2743,7 +2791,6 @@ dom.canvas.addEventListener("pointermove", (event) => {
     saveCurrentPage();
     const shouldRecognize = hasCurrentBoardInk() && (strokeHadInk || state.tool === "eraser" || canvasHasVisibleInk());
     if (shouldRecognize) {
-      markUserInput("board");
       scheduleHandwritingRecognition("停笔 6 秒后");
     }
   });
@@ -2841,6 +2888,9 @@ dom.nextPageBtn.addEventListener("click", () => {
 
 function resetQuestionGuideState(options = {}) {
   const now = Date.now();
+  state.lectureSessionId += 1;
+  state.inputSequenceId = 0;
+  state.lastInputEvent = null;
   setGuideState(GUIDE_STATES.HEURISTIC);
   clearPendingThought();
   clearTimeout(state.recognitionTimer);
@@ -2998,13 +3048,18 @@ async function runHandwritingRecognition(reason) {
   const requestId = ++state.handwritingRequestId;
   const questionId = question.id;
   const recognitionInputSnapshot = getStudentInputSnapshot();
+  const responseToken = getInteractionToken();
   saveCurrentPage();
   dom.recognitionPill.textContent = "板书识别中";
   dom.recognitionPill.classList.remove("hidden");
 
   try {
     const result = normalizeHandwritingResult(await requestHandwritingAnalysis(question, reason));
-    if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) return;
+    if (
+      requestId !== state.handwritingRequestId ||
+      currentPageQuestion()?.id !== questionId ||
+      !isCurrentInteraction(responseToken)
+    ) return;
     if (skipStaleHandwritingFeedback("recognition-result", recognitionInputSnapshot)) return;
     state.latestHandwritingResult = result;
     state.lastHandwritingRecognizedAt = Date.now();
@@ -3103,6 +3158,7 @@ async function verifyCurrentBoardForCompletion(question) {
   const requestId = ++state.handwritingRequestId;
   const questionId = question.id;
   const recognitionInputSnapshot = getStudentInputSnapshot();
+  const responseToken = getInteractionToken();
   saveCurrentPage();
   dom.recognitionPill.textContent = "正在检查板书步骤";
   dom.recognitionPill.classList.remove("hidden");
@@ -3110,7 +3166,11 @@ async function verifyCurrentBoardForCompletion(question) {
   const result = normalizeHandwritingResult(
     await requestHandwritingAnalysis(question, "完成讲解前检查：判断板书是否至少包含一个与本题相关且正确的关键步骤")
   );
-  if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) {
+  if (
+    requestId !== state.handwritingRequestId ||
+    currentPageQuestion()?.id !== questionId ||
+    !isCurrentInteraction(responseToken)
+  ) {
     return { verified: false, stale: true, result: null, guidance: "题目已经切换，本次板书检查已取消。" };
   }
 
@@ -4325,7 +4385,6 @@ function commitCloudAsrPreviewFallback() {
   if (previous && Date.now() - state.lastCloudAsrTextAt < 6000 && (current === previous || current.includes(previous))) {
     return "";
   }
-  markUserInput("speech");
   void enqueueRecognizedSpeech(fallback);
   return fallback;
 }
@@ -4491,7 +4550,6 @@ function commitCloudAsrText(text) {
   }
   clearSpeechDraft();
   appendTranscript(normalized);
-  markUserInput("speech");
   state.lastCloudAsrText = normalized;
   state.lastCloudAsrTextAt = now;
   dom.studentAvatar.classList.add("speaking");
@@ -4500,9 +4558,14 @@ function commitCloudAsrText(text) {
 }
 
 function enqueueRecognizedSpeech(text, options = {}) {
+  const queuedOptions = { ...options };
+  if (!queuedOptions.inputAlreadyRegistered) {
+    markUserInput("speech");
+    queuedOptions.inputAlreadyRegistered = true;
+  }
   state.speechInterpretationPromise = state.speechInterpretationPromise
     .catch(() => {})
-    .then(() => handleRecognizedSpeech(text, options));
+    .then(() => handleRecognizedSpeech(text, queuedOptions));
   return state.speechInterpretationPromise;
 }
 
@@ -4546,13 +4609,13 @@ async function handleRecognizedSpeech(text, options = {}) {
     isExplicitFinalAnswerStatement(immediateText) ||
     extractDirectFinalAnswerCandidate(immediateText)
   ) {
-    handleStudentSpeech(immediateText);
+    handleStudentSpeech(immediateText, options);
     void correctLatestTranscript(immediateText, { rawAsrText: rawText, localNormalizedText: immediateText });
     return;
   }
 
   const spokenText = await correctLatestTranscript(immediateText, { rawAsrText: rawText, localNormalizedText: immediateText });
-  if (spokenText) handleStudentSpeech(spokenText);
+  if (spokenText) handleStudentSpeech(spokenText, options);
 }
 
 function compactSpeechForCompare(text) {
@@ -4670,11 +4733,11 @@ function handleSilenceTimeout() {
   });
 }
 
-function handleStudentSpeech(text) {
+function handleStudentSpeech(text, options = {}) {
   text = normalizeMathSpeechText(text);
   if (!text) return;
   const normalized = text.replace(/\s/g, "");
-  markUserInput("speech");
+  if (!options.inputAlreadyRegistered) markUserInput("speech");
   const directFinalAnswer = extractDirectFinalAnswerCandidate(text);
   const isExplicitFinalAnswer = isExplicitFinalAnswerStatement(text) || Boolean(directFinalAnswer);
 
@@ -5064,14 +5127,21 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   const requestId = ++state.activeGuideRequestId;
   const questionId = question?.id || "";
   const guideInputSnapshot = getStudentInputSnapshot();
-  const guideOptions = { ...options, inputSnapshot: guideInputSnapshot };
+  const responseToken = getInteractionToken();
+  const responseId = `guide:${responseToken.sessionId}:${responseToken.sequenceId}:${requestId}`;
+  const guideOptions = { ...options, inputSnapshot: guideInputSnapshot, responseToken, responseId };
   setGuideState(targetGuideState);
   dom.lianState.textContent = targetGuideState === GUIDE_STATES.INTERACTIVE ? "准备分步讲解" : "在想提示";
   if (isSilenceGuide) state.silenceGuidePending = true;
 
   try {
     const result = await requestAIGuide(eventType, latestStudentSpeech, guideOptions);
-    if (state.teachSessionPaused || requestId !== state.activeGuideRequestId || currentPageQuestion()?.id !== questionId) {
+    if (
+      state.teachSessionPaused ||
+      requestId !== state.activeGuideRequestId ||
+      currentPageQuestion()?.id !== questionId ||
+      !isCurrentInteraction(responseToken)
+    ) {
       return false;
     }
     if (skipStaleHandwritingFeedback("guide-result", guideInputSnapshot)) return false;
@@ -5084,11 +5154,12 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     }
 
     if (hasStudentInputSince(guideInputSnapshot)) return false;
-    await lianSpeak(speech);
+    await lianSpeak(speech, { responseToken, responseId });
     if (
       state.teachSessionPaused ||
       requestId !== state.activeGuideRequestId ||
       currentPageQuestion()?.id !== questionId ||
+      !isCurrentInteraction(responseToken) ||
       hasStudentInputSince(guideInputSnapshot)
     ) {
       return false;
@@ -5102,11 +5173,12 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       state.teachSessionPaused ||
       requestId !== state.activeGuideRequestId ||
       currentPageQuestion()?.id !== questionId ||
+      !isCurrentInteraction(responseToken) ||
       hasStudentInputSince(guideInputSnapshot)
     ) {
       return false;
     }
-    lianSpeak(fallbackText);
+    lianSpeak(fallbackText, { responseToken, responseId });
     if (isSilenceGuide && state.isListening) resetSilenceTimer();
     return true;
   } finally {
@@ -5155,7 +5227,8 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       studentFinalAnswerEvidence: state.hasExplicitFinalAnswer,
       answerVerified: state.finalAnswerVerified,
       boardCompletionVerified: state.boardCompletionVerified,
-      inputSnapshot: options.inputSnapshot || getStudentInputSnapshot()
+      inputSnapshot: options.inputSnapshot || getStudentInputSnapshot(),
+      responseId: options.responseId || ""
     })
   });
   const result = await response.json().catch(() => ({}));
@@ -5537,16 +5610,24 @@ function splitLianSpeechText(text) {
   return chunks.filter(Boolean);
 }
 
-async function playCloudLianSpeech(speechText, speechRequestId, publishText) {
+async function playCloudLianSpeech(
+  speechText,
+  speechRequestId,
+  publishText,
+  responseToken,
+  abortController,
+  responseId
+) {
   if (state.isMuted || !speechText) return false;
   const response = await fetch("/api/tts", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: speechText })
+    body: JSON.stringify({ text: speechText, responseId }),
+    signal: abortController?.signal
   });
   if (!response.ok) return false;
   const audioBlob = await response.blob();
-  if (!audioBlob.size || speechRequestId !== state.lianSpeechRequestId) return false;
+  if (!audioBlob.size || speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) return false;
 
   const audioUrl = URL.createObjectURL(audioBlob);
   const audio = getLianAudioElement();
@@ -5574,7 +5655,7 @@ async function playCloudLianSpeech(speechText, speechRequestId, publishText) {
       resolve(Boolean(played));
     };
     audio.onplaying = () => {
-      if (speechRequestId !== state.lianSpeechRequestId) {
+      if (speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) {
         audio.pause();
         cleanup(false);
         return;
@@ -5585,7 +5666,7 @@ async function playCloudLianSpeech(speechText, speechRequestId, publishText) {
     audio.onerror = () => cleanup(false);
     audio.onabort = () => cleanup(false);
     audio.onpause = () => {
-      if (speechRequestId !== state.lianSpeechRequestId) cleanup(false);
+      if (speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) cleanup(false);
     };
     audio.play().catch((error) => {
       console.warn("[tts] cloud audio playback failed:", error?.name || error);
@@ -5596,6 +5677,8 @@ async function playCloudLianSpeech(speechText, speechRequestId, publishText) {
 
 function lianSpeak(text, options = {}) {
   if (state.teachSessionPaused && options.allowWhilePaused !== true) return Promise.resolve(false);
+  const responseToken = options.responseToken || getInteractionToken();
+  if (!isCurrentInteraction(responseToken)) return Promise.resolve(false);
   const now = Date.now();
   const dedupeKey = getGuidanceDedupeKey(text, options);
   const cooldownMs = Number.isFinite(options.cooldownMs) ? options.cooldownMs : REPEATED_GUIDANCE_COOLDOWN_MS;
@@ -5612,14 +5695,18 @@ function lianSpeak(text, options = {}) {
   dom.lianAvatar.classList.add("speaking");
   let textPublished = false;
   const publishText = () => {
-    if (textPublished) return;
+    if (textPublished || !isCurrentInteraction(responseToken)) return false;
     textPublished = true;
     dom.lianBubble.textContent = text;
     if (options.log !== false) addLog("恋恋", text, { key: options.logKey || (dedupeKey ? `lian:${dedupeKey}` : "") });
     if (options.trackQuestion !== false) rememberLianQuestion(text);
+    return true;
   };
   const speechRequestId = ++state.lianSpeechRequestId;
+  const responseId = options.responseId || `lian:${responseToken.sessionId}:${responseToken.sequenceId}:${speechRequestId}`;
   stopLianSpeechOutput();
+  const abortController = new AbortController();
+  state.lianTtsAbortController = abortController;
   const pausedRecognition = pauseRecognitionForLianSpeech();
 
   return new Promise((resolve) => {
@@ -5628,18 +5715,20 @@ function lianSpeak(text, options = {}) {
     const finishSpeaking = () => {
       if (finished) return;
       finished = true;
-      publishText();
       if (fallbackTimer) clearTimeout(fallbackTimer);
+      const isCurrent = speechRequestId === state.lianSpeechRequestId && isCurrentInteraction(responseToken);
+      if (isCurrent) publishText();
       if (speechRequestId === state.lianSpeechRequestId) {
         clearInterval(state.lianSpeechKeepAliveTimer);
         state.lianSpeechKeepAliveTimer = null;
         state.currentLianUtterance = null;
+        if (state.lianTtsAbortController === abortController) state.lianTtsAbortController = null;
         if (pausedRecognition) resumeRecognitionAfterLianSpeech();
         dom.lianAvatar.classList.remove("speaking");
         dom.lianAvatar.classList.add("listening");
         dom.lianState.textContent = guideIdleText();
       }
-      resolve();
+      resolve(isCurrent);
     };
 
     const playBrowserSpeech = () => {
@@ -5658,7 +5747,7 @@ function lianSpeak(text, options = {}) {
           return true;
         }
         const startSpeech = (voice, chunkIndex = 0, retried = false) => {
-          if (finished || speechRequestId !== state.lianSpeechRequestId) {
+          if (finished || speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) {
             finishSpeaking();
             return;
           }
@@ -5718,7 +5807,14 @@ function lianSpeak(text, options = {}) {
         try {
           if (state.lianAudioUnlockPromise) await state.lianAudioUnlockPromise;
           const speechText = prepareLianSpeechText(text);
-          const playedCloud = await playCloudLianSpeech(speechText, speechRequestId, publishText);
+          const playedCloud = await playCloudLianSpeech(
+            speechText,
+            speechRequestId,
+            publishText,
+            responseToken,
+            abortController,
+            responseId
+          );
           if (playedCloud) {
             finishSpeaking();
             return;
@@ -5727,7 +5823,10 @@ function lianSpeak(text, options = {}) {
           console.warn("Cloud Lian speech fallback:", error);
         }
       }
-      if (finished) return;
+      if (finished || !isCurrentInteraction(responseToken)) {
+        finishSpeaking();
+        return;
+      }
       if (playBrowserSpeech()) return;
       publishText();
       fallbackTimer = setTimeout(finishSpeaking, 260);
