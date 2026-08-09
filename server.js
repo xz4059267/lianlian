@@ -380,6 +380,7 @@ const HANDWRITING_PROMPT = [
   "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
   "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；只要一个可见关键关系或计算步骤与 Question Memory 一致，就可以作为可核验步骤。",
   "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
+  "如果板书已经出现最终结果或带有‘答案/所以/因此/解得’的结论，必须把该结果原样写入 detectedWriting 或 mathExpression，并把对应的最后一步保留在 completedSteps；不要只在 calculationCheck 里提到它。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");

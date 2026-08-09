@@ -3217,6 +3217,31 @@ async function runHandwritingRecognition(reason) {
     state.handwritingResults[question.id] = result;
     state.boardCompletionVerified = isBoardCompletionVerified(result);
 
+    const finalAnswerCandidate = extractHandwritingFinalAnswerCandidate(result);
+    console.log("[handwriting] decision", {
+      questionId: question.id,
+      requestId,
+      boardVersion,
+      writingState: result?.writingState || "",
+      calculationStatus: result?.calculationStatus || "",
+      isRelevant: result?.isRelevant ?? null,
+      boardComplete: result?.boardComplete ?? null,
+      completedSteps: result?.completedSteps || [],
+      finalAnswerCandidate
+    });
+
+    // A final answer must enter the answer-check path before the generic
+    // "board recorded" state. Otherwise a valid last step is treated as
+    // ordinary progress and the student never gets an immediate check.
+    if (
+      finalAnswerCandidate &&
+      !isHandwritingCalculationWrong(result) &&
+      await maybeVerifyFinalAnswerFromHandwriting(result)
+    ) {
+      dom.recognitionPill.textContent = "正在核对答案";
+      return;
+    }
+
     if (isHandwritingCalculationWrong(result)) {
       dom.recognitionPill.textContent = "发现需要检查";
       maybeSpeakHandwritingGuidance(result);
@@ -3667,20 +3692,43 @@ function isBoardCompletionVerified(result) {
 }
 
 function extractAnswerTextFromHandwriting(result) {
-  return String(result?.mathExpression || result?.detectedWriting || result?.calculationCheck || "").trim();
+  const visibleEvidence = getHandwritingAnswerEvidence(result);
+  return String(
+    result?.mathExpression ||
+    result?.detectedWriting ||
+    result?.finalAnswer ||
+    result?.answer ||
+    result?.studentAnswer ||
+    result?.recognizedText ||
+    result?.boardText ||
+    result?.completedSteps?.at?.(-1) ||
+    visibleEvidence ||
+    ""
+  ).trim();
+}
+
+function getHandwritingAnswerEvidence(result) {
+  const completedSteps = Array.isArray(result?.completedSteps)
+    ? result.completedSteps.join("\n")
+    : "";
+  return [
+    result?.mathExpression,
+    result?.detectedWriting,
+    result?.finalAnswer,
+    result?.answer,
+    result?.studentAnswer,
+    result?.recognizedText,
+    result?.boardText,
+    completedSteps
+  ]
+    .filter((value) => value != null && String(value).trim())
+    .map((value) => String(value).trim())
+    .join("\n")
+    .normalize("NFKC");
 }
 
 function extractHandwritingFinalAnswerCandidate(result) {
-  const combined = [
-    result?.mathExpression,
-    result?.detectedWriting,
-    result?.calculationCheck,
-    result?.positiveFeedback,
-    result?.issueSummary
-  ]
-    .filter(Boolean)
-    .join("\n")
-    .normalize("NFKC");
+  const combined = getHandwritingAnswerEvidence(result);
   if (!combined.trim()) return "";
 
   const assignmentMatches = [
@@ -3705,9 +3753,23 @@ function extractHandwritingFinalAnswerCandidate(result) {
 }
 
 function shouldVerifyHandwritingFinalAnswer(result) {
-  if (!result?.isRelevant) return false;
-  if (isIncompleteHandwritingIssue(result) && !isHandwritingCalculationCorrect(result)) return false;
-  return Boolean(extractHandwritingFinalAnswerCandidate(result));
+  const candidate = extractHandwritingFinalAnswerCandidate(result);
+  if (!candidate) return false;
+  if (isHandwritingCalculationWrong(result)) return false;
+
+  const evidence = getHandwritingAnswerEvidence(result);
+  const hasFinalitySignal = Boolean(
+    result?.boardComplete === true ||
+    result?.writingState === "complete" ||
+    /(?:最终答案|最后答案|答案|结果|所以|因此|解得|得到|得出|答[:：])/.test(evidence) ||
+    hasReviewableBoardStep(result)
+  );
+
+  // The model may omit isRelevant when it returns a valid structured answer
+  // candidate. Keep the safety gate, but do not discard usable board evidence.
+  if (result?.isRelevant === false && !hasFinalitySignal) return false;
+  if (isIncompleteHandwritingIssue(result) && !hasFinalitySignal) return false;
+  return hasFinalitySignal;
 }
 
 async function maybeVerifyFinalAnswerFromHandwriting(result) {
@@ -3745,7 +3807,7 @@ function normalizeBoardMathText(value) {
 
 function hasReviewableBoardStep(result) {
   if (result?.boardComplete === true && !isIncompleteHandwritingIssue(result)) return true;
-  const boardText = normalizeBoardMathText([result?.detectedWriting, result?.mathExpression].filter(Boolean).join(" "));
+  const boardText = normalizeBoardMathText(getHandwritingAnswerEvidence(result));
   if (!boardText) return false;
 
   const withoutAnswerLead = boardText.replace(/^(?:最后|最终)?(?:答案|结果)(?:是|为|等于|=|＝)?/g, "");

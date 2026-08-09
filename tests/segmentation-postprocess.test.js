@@ -155,7 +155,9 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
   assert.doesNotMatch(appSource, /fetch\("\/api\/answer-key"/);
   assert.match(appSource, /questionMemory,/);
   assert.doesNotMatch(appHandwritingRequest, /questionImage:|problemText:|knowledgePoints:|boardImage:|createCurrentBoardSnapshot/);
-  assert.doesNotMatch(appHandwritingRun, /maybeSpeakHandwritingSuccess|maybeSpeakHandwritingUnclear|maybeVerifyFinalAnswerFromHandwriting|maybePromptSaveFromHandwriting/);
+  assert.match(appHandwritingRun, /maybeVerifyFinalAnswerFromHandwriting\(result\)/);
+  assert.match(appHandwritingRun, /finalAnswerCandidate/);
+  assert.doesNotMatch(appHandwritingRun, /getVerifiedAnswerKey\(|fetch\("\/api\/answer-key"/);
 });
 
 test("keeps correct board progress silent and grounds feedback in visible work", () => {
