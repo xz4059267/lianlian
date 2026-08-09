@@ -5112,7 +5112,7 @@ function handleSilenceTimeout() {
       stage: nextStage,
       silenceSeconds: Math.round((now - getLastUserInputAt()) / 1000),
       allowConcreteStep: nextStage >= 1,
-      allowFormula: nextStage >= 3,
+      allowFormula: nextStage >= 1,
       allowFinalAnswer: nextStage >= MAX_SILENCE_GUIDE_STAGE
     });
     setGuideState(guideState);
@@ -5120,9 +5120,10 @@ function handleSilenceTimeout() {
       force: true,
       guideState,
       silenceStage: nextStage,
-      allowConcreteStep: nextStage >= 2,
-      allowFormula: nextStage >= 3,
+      allowConcreteStep: nextStage >= 1,
+      allowFormula: nextStage >= 1,
       allowFinalAnswer: nextStage >= MAX_SILENCE_GUIDE_STAGE,
+      allowUnverifiedFinalAnswer: nextStage >= MAX_SILENCE_GUIDE_STAGE,
       silenceSeconds: Math.round((now - getLastUserInputAt()) / 1000),
       fallbackText: buildSilenceEscalationFallback(nextStage)
     });
@@ -5144,7 +5145,7 @@ function handleSilenceTimeout() {
     stage: 1,
     silenceSeconds: Math.round(idleMs / 1000),
     allowConcreteStep: true,
-    allowFormula: false,
+    allowFormula: true,
     allowFinalAnswer: false
   });
   requestSmartGuide("silence", "", {
@@ -5152,8 +5153,9 @@ function handleSilenceTimeout() {
     guideState: GUIDE_STATES.MICRO_HINT,
     silenceStage: 1,
     allowConcreteStep: true,
-    allowFormula: false,
+    allowFormula: true,
     allowFinalAnswer: false,
+    allowUnverifiedFinalAnswer: false,
     silenceSeconds: Math.round(idleMs / 1000),
     fallbackText: buildSilenceEscalationFallback(1) /* pickPrompt("silence-care", [
       "你停了一会儿。我们先接着刚才那一步想：题目里哪个条件还没有用上？",
@@ -5163,7 +5165,47 @@ function handleSilenceTimeout() {
   });
 }
 
+function getSilenceContextStep() {
+  const result = state.latestHandwritingResult || {};
+  const question = currentPageQuestion();
+  const memory = getQuestionMemory(question);
+  const completedSteps = Array.isArray(result.completedSteps)
+    ? result.completedSteps.map((step) => String(step || "").trim()).filter(Boolean)
+    : [];
+  const outline = Array.isArray(memory?.solutionOutline)
+    ? memory.solutionOutline.map((step) => String(step || "").trim()).filter(Boolean)
+    : [];
+  const candidates = [
+    result.expectedNextStep,
+    result.missingBoardContent,
+    outline[Math.min(completedSteps.length, Math.max(0, outline.length - 1))],
+    outline[0]
+  ]
+    .map((step) => String(step || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  return candidates.find((step) => {
+    if (/question memory|继续|下一步|关系式|列出|找出|想一想|再算|补写/i.test(step) && !/[=:+\-*/]/.test(step)) {
+      return false;
+    }
+    return /[=:+\-*/]|\d|x|y|m|n|比例|面积|周长|体积|角度|方程|函数/i.test(step);
+  }) || "";
+}
+
 function buildSilenceEscalationFallback(stage) {
+  const contextualStep = getSilenceContextStep();
+  if (contextualStep) {
+    const normalizedStage = Math.max(1, Math.min(MAX_SILENCE_GUIDE_STAGE, Number(stage) || 1));
+    if (normalizedStage === 1) {
+      return `先把这一步写出来：${contextualStep}。写好后再继续。`;
+    }
+    if (normalizedStage === 2) {
+      return `我们直接做这一小步：${contextualStep}。完成后再往下算。`;
+    }
+    if (normalizedStage === 3) {
+      return `把关键式写在黑板上：${contextualStep}。写好后再讲这一小步。`;
+    }
+  }
   const fallbackByStage = {
     1: "60秒了，我们直接做下一步：先从题目给出的条件列出对应关系式。",
     2: "我们先把下一步关系写出来，再继续往下算。",
@@ -5648,6 +5690,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       boardImage: getBoardImageForGuide(),
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
       latestHandwritingResult: state.latestHandwritingResult || null,
+      silenceContextStep: /silence/.test(eventType) ? getSilenceContextStep() : "",
       boardPendingRecognition: Boolean(
         state.lastBoardWriteAt &&
         state.lastBoardWriteAt > (state.lastHandwritingRecognizedAt || 0)
@@ -5658,6 +5701,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       allowConcreteStep: options.allowConcreteStep === true,
       allowFormula: options.allowFormula === true,
       allowFinalAnswer: options.allowFinalAnswer === true,
+      allowUnverifiedFinalAnswer: options.allowUnverifiedFinalAnswer === true,
       silenceSeconds: options.silenceSeconds || Math.round((Date.now() - getLastUserInputAt()) / 1000),
       boardIdleSeconds: Math.round((Date.now() - (state.lastBoardWriteAt || getLastUserInputAt())) / 1000),
       stuckCount: state.stuckCount,
@@ -5717,10 +5761,16 @@ function trimGuideSpeech(text, eventType) {
   let value = String(text || "").replace(/\s+/g, " ").trim();
   if (!value) return "";
 
-  const maxLength = /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
+  const silenceStage = Number(state.silenceGuideStage || 0);
+  const isDetailedSilence = /silence/.test(eventType) && silenceStage >= MAX_SILENCE_GUIDE_STAGE;
+  const maxLength = isDetailedSilence
+    ? 240
+    : /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
     ? 120
     : 46;
-  const maxSentences = /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
+  const maxSentences = isDetailedSilence
+    ? 4
+    : /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
     ? 2
     : 1;
 
@@ -5741,11 +5791,18 @@ function trimGuideSpeech(text, eventType) {
 function formatGuideSpeech(eventType, result, fallbackText) {
   let speech = String(result?.speech || "").trim() || fallbackText;
   const formulaOrStep = String(result?.formulaOrStep || "").trim();
-  const lectureUnlocked = state.guideState === GUIDE_STATES.INTERACTIVE;
+  const silenceStage = Number(state.silenceGuideStage || 0);
+  const silenceAllowsConcrete = /silence/.test(eventType) && silenceStage >= 1;
+  const lectureUnlocked = state.guideState === GUIDE_STATES.INTERACTIVE || silenceAllowsConcrete;
   const tooExplicit = !lectureUnlocked && ["formula", "worked_step", "summary"].includes(result?.hintLevel);
   const needsConcreteStep = lectureUnlocked && /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType);
+  const contextualStep = silenceAllowsConcrete ? getSilenceContextStep() : "";
 
   if (tooExplicit) speech = fallbackText;
+
+  if (needsConcreteStep && contextualStep && !formulaOrStep && !speech.includes(contextualStep.slice(0, 8))) {
+    speech += ` 先把这一步写出来：${contextualStep}。写好后再继续。`;
+  }
 
   if (needsConcreteStep && formulaOrStep && !speech.includes(formulaOrStep.slice(0, 8))) {
     speech += pickPrompt("formula-step", [

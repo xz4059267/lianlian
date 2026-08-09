@@ -195,7 +195,7 @@ const LIAN_GUIDE_PROMPT = [
   "普通沉默达到 1 分钟时，第一次应结合学生最后讲到的内容给一个很小的切入提示；不要直接完整讲题。只有提示后继续沉默或学生确认不会，才分步讲解。",
   "学生讲得顺时，优先不说；需要回应时必须贴着学生内容做理解确认，不使用固定鼓励词。",
   "如果前端传入 lectureUnlocked=false，你只能输出 encourage 或 light 级别内容，不能输出 formula/worked_step/summary。",
-  "如果前端传入 lectureUnlocked=true，你仍然不能一次性倒完整答案；只给一小步，并把话交还给学生。",
+  "如果前端传入 lectureUnlocked=true，默认只给一小步并把话交还给学生；但 silenceStage>=4 且学生持续沉默时，必须直接完成当前题的详细讲解，给出关键式和最终答案，并先自行检查计算。",
   "不要直接说“你错了”，要转成检查提醒或启发式问题。",
   "必须以当前传入的题目图片和当前黑板截图为准；不要沿用上一道题的变量、答案、比例式或知识点。",
   "如果当前题目图片和黑板里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
@@ -7569,7 +7569,10 @@ function makeAnswerLockedGuideSafe(result, answerKey, body, reason = "answer con
 }
 
 async function auditGuideMath(result, answerKey, body) {
-  if (!answerKey?.trusted) return makeUnverifiedGuideSafe(result);
+  if (!answerKey?.trusted) {
+    if (body?.allowUnverifiedFinalAnswer === true && Number(body?.silenceStage) >= 4) return result;
+    return makeUnverifiedGuideSafe(result);
+  }
   if (!guideHasCheckableMathClaim(result)) return result;
   const wrongClaims = guideContradictsVerifiedAnswer(result, answerKey);
   if (wrongClaims) {
@@ -7962,8 +7965,9 @@ function getSilenceGuidePolicy(stage) {
     stage: level,
     guideState: level >= 2 ? "interactive_teaching" : "micro_hint",
     allowConcreteStep: level >= 1,
-    allowFormula: level >= 3,
-    allowFinalAnswer: level >= 4
+    allowFormula: level >= 1,
+    allowFinalAnswer: level >= 4,
+    allowUnverifiedFinalAnswer: level >= 4
   };
 }
 
@@ -7996,6 +8000,7 @@ async function handleGuide(req, res) {
   const silencePolicy = getSilenceGuidePolicy(silenceStage);
   const guideState = body.guideState || silencePolicy.guideState || "heuristic_guidance";
   const lectureUnlocked = Boolean(body.lectureUnlocked || silencePolicy.guideState === "interactive_teaching");
+  const allowUnverifiedFinalAnswer = body.allowUnverifiedFinalAnswer === true || silencePolicy.allowUnverifiedFinalAnswer;
   let answerKey;
   try {
     answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
@@ -8003,6 +8008,13 @@ async function handleGuide(req, res) {
     console.warn(`[guide] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
     answerKey = makeUnavailableAnswerKey(error);
   }
+
+  const answerReference = !answerKey?.trusted && allowUnverifiedFinalAnswer
+    ? {
+        trusted: false,
+        instruction: "No verified answer key is available. At silence stage 4, solve the problem directly from the question image, derive the key equations, check the arithmetic, and state the final answer. Do not withhold the solution merely because the reference key is unavailable."
+      }
+    : privateAnswerReference(answerKey);
 
   let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
@@ -8014,7 +8026,7 @@ async function handleGuide(req, res) {
       STATEMENT_EVALUATION_RULES,
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
-      `SILENCE POLICY OVERRIDE: stage ${silenceStage}. After 60 seconds, give a concrete next operation tied to this problem, not a generic question. Stage 2 gives a concrete relation; stage 3 gives the key equation and asks the student to write or repeat it; stage 4 may state the verified equation and final answer only when allowFinalAnswer is true and verifiedAnswerReference.trusted is true. Never invent an answer and never repeat an earlier weaker hint.`,
+      `SILENCE POLICY OVERRIDE: stage ${silenceStage}. After 60 seconds, give a concrete next operation tied to this problem, not a generic question. Stage 1 may give one problem-specific relation; stage 2 gives the next concrete operation; stage 3 gives the key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
     ].join("\n\n"),
     content: [
       {
@@ -8031,6 +8043,7 @@ async function handleGuide(req, res) {
           allowConcreteStep: body.allowConcreteStep === true || silencePolicy.allowConcreteStep,
           allowFormula: body.allowFormula === true || silencePolicy.allowFormula,
           allowFinalAnswer: body.allowFinalAnswer === true || silencePolicy.allowFinalAnswer,
+          allowUnverifiedFinalAnswer,
           silenceSeconds: body.silenceSeconds || 0,
           boardIdleSeconds: body.boardIdleSeconds || 0,
           stuckCount: body.stuckCount || 0,
@@ -8051,24 +8064,28 @@ async function handleGuide(req, res) {
           knownKnowledgePoints: body.knowledgePoints || [],
           hasBoardInk: body.hasBoardInk === true,
           latestHandwritingResult: body.latestHandwritingResult || null,
+          silenceContextStep: body.silenceContextStep || "",
           boardPendingRecognition: Boolean(body.boardPendingRecognition),
-          verifiedAnswerReference: privateAnswerReference(answerKey),
+          verifiedAnswerReference: answerReference,
           boundaryRules: [
+            "When silenceStage is at least 1 and silenceContextStep is present, use that exact problem-specific relation as formulaOrStep and explain only that one next step; do not replace it with generic wording.",
+            "At silenceStage 1, one concrete relation or formula is allowed, but the final answer is still forbidden until the verified-answer stage.",
+            "At silenceStage 4, give the complete problem-specific explanation, key equations, and final answer even when the standard answer reference is unavailable; derive and check it from the question image instead of returning a generic retry message.",
             "如果 eventType=answer_to_lian_question，必须优先回应 lianQuestion 和 latestStudentSpeech 的对应关系，shouldSpeak=true，通常一句话确认后再给一个很小的下一步。",
             "如果学生回答的是要讲哪一道题、哪一步或哪种方式，先接受这个选择，不要根据黑板截图另行改成别的题号。",
             "lectureUnlocked=false 时只能启发引导或微提示，hintLevel 只能为 encourage/light。",
             "lectureUnlocked=false 时 speech 不得包含最终答案、中间完整算式或完整解题步骤。",
-            "lectureUnlocked=true 时只讲一个小步骤，不得一次性讲完整题。",
-            `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2可以给出下一步具体运算关系；阶段3可以给出关键式子并要求学生写下或复述；阶段4且 allowFinalAnswer=true 时，才可以根据 trusted verifiedAnswerReference 说出核验过的关键式子和最终答案。`,
+            "lectureUnlocked=true 时默认只讲一个小步骤；但 silenceStage>=4 且学生持续沉默时，必须一次性完成当前题的详细讲解，给出关键式和最终答案。",
+            `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2可以给出下一步具体运算关系；阶段3可以给出关键式子并要求学生写下或复述；阶段4如果学生持续沉默，直接根据题图完成详细讲解，给出关键式子和最终答案，不需要等待标准答案核验，但必须先自行检查计算。`,
             "沉默时间越长，引导必须越具体：不能在后续阶段重复阶段1的泛泛提问，也不能把已经给过的提示原样重复。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
             "如果 eventType=active_help，学生已经明确提问或表示不会，必须 shouldSpeak=true，并直接回应这个问题；只给当前最需要的一个小步骤，不要先泛泛鼓励。",
-            "如果只是普通 1 分钟沉默且 awaitingSilenceFollowup=false，必须 shouldSpeak=true，并贴着学生最后讲到的内容给一个小切入点；不直接给完整公式或完整答案。只有 silenceStage>=3 才能逐步给出关键式，只有 silenceStage>=4 且答案已核验时才能说出最终答案。",
+            "如果只是普通 1 分钟沉默且 awaitingSilenceFollowup=false，必须 shouldSpeak=true，并贴着学生最后讲到的内容给一个小切入点；不直接给完整公式或完整答案。只有 silenceStage>=3 才能逐步给出关键式；silenceStage>=4 且学生持续沉默时，允许直接完成题目讲解并给出最终答案，即使标准答案参考暂不可用，也必须从题图推导并检查。",
             "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
             "如果 eventType=thought_complete 且确实需要回应，speech 只能是一句短回应；不要展开完整讲解、不要连续解释多个概念。",
             "lectureComplete 默认必须为 false；只有 answerVerified=true、boardCompletionVerified=true，且学生已经讲完关键思路时才设为 true。点击‘我讲完了’本身不是完成证据。",
             "lectureComplete=true 后 speech 只做一次收束，不得继续追问、要求复述或重复已经说过的选项。",
-            "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致。trusted=false 时禁止判断对错或输出确定数学结论。",
+            "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致；但 silenceStage>=4 且 allowUnverifiedFinalAnswer=true 时，允许直接从题目图片推导并检查后给出关键式和最终答案，不要因为 trusted=false 而退回泛泛提示。",
             "verifiedAnswerReference.trusted=true 时，禁止给出与 canonicalAnswer 不一致的候选最终答案；指出错误时只说具体错在常数项、符号、对应关系或公式，不要说“或者另一个答案”。",
             "如果 verifiedAnswerReference.choiceAnalysis 存在，选项字母只能和其中同标签的 selectedOptionText 一起使用；不要重新猜测 C、D 或其他字母的含义。涉及结论 I/II 时，必须依据 statementVerdicts 的 correct 判断说明。",
             "不要把题目图片里被划掉、红叉或旁边批改的原错答案当作可能正确答案。",
@@ -8755,6 +8772,7 @@ module.exports = {
   buildLayoutContentBlocks,
   assessLocalSegmentationConfidence,
   enforceOrderedProportionConvention,
+  auditGuideMath,
   guideContradictsVerifiedAnswer,
   makeAnswerLockedGuideSafe,
   answerValuesEquivalent,

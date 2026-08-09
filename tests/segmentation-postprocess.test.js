@@ -22,6 +22,7 @@ const {
   buildLayoutContentBlocks,
   assessLocalSegmentationConfidence,
   enforceOrderedProportionConvention,
+  auditGuideMath,
   guideContradictsVerifiedAnswer,
   answerValuesEquivalent,
   choiceAnalysesAgree,
@@ -41,7 +42,7 @@ const {
   getSilenceGuidePolicy
 } = require("../server.js");
 
-test("escalates silence guidance from a concrete entry point to a verified answer", () => {
+test("escalates silence guidance from a concrete entry point to a complete answer", () => {
   const stage0 = getSilenceGuidePolicy(0);
   const stage1 = getSilenceGuidePolicy(1);
   const stage2 = getSilenceGuidePolicy(2);
@@ -50,12 +51,37 @@ test("escalates silence guidance from a concrete entry point to a verified answe
 
   assert.equal(stage0.allowConcreteStep, false);
   assert.equal(stage1.allowConcreteStep, true);
-  assert.equal(stage1.allowFormula, false);
+  assert.equal(stage1.allowFormula, true);
   assert.equal(stage2.guideState, "interactive_teaching");
   assert.equal(stage3.allowFormula, true);
   assert.equal(stage3.allowFinalAnswer, false);
   assert.equal(stage4.allowFinalAnswer, true);
+  assert.equal(stage4.allowUnverifiedFinalAnswer, true);
   assert.equal(getSilenceGuidePolicy(99).stage, 4);
+});
+
+test("allows stage-4 silence to explain without a standard-answer key", async () => {
+  const detailed = await auditGuideMath(
+    {
+      shouldSpeak: true,
+      speech: "先由题目条件列出关系式，再整理并计算，最后得到答案。",
+      formulaOrStep: "2:3=x:6",
+      hintLevel: "summary",
+      lectureComplete: false
+    },
+    { trusted: false },
+    { allowUnverifiedFinalAnswer: true, silenceStage: 4 }
+  );
+
+  assert.equal(detailed.speech, "先由题目条件列出关系式，再整理并计算，最后得到答案。");
+  assert.equal(detailed.formulaOrStep, "2:3=x:6");
+
+  const guarded = await auditGuideMath(
+    detailed,
+    { trusted: false },
+    { allowUnverifiedFinalAnswer: false, silenceStage: 3 }
+  );
+  assert.notEqual(guarded.speech, detailed.speech);
 });
 
 test("captures one standard-answer result as a reusable Question Memory snapshot", () => {
