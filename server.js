@@ -7941,7 +7941,7 @@ function applyLatestHandwritingConsistency(result, body = {}) {
   if (status === "unclear" || status === "incomplete") {
     const definitive = /正确|错误|不对|答案是|结果是|wrong|incorrect/i.test(speech);
     if (definitive) {
-      const canPrompt = ["active_help", "stuck", "silence", "silence_followup", "error_silence"].includes(eventType);
+      const canPrompt = ["active_help", "stuck", "silence", "silence_followup", "silence_escalation", "error_silence"].includes(eventType);
       return {
         ...output,
         shouldSpeak: canPrompt,
@@ -7954,6 +7954,17 @@ function applyLatestHandwritingConsistency(result, body = {}) {
   }
 
   return output;
+}
+
+function getSilenceGuidePolicy(stage) {
+  const level = Math.max(0, Math.min(4, Number(stage) || 0));
+  return {
+    stage: level,
+    guideState: level >= 2 ? "interactive_teaching" : "micro_hint",
+    allowConcreteStep: level >= 1,
+    allowFormula: level >= 3,
+    allowFinalAnswer: level >= 4
+  };
 }
 
 async function handleGuide(req, res) {
@@ -7978,8 +7989,13 @@ async function handleGuide(req, res) {
     normal: "学生正在正常讲解。"
   }[body.eventType || "normal"] || "学生正在讲题。";
 
-  const guideState = body.guideState || "heuristic_guidance";
-  const lectureUnlocked = Boolean(body.lectureUnlocked);
+  if (body.eventType === "silence_escalation") {
+    eventText.silence_escalation = "The student has remained silent through another escalation interval. Give a more concrete next step than the previous hint; later stages may include the equation and verified answer.";
+  }
+  const silenceStage = Math.max(0, Math.min(4, Number(body.silenceStage) || 0));
+  const silencePolicy = getSilenceGuidePolicy(silenceStage);
+  const guideState = body.guideState || silencePolicy.guideState || "heuristic_guidance";
+  const lectureUnlocked = Boolean(body.lectureUnlocked || silencePolicy.guideState === "interactive_teaching");
   let answerKey;
   try {
     answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
@@ -7991,7 +8007,15 @@ async function handleGuide(req, res) {
   let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
-    instructions: [LIAN_GUIDE_PROMPT, HANDWRITING_CONSISTENCY_RULES, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES, COMPANION_DIALOGUE_POLICY, LECTURE_COMPLETION_RULES].join("\n\n"),
+    instructions: [
+      LIAN_GUIDE_PROMPT,
+      HANDWRITING_CONSISTENCY_RULES,
+      ORDERED_PROPORTION_RULES,
+      STATEMENT_EVALUATION_RULES,
+      COMPANION_DIALOGUE_POLICY,
+      LECTURE_COMPLETION_RULES,
+      `SILENCE POLICY OVERRIDE: stage ${silenceStage}. After 60 seconds, give a concrete next operation tied to this problem, not a generic question. Stage 2 gives a concrete relation; stage 3 gives the key equation and asks the student to write or repeat it; stage 4 may state the verified equation and final answer only when allowFinalAnswer is true and verifiedAnswerReference.trusted is true. Never invent an answer and never repeat an earlier weaker hint.`,
+    ].join("\n\n"),
     content: [
       {
         type: "input_text",
@@ -8003,6 +8027,10 @@ async function handleGuide(req, res) {
           lianQuestion: body.lianQuestion || "",
           currentGuideState: guideState,
           lectureUnlocked,
+          silenceStage,
+          allowConcreteStep: body.allowConcreteStep === true || silencePolicy.allowConcreteStep,
+          allowFormula: body.allowFormula === true || silencePolicy.allowFormula,
+          allowFinalAnswer: body.allowFinalAnswer === true || silencePolicy.allowFinalAnswer,
           silenceSeconds: body.silenceSeconds || 0,
           boardIdleSeconds: body.boardIdleSeconds || 0,
           stuckCount: body.stuckCount || 0,
@@ -8031,9 +8059,11 @@ async function handleGuide(req, res) {
             "lectureUnlocked=false 时只能启发引导或微提示，hintLevel 只能为 encourage/light。",
             "lectureUnlocked=false 时 speech 不得包含最终答案、中间完整算式或完整解题步骤。",
             "lectureUnlocked=true 时只讲一个小步骤，不得一次性讲完整题。",
+            `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2可以给出下一步具体运算关系；阶段3可以给出关键式子并要求学生写下或复述；阶段4且 allowFinalAnswer=true 时，才可以根据 trusted verifiedAnswerReference 说出核验过的关键式子和最终答案。`,
+            "沉默时间越长，引导必须越具体：不能在后续阶段重复阶段1的泛泛提问，也不能把已经给过的提示原样重复。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
             "如果 eventType=active_help，学生已经明确提问或表示不会，必须 shouldSpeak=true，并直接回应这个问题；只给当前最需要的一个小步骤，不要先泛泛鼓励。",
-            "如果只是普通 1 分钟沉默且 awaitingSilenceFollowup=false，必须 shouldSpeak=true，并贴着学生最后讲到的内容给一个小切入点；不直接给完整公式或完整答案。",
+            "如果只是普通 1 分钟沉默且 awaitingSilenceFollowup=false，必须 shouldSpeak=true，并贴着学生最后讲到的内容给一个小切入点；不直接给完整公式或完整答案。只有 silenceStage>=3 才能逐步给出关键式，只有 silenceStage>=4 且答案已核验时才能说出最终答案。",
             "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
             "如果 eventType=thought_complete 且确实需要回应，speech 只能是一句短回应；不要展开完整讲解、不要连续解释多个概念。",
             "lectureComplete 默认必须为 false；只有 answerVerified=true、boardCompletionVerified=true，且学生已经讲完关键思路时才设为 true。点击‘我讲完了’本身不是完成证据。",
@@ -8742,5 +8772,6 @@ module.exports = {
   buildHandwritingProcessFeedback,
   registerQuestionMemoryIdentity,
   registerHandwritingRequest,
-  isLatestHandwritingRequest
+  isLatestHandwritingRequest,
+  getSilenceGuidePolicy
 };

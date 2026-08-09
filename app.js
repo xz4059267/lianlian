@@ -138,6 +138,9 @@ const GUIDE_STATE_LABELS = {
 
 const SILENCE_CARE_MS = 60000;
 const SILENCE_AFTER_CARE_MS = 60000;
+// Each additional full idle interval moves the guide closer to a concrete
+// equation and the verified answer. Student input resets the level.
+const MAX_SILENCE_GUIDE_STAGE = 4;
 const ERROR_SILENCE_MS = 60000;
 const BOARD_RECOGNITION_DELAY_MS = 6500;
 const THOUGHT_PAUSE_MS = 8000;
@@ -312,6 +315,8 @@ const state = {
   lastIssueAt: 0,
   silenceCareAskedAt: 0,
   awaitingSilenceFollowup: false,
+  silenceGuideStage: 0,
+  silenceGuidanceExhausted: false,
   interactiveStepCount: 0,
   activeGuideRequestId: 0,
   silenceGuidePending: false,
@@ -697,6 +702,8 @@ function skipStaleHandwritingFeedback(stage, snapshot) {
 function clearSilenceFollowup() {
   state.awaitingSilenceFollowup = false;
   state.silenceCareAskedAt = 0;
+  state.silenceGuideStage = 0;
+  state.silenceGuidanceExhausted = false;
 }
 
 function markUserInput(type) {
@@ -731,7 +738,7 @@ function markUserInput(type) {
   }
   state.lastUserInputAt = now;
 
-  if (state.awaitingSilenceFollowup) {
+  if (state.awaitingSilenceFollowup || state.silenceGuideStage > 0 || state.silenceGuidanceExhausted) {
     clearSilenceFollowup();
     if (state.guideState === GUIDE_STATES.MICRO_HINT) setGuideState(GUIDE_STATES.HEURISTIC);
   }
@@ -2362,7 +2369,7 @@ function initCurrentQuestion() {
       "来，先把题目里的条件说一遍，我跟着你一起理顺。"
     ]);
     state.pendingLianOpeningText = "";
-    void lianSpeak(openingText).finally(() => {
+    void lianSpeak(openingText, { isOpeningSpeech: true }).finally(() => {
       if (
         currentPageQuestion()?.id === openingQuestionId &&
         !state.currentQuestionCompleted &&
@@ -5069,7 +5076,7 @@ function stopSpeechNoResultTimer() {
 function resetSilenceTimer(updateSpeechAt = true) {
   clearTimeout(state.silenceTimer);
   state.silenceTimer = null;
-  if (state.teachSessionPaused) return;
+  if (state.teachSessionPaused || state.silenceGuidanceExhausted) return;
   const now = Date.now();
   if (updateSpeechAt || !state.lastSpeechAt) state.lastSpeechAt = now;
   if (!state.lastUserInputAt) state.lastUserInputAt = getLastUserInputAt() || now;
@@ -5092,12 +5099,32 @@ function handleSilenceTimeout() {
       return;
     }
 
-    clearSilenceFollowup();
-    setGuideState(GUIDE_STATES.INTERACTIVE);
-    requestSmartGuide("silence_followup", "", {
+    const nextStage = Math.min(
+      MAX_SILENCE_GUIDE_STAGE,
+      Math.max(1, Number(state.silenceGuideStage || 1) + 1)
+    );
+    state.silenceGuideStage = nextStage;
+    state.silenceCareAskedAt = now;
+    state.awaitingSilenceFollowup = nextStage < MAX_SILENCE_GUIDE_STAGE;
+    state.silenceGuidanceExhausted = nextStage >= MAX_SILENCE_GUIDE_STAGE;
+    const guideState = nextStage >= 2 ? GUIDE_STATES.INTERACTIVE : GUIDE_STATES.MICRO_HINT;
+    console.info("[silence-guide] escalate", {
+      stage: nextStage,
+      silenceSeconds: Math.round((now - getLastUserInputAt()) / 1000),
+      allowConcreteStep: nextStage >= 1,
+      allowFormula: nextStage >= 3,
+      allowFinalAnswer: nextStage >= MAX_SILENCE_GUIDE_STAGE
+    });
+    setGuideState(guideState);
+    requestSmartGuide(nextStage >= 3 ? "silence_escalation" : "silence_followup", "", {
       force: true,
-      guideState: GUIDE_STATES.INTERACTIVE,
-      silenceSeconds: Math.round((now - getLastUserInputAt()) / 1000)
+      guideState,
+      silenceStage: nextStage,
+      allowConcreteStep: nextStage >= 2,
+      allowFormula: nextStage >= 3,
+      allowFinalAnswer: nextStage >= MAX_SILENCE_GUIDE_STAGE,
+      silenceSeconds: Math.round((now - getLastUserInputAt()) / 1000),
+      fallbackText: buildSilenceEscalationFallback(nextStage)
     });
     return;
   }
@@ -5109,18 +5136,41 @@ function handleSilenceTimeout() {
   }
 
   setGuideState(GUIDE_STATES.MICRO_HINT);
+  state.silenceGuideStage = 1;
+  state.silenceGuidanceExhausted = false;
   state.awaitingSilenceFollowup = true;
   state.silenceCareAskedAt = now;
+  console.info("[silence-guide] start", {
+    stage: 1,
+    silenceSeconds: Math.round(idleMs / 1000),
+    allowConcreteStep: true,
+    allowFormula: false,
+    allowFinalAnswer: false
+  });
   requestSmartGuide("silence", "", {
     force: true,
     guideState: GUIDE_STATES.MICRO_HINT,
+    silenceStage: 1,
+    allowConcreteStep: true,
+    allowFormula: false,
+    allowFinalAnswer: false,
     silenceSeconds: Math.round(idleMs / 1000),
-    fallbackText: pickPrompt("silence-care", [
+    fallbackText: buildSilenceEscalationFallback(1) /* pickPrompt("silence-care", [
       "你停了一会儿。我们先接着刚才那一步想：题目里哪个条件还没有用上？",
       "先不用急着往后算。回到刚才的思路，看看哪一个已知条件能接上这一步。",
       "我们从刚才停下的位置接着看。你先找找题目里还没用到的那个关系。"
-    ])
+    ]) */
   });
+}
+
+function buildSilenceEscalationFallback(stage) {
+  const fallbackByStage = {
+    1: "60秒了，我们直接做下一步：先从题目给出的条件列出对应关系式。",
+    2: "我们先把下一步关系写出来，再继续往下算。",
+    3: "现在把对应的式子写在黑板上，先完成这一小步。",
+    4: "我把这道题的关键式子和核验过的答案一起说清楚，你可以对照黑板检查。"
+  };
+  return fallbackByStage[Math.max(1, Math.min(MAX_SILENCE_GUIDE_STAGE, Number(stage) || 1))];
 }
 
 function handleStudentSpeech(text, options = {}) {
@@ -5555,7 +5605,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       return false;
     }
     if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
-    if (isSilenceGuide) resetSilenceTimer(false);
+    if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
     return true;
   } catch (error) {
     console.warn("AI guide fallback:", error);
@@ -5569,7 +5619,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       return false;
     }
     lianSpeak(fallbackText, { responseToken, responseId });
-    if (isSilenceGuide) resetSilenceTimer(false);
+    if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
     return true;
   } finally {
     if (isSilenceGuide) state.silenceGuidePending = false;
@@ -5604,6 +5654,10 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       ),
       guideState: options.guideState || state.guideState,
       lectureUnlocked: (options.guideState || state.guideState) === GUIDE_STATES.INTERACTIVE,
+      silenceStage: Number(options.silenceStage || state.silenceGuideStage || 0),
+      allowConcreteStep: options.allowConcreteStep === true,
+      allowFormula: options.allowFormula === true,
+      allowFinalAnswer: options.allowFinalAnswer === true,
       silenceSeconds: options.silenceSeconds || Math.round((Date.now() - getLastUserInputAt()) / 1000),
       boardIdleSeconds: Math.round((Date.now() - (state.lastBoardWriteAt || getLastUserInputAt())) / 1000),
       stuckCount: state.stuckCount,
@@ -5663,10 +5717,10 @@ function trimGuideSpeech(text, eventType) {
   let value = String(text || "").replace(/\s+/g, " ").trim();
   if (!value) return "";
 
-  const maxLength = /active_help|repeat_wrong|error_silence|silence_followup|next_step/.test(eventType)
-    ? 76
+  const maxLength = /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
+    ? 120
     : 46;
-  const maxSentences = /active_help|repeat_wrong|error_silence|silence_followup|next_step/.test(eventType)
+  const maxSentences = /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
     ? 2
     : 1;
 
@@ -5689,7 +5743,7 @@ function formatGuideSpeech(eventType, result, fallbackText) {
   const formulaOrStep = String(result?.formulaOrStep || "").trim();
   const lectureUnlocked = state.guideState === GUIDE_STATES.INTERACTIVE;
   const tooExplicit = !lectureUnlocked && ["formula", "worked_step", "summary"].includes(result?.hintLevel);
-  const needsConcreteStep = lectureUnlocked && /active_help|repeat_wrong|error_silence|silence_followup|next_step/.test(eventType);
+  const needsConcreteStep = lectureUnlocked && /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType);
 
   if (tooExplicit) speech = fallbackText;
 
@@ -5735,7 +5789,7 @@ function buildFallbackGuide(eventType, question) {
       "我在听，如果刚好卡住了，你告诉我卡在什么地方。"
     ]);
   }
-  if (eventType === "active_help" || eventType === "repeat_wrong" || eventType === "error_silence" || eventType === "silence_followup" || eventType === "next_step") {
+  if (eventType === "active_help" || eventType === "repeat_wrong" || eventType === "error_silence" || eventType === "silence_followup" || eventType === "silence_escalation" || eventType === "next_step") {
     return pickPrompt("fallback-interactive", [
       `我们只看一小步：先抓住${point}，把题干里的关系找出来。然后你按这个方向再讲一遍。`,
       `先给你一个小提示，看看${point}，把对应关系找出来，再用自己的话说一次。`,
@@ -6041,10 +6095,12 @@ async function playCloudLianSpeech(
   audio.preload = "auto";
   audio.muted = false;
   audio.volume = LIAN_VOICE_VOLUME;
+  audio.load();
   state.currentLianUtterance = audio;
 
   return await new Promise((resolve) => {
     let settled = false;
+    let playbackAttempts = 0;
     const cleanup = (played) => {
       if (settled) return;
       settled = true;
@@ -6073,10 +6129,32 @@ async function playCloudLianSpeech(
     audio.onpause = () => {
       if (speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) cleanup(false);
     };
-    audio.play().catch((error) => {
-      console.warn("[tts] cloud audio playback failed:", error?.name || error);
-      cleanup(false);
-    });
+    const startPlayback = () => {
+      audio.play().catch((error) => {
+        console.warn("[tts] cloud audio playback failed:", error?.name || error);
+        if (
+          playbackAttempts === 0 &&
+          speechRequestId === state.lianSpeechRequestId &&
+          isCurrentInteraction(responseToken)
+        ) {
+          playbackAttempts += 1;
+          setTimeout(() => {
+            if (
+              speechRequestId !== state.lianSpeechRequestId ||
+              !isCurrentInteraction(responseToken)
+            ) {
+              cleanup(false);
+              return;
+            }
+            audio.load();
+            startPlayback();
+          }, 180);
+          return;
+        }
+        cleanup(false);
+      });
+    };
+    startPlayback();
   });
 }
 
@@ -6210,9 +6288,17 @@ function lianSpeak(text, options = {}) {
     void (async () => {
       if (!state.isMuted) {
         try {
-          if (state.lianAudioUnlockPromise) await state.lianAudioUnlockPromise;
+          if (!state.lianAudioUnlocked) {
+            const unlocked = await unlockLianAudio();
+            // The opening sentence is started from a requestAnimationFrame,
+            // so retry the one-shot browser audio unlock if the first attempt
+            // was rejected before the cloud audio request completed.
+            if (!unlocked && options.isOpeningSpeech === true) {
+              await unlockLianAudio();
+            }
+          }
           const speechText = prepareLianSpeechText(text);
-          const playedCloud = await playCloudLianSpeech(
+          let playedCloud = await playCloudLianSpeech(
             speechText,
             speechRequestId,
             publishText,
@@ -6220,6 +6306,30 @@ function lianSpeak(text, options = {}) {
             abortController,
             responseId
           );
+          // The first opening sentence can race the browser audio unlock or
+          // the cloud TTS prefetch. Retry the cloud playback once before
+          // falling back to text-only output.
+          if (
+            !playedCloud &&
+            options.isOpeningSpeech === true &&
+            speechRequestId === state.lianSpeechRequestId &&
+            isCurrentInteraction(responseToken)
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 180));
+            if (
+              speechRequestId === state.lianSpeechRequestId &&
+              isCurrentInteraction(responseToken)
+            ) {
+              playedCloud = await playCloudLianSpeech(
+                speechText,
+                speechRequestId,
+                publishText,
+                responseToken,
+                abortController,
+                responseId
+              );
+            }
+          }
           if (playedCloud) {
             finishSpeaking();
             return;
@@ -6540,6 +6650,7 @@ function goToLectureQuestion(index, openingText = "") {
     const questionId = currentPageQuestion()?.id || "";
     const speechStartedAt = state.lastUserInputAt;
     void lianSpeak(openingText, {
+      isOpeningSpeech: true,
       allowRepeat: true,
       cooldownMs: 0
     }).finally(() => {

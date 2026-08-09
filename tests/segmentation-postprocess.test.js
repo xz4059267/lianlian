@@ -37,8 +37,26 @@ const {
   buildHandwritingProcessFeedback,
   registerQuestionMemoryIdentity,
   registerHandwritingRequest,
-  isLatestHandwritingRequest
+  isLatestHandwritingRequest,
+  getSilenceGuidePolicy
 } = require("../server.js");
+
+test("escalates silence guidance from a concrete entry point to a verified answer", () => {
+  const stage0 = getSilenceGuidePolicy(0);
+  const stage1 = getSilenceGuidePolicy(1);
+  const stage2 = getSilenceGuidePolicy(2);
+  const stage3 = getSilenceGuidePolicy(3);
+  const stage4 = getSilenceGuidePolicy(4);
+
+  assert.equal(stage0.allowConcreteStep, false);
+  assert.equal(stage1.allowConcreteStep, true);
+  assert.equal(stage1.allowFormula, false);
+  assert.equal(stage2.guideState, "interactive_teaching");
+  assert.equal(stage3.allowFormula, true);
+  assert.equal(stage3.allowFinalAnswer, false);
+  assert.equal(stage4.allowFinalAnswer, true);
+  assert.equal(getSilenceGuidePolicy(99).stage, 4);
+});
 
 test("captures one standard-answer result as a reusable Question Memory snapshot", () => {
   const memory = buildQuestionMemory("q-1", {
