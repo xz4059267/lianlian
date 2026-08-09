@@ -458,6 +458,7 @@ function resumeTeachSessionAfterNavigation() {
   state.resumeHandwritingAfterNavigation = false;
   state.resumeIssueTimerAfterNavigation = false;
   shiftTeachSessionTimes(pausedFor);
+  if (!state.currentQuestionCompleted) resetSilenceTimer(false);
 
   dom.studentState.textContent = shouldResumeListening ? "正在恢复收听" : "准备讲题";
   dom.lianState.textContent = guideIdleText();
@@ -735,7 +736,10 @@ function markUserInput(type) {
     if (state.guideState === GUIDE_STATES.MICRO_HINT) setGuideState(GUIDE_STATES.HEURISTIC);
   }
 
-  if (state.isListening) resetSilenceTimer(false);
+  // Silence care is based on student input, not microphone permission.
+  // Board and transcript input both reset the same idle timer even when
+  // speech recognition has not been started.
+  resetSilenceTimer(false);
 }
 
 function getBoardVersion(question = currentPageQuestion()) {
@@ -2345,6 +2349,8 @@ function initCurrentQuestion() {
   clearIssueTracking();
   clearSilenceFollowup();
   state.activeGuideRequestId += 1;
+  const openingQuestionId = question.id;
+  const openingStartedAt = state.lastUserInputAt;
   requestAnimationFrame(() => {
     resizeBoardCanvas();
     loadCurrentPage();
@@ -2356,7 +2362,16 @@ function initCurrentQuestion() {
       "来，先把题目里的条件说一遍，我跟着你一起理顺。"
     ]);
     state.pendingLianOpeningText = "";
-    lianSpeak(openingText);
+    void lianSpeak(openingText).finally(() => {
+      if (
+        currentPageQuestion()?.id === openingQuestionId &&
+        !state.currentQuestionCompleted &&
+        state.lastUserInputAt <= openingStartedAt
+      ) {
+        state.lastUserInputAt = Date.now();
+        resetSilenceTimer(false);
+      }
+    });
   });
 }
 
@@ -3079,17 +3094,28 @@ function resetQuestionGuideState(options = {}) {
     "现在讲这道题，你不用急着算，先把思路说出来。"
   ]);
   if (options.speak !== false) {
+    const questionId = currentPageQuestion()?.id || "";
+    const speechStartedAt = state.lastUserInputAt;
     void lianSpeak(dom.lianBubble.textContent, {
-      dedupeKey: `question-change:${currentPageQuestion()?.id || state.boardPageIndex}`,
+      dedupeKey: `question-change:${questionId || state.boardPageIndex}`,
       cooldownMs: 0,
       allowRepeat: true,
       log: false,
       trackQuestion: false
+    }).finally(() => {
+      if (
+        currentPageQuestion()?.id === questionId &&
+        !state.currentQuestionCompleted &&
+        state.lastUserInputAt <= speechStartedAt
+      ) {
+        state.lastUserInputAt = Date.now();
+        resetSilenceTimer(false);
+      }
     });
   } else {
     dom.lianBubble.textContent = "";
+    if (!options.deferSilenceTimer) resetSilenceTimer(false);
   }
-  if (state.isListening) resetSilenceTimer();
 }
 
 function scheduleHandwritingRecognition(reason) {
@@ -5056,7 +5082,7 @@ function resetSilenceTimer(updateSpeechAt = true) {
 
 function handleSilenceTimeout() {
   if (state.teachSessionPaused) return;
-  if (!state.isListening) return;
+  if (!currentPageQuestion() || state.currentQuestionCompleted) return;
 
   const now = Date.now();
   if (state.awaitingSilenceFollowup) {
@@ -5529,7 +5555,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       return false;
     }
     if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
-    if (isSilenceGuide && state.isListening) resetSilenceTimer();
+    if (isSilenceGuide) resetSilenceTimer(false);
     return true;
   } catch (error) {
     console.warn("AI guide fallback:", error);
@@ -5543,7 +5569,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       return false;
     }
     lianSpeak(fallbackText, { responseToken, responseId });
-    if (isSilenceGuide && state.isListening) resetSilenceTimer();
+    if (isSilenceGuide) resetSilenceTimer(false);
     return true;
   } finally {
     if (isSilenceGuide) state.silenceGuidePending = false;
@@ -6499,7 +6525,11 @@ function goToLectureQuestion(index, openingText = "") {
   if (index < 0 || index >= state.lecture.length) return false;
   state.boardPageIndex = index;
   state.currentLectureIndex = index;
-  resetQuestionGuideState({ speak: !openingText });
+  const hasOpeningText = Boolean(openingText);
+  resetQuestionGuideState({
+    speak: !hasOpeningText,
+    deferSilenceTimer: hasOpeningText
+  });
   loadCurrentPage();
   updatePageLabel();
   dom.finishQuestionBtn.disabled = false;
@@ -6507,9 +6537,20 @@ function goToLectureQuestion(index, openingText = "") {
   dom.lianAvatar.classList.remove("speaking");
   dom.lianAvatar.classList.add("listening");
   if (openingText) {
+    const questionId = currentPageQuestion()?.id || "";
+    const speechStartedAt = state.lastUserInputAt;
     void lianSpeak(openingText, {
       allowRepeat: true,
       cooldownMs: 0
+    }).finally(() => {
+      if (
+        currentPageQuestion()?.id === questionId &&
+        !state.currentQuestionCompleted &&
+        state.lastUserInputAt <= speechStartedAt
+      ) {
+        state.lastUserInputAt = Date.now();
+        resetSilenceTimer(false);
+      }
     });
   }
   return true;
