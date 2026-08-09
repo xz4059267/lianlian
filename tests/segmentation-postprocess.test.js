@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const {
   groupOcrBlocksIntoLines,
@@ -28,8 +30,230 @@ const {
   studentAnswerMatchesVerifiedKey,
   isOnlyDirectAnswerWriting,
   applyStatementEvaluationSafety,
-  applyLatestHandwritingConsistency
+  applyLatestHandwritingConsistency,
+  summarizeHandwritingDiagnostics,
+  buildQuestionMemory,
+  questionMemoryToAnswerKey,
+  buildHandwritingProcessFeedback,
+  registerQuestionMemoryIdentity,
+  registerHandwritingRequest,
+  isLatestHandwritingRequest
 } = require("../server.js");
+
+test("captures one standard-answer result as a reusable Question Memory snapshot", () => {
+  const memory = buildQuestionMemory("q-1", {
+    trusted: true,
+    status: "structured-single-pass",
+    confidence: 0.96,
+    canonicalAnswer: "C",
+    acceptedAnswers: ["C"],
+    problemText: "选择正确答案",
+    questionType: "choice",
+    knowledge: "比例",
+    solutionOutline: ["按题目顺序列比例"],
+    verificationChecks: ["代入检查"]
+  });
+
+  assert.equal(memory.version, 1);
+  assert.equal(memory.questionId, "q-1");
+  assert.equal(memory.ready, true);
+  assert.equal(memory.canonicalAnswer, "C");
+  assert.deepEqual(memory.solutionOutline, ["按题目顺序列比例"]);
+
+  const answerKey = questionMemoryToAnswerKey(memory, "q-1");
+  assert.equal(answerKey.trusted, true);
+  assert.equal(answerKey.canonicalAnswer, "C");
+});
+
+test("keeps one Question Memory identity per answer session", () => {
+  const sessionId = `session-${Date.now()}-${Math.random()}`;
+  const questionId = "q-memory-singleton";
+  assert.equal(registerQuestionMemoryIdentity(sessionId, questionId, "memory-a"), "memory-a");
+  assert.equal(registerQuestionMemoryIdentity(sessionId, questionId, "memory-a"), "memory-a");
+  assert.throws(
+    () => registerQuestionMemoryIdentity(sessionId, questionId, "memory-b"),
+    (error) => error.code === "question_memory_conflict" && error.statusCode === 409
+  );
+  assert.equal(
+    registerQuestionMemoryIdentity(sessionId, "q-memory-content", "memory-c", "answer:C"),
+    "memory-c"
+  );
+  assert.throws(
+    () => registerQuestionMemoryIdentity(sessionId, "q-memory-content", "memory-c", "answer:D"),
+    (error) => error.code === "question_memory_conflict" && error.statusCode === 409
+  );
+});
+
+test("rejects an older handwriting response after a newer request starts", () => {
+  const sessionId = `session-order-${Date.now()}-${Math.random()}`;
+  const questionId = "q-handwriting-order";
+  registerHandwritingRequest(sessionId, questionId, 2);
+  assert.equal(isLatestHandwritingRequest(sessionId, questionId, 2), true);
+  assert.equal(isLatestHandwritingRequest(sessionId, questionId, 1), false);
+  assert.throws(
+    () => registerHandwritingRequest(sessionId, questionId, 1),
+    (error) => error.code === "stale_request" && error.statusCode === 409
+  );
+});
+
+test("propagates session and memory identity through handwriting requests", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const requestSource = appSource.slice(
+    appSource.indexOf("async function requestHandwritingAnalysis"),
+    appSource.indexOf("async function verifyCurrentBoardForCompletion")
+  );
+  const handlerSource = serverSource.slice(
+    serverSource.indexOf("async function handleHandwriting"),
+    serverSource.indexOf("function isOnlyDirectAnswerWriting")
+  );
+  assert.match(requestSource, /sessionId/);
+  assert.match(requestSource, /requestId/);
+  assert.match(requestSource, /memoryId/);
+  assert.match(requestSource, /boardVersion/);
+  assert.match(handlerSource, /registerQuestionMemoryIdentity/);
+  assert.match(handlerSource, /registerHandwritingRequest/);
+  assert.match(handlerSource, /isLatestHandwritingRequest/);
+});
+
+test("fails closed when handwriting has no matching Question Memory", () => {
+  assert.throws(
+    () => questionMemoryToAnswerKey(null, "q-1"),
+    (error) => error.code === "question_memory_missing" && error.stage === "question-memory"
+  );
+  assert.throws(
+    () => questionMemoryToAnswerKey({ questionId: "q-2", ready: true }, "q-1"),
+    (error) => error.code === "question_memory_mismatch" && error.stage === "question-memory"
+  );
+});
+
+test("handwriting consumes Question Memory without acquiring an answer key", () => {
+  const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const handlerSource = serverSource.slice(
+    serverSource.indexOf("async function handleHandwriting"),
+    serverSource.indexOf("function isOnlyDirectAnswerWriting")
+  );
+  const auditSource = serverSource.slice(
+    serverSource.indexOf("async function auditHandwritingResult"),
+    serverSource.indexOf("async function handleQuestionMemory")
+  );
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const appHandwritingRequest = appSource.slice(
+    appSource.indexOf("async function requestHandwritingAnalysis"),
+    appSource.indexOf("async function verifyCurrentBoardForCompletion")
+  );
+  const appHandwritingRun = appSource.slice(
+    appSource.indexOf("async function runHandwritingRecognition"),
+    appSource.indexOf("async function requestHandwritingAnalysis")
+  );
+
+  assert.match(handlerSource, /questionMemoryToAnswerKey\(body\.questionMemory/);
+  assert.doesNotMatch(handlerSource, /getVerifiedAnswerKey\(/);
+  assert.doesNotMatch(handlerSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|包含题目区域|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
+  assert.doesNotMatch(auditSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|包含题目区域|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
+  assert.match(appSource, /fetch\("\/api\/question-memory"/);
+  assert.doesNotMatch(appSource, /fetch\("\/api\/answer-key"/);
+  assert.match(appSource, /questionMemory,/);
+  assert.doesNotMatch(appHandwritingRequest, /questionImage:|problemText:|knowledgePoints:|boardImage:|createCurrentBoardSnapshot/);
+  assert.doesNotMatch(appHandwritingRun, /maybeSpeakHandwritingSuccess|maybeSpeakHandwritingUnclear|maybeVerifyFinalAnswerFromHandwriting|maybePromptSaveFromHandwriting/);
+});
+
+test("keeps correct board progress silent and grounds feedback in visible work", () => {
+  const answerKey = questionMemoryToAnswerKey(buildQuestionMemory("q-1", {
+    trusted: true,
+    status: "structured-single-pass",
+    confidence: 0.95,
+    canonicalAnswer: "x=4",
+    acceptedAnswers: ["x=4"],
+    solutionOutline: ["列出 2:3=x:6", "交叉相乘得到 3x=12", "求得 x=4"]
+  }), "q-1");
+  const result = buildHandwritingProcessFeedback({
+    writingState: "complete",
+    completedSteps: ["列出 2:3=x:6"],
+    calculationStatus: "correct",
+    confidence: 0.9,
+    hasPossibleIssue: false
+  }, answerKey, { boardIdleSeconds: 7 });
+
+  assert.equal(result.guidance, "");
+  assert.equal(result.positiveFeedback, "你已经写出了“列出 2:3=x:6”。");
+  assert.doesNotMatch(result.positiveFeedback, /很好|很棒|继续努力/);
+});
+
+test("only gives stalled guidance from Question Memory standard steps", () => {
+  const answerKey = questionMemoryToAnswerKey(buildQuestionMemory("q-1", {
+    trusted: true,
+    canonicalAnswer: "x=4",
+    acceptedAnswers: ["x=4"],
+    solutionOutline: ["列出 2:3=x:6", "交叉相乘得到 3x=12"]
+  }), "q-1");
+  const observation = {
+    writingState: "stalled",
+    completedSteps: ["列出 2:3=x:6"],
+    calculationStatus: "incomplete",
+    confidence: 0.86,
+    hasPossibleIssue: false
+  };
+
+  const shortPause = buildHandwritingProcessFeedback(observation, answerKey, { boardIdleSeconds: 7 });
+  assert.equal(shortPause.writingState, "in_progress");
+  assert.equal(shortPause.guidance, "");
+
+  const stalled = buildHandwritingProcessFeedback(observation, answerKey, { boardIdleSeconds: 20 });
+  assert.equal(stalled.expectedNextStep, "交叉相乘得到 3x=12");
+  assert.match(stalled.guidance, /列出 2:3=x:6/);
+  assert.match(stalled.guidance, /交叉相乘得到 3x=12/);
+});
+
+test("requires a concrete visible error location before interrupting", () => {
+  const answerKey = { trusted: true, solutionOutline: ["核对等号后的数"] };
+  const explicit = buildHandwritingProcessFeedback({
+    writingState: "complete",
+    completedSteps: ["写出 x=-2"],
+    calculationStatus: "wrong",
+    confidence: 0.91,
+    hasPossibleIssue: true,
+    errorLocation: "最后一行 x=-2",
+    errorEvidence: "它与 Question Memory 中已核验的 x=4 冲突"
+  }, answerKey);
+  assert.equal(explicit.guidance, "先检查最后一行 x=-2：它与 Question Memory 中已核验的 x=4 冲突");
+
+  const vague = buildHandwritingProcessFeedback({
+    writingState: "complete",
+    calculationStatus: "wrong",
+    confidence: 0.91,
+    hasPossibleIssue: true,
+    issueSummary: "可能不对"
+  }, answerKey);
+  assert.equal(vague.calculationStatus, "unclear");
+  assert.equal(vague.guidance, "");
+});
+
+test("keeps independent handwriting attempts distinguishable", () => {
+  const first = summarizeHandwritingDiagnostics({
+    requestId: 11,
+    questionId: "q-1",
+    boardVersion: 1,
+    reason: "停笔后识别",
+    canvasWidth: 800,
+    canvasHeight: 600,
+    boardOnlyBytes: 1200
+  });
+  const second = summarizeHandwritingDiagnostics({
+    requestId: 12,
+    questionId: "q-1",
+    boardVersion: 2,
+    reason: "继续写字后再次停笔",
+    canvasWidth: 800,
+    canvasHeight: 600,
+    boardOnlyBytes: 1800
+  });
+
+  assert.notEqual(first.requestId, second.requestId);
+  assert.notEqual(first.boardVersion, second.boardVersion);
+  assert.equal(first.questionId, second.questionId);
+  assert.ok(second.boardOnlyBytes > first.boardOnlyBytes);
+});
 
 test("clips layout regions to OCR question-number intervals", () => {
   const anchors = [
@@ -1014,7 +1238,10 @@ test("uses the latest wrong handwriting result to guide from the actual mistake"
       eventType: "check",
       latestHandwritingResult: {
         calculationStatus: "wrong",
+        confidence: 0.9,
         issueSummary: "减法符号写反了",
+        errorLocation: "第二行减号",
+        errorEvidence: "第二行把减号写成了加号",
         guidance: "先重新检查两边相减时的符号。",
         expectedNextStep: "重新检查符号"
       }
@@ -1077,12 +1304,13 @@ test("does not contradict a latest correct handwriting result", () => {
       eventType: "check",
       latestHandwritingResult: {
         calculationStatus: "correct",
-        positiveFeedback: "这一步和题目条件吻合，可以继续。"
+        completedSteps: []
       }
     }
   );
 
-  assert.equal(result.speech, "这一步和题目条件吻合，可以继续。");
+  assert.equal(result.shouldSpeak, false);
+  assert.equal(result.speech, "");
   assert.equal(result.hintLevel, "encourage");
 });
 

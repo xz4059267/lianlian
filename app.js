@@ -192,6 +192,7 @@ const state = {
   boardPageIndex: 0,
   boardPages: {},
   boardInkByQuestion: {},
+  boardVersionByQuestion: {},
   boardHistories: {},
   boardImageStates: {},
   boardHeights: {},
@@ -206,6 +207,11 @@ const state = {
   lastPoint: null,
   recognitionTimer: null,
   handwritingRequestId: 0,
+  handwritingRequestInFlight: false,
+  handwritingActiveRequest: null,
+  handwritingRequestStatusById: {},
+  handwritingQueuedReason: "",
+  handwritingQueuedMeta: null,
   latestHandwritingResult: null,
   lastHandwritingRecognizedAt: 0,
   handwritingDisabledUntil: 0,
@@ -250,12 +256,10 @@ const state = {
   completionCheckInProgress: false,
   autoSavePromptedQuestionId: "",
   finalAnswerRequestId: 0,
-  answerKeyStatusByQuestion: {},
-  answerKeysByQuestion: {},
-  answerKeyFetchPromises: {},
-  answerKeyPrefetchQueue: [],
-  answerKeyPrefetchQueuedIds: new Set(),
-  answerKeyPrefetchActive: 0,
+  questionMemoryStatusByQuestion: {},
+  questionMemoriesByQuestion: {},
+  questionMemoryFetchPromises: {},
+  questionMemoryIdsByQuestion: {},
   currentQuestionCompleted: false,
   hasExplicitFinalAnswer: false,
   pendingLianQuestion: null,
@@ -274,6 +278,7 @@ const state = {
   lianVoiceSelectionLocked: false,
   lianSpeechRequestId: 0,
   lectureSessionId: 0,
+  answerSessionId: 0,
   inputSequenceId: 0,
   lastInputEvent: null,
   lianTtsAbortController: null,
@@ -356,6 +361,13 @@ function pauseTeachSessionForNavigation() {
   state.silenceGuidePending = false;
   state.activeGuideRequestId += 1;
   state.handwritingRequestId += 1;
+  if (state.handwritingActiveRequest) {
+    rememberHandwritingRequestStatus(state.handwritingActiveRequest.requestId, "stale");
+  }
+  state.handwritingActiveRequest = null;
+  state.handwritingRequestInFlight = false;
+  state.handwritingQueuedReason = "";
+  state.handwritingQueuedMeta = null;
   state.finalAnswerRequestId += 1;
 
   if (state.resumeSpeechAfterNavigation) window.speechSynthesis.pause();
@@ -706,6 +718,11 @@ function markUserInput(type) {
   }
   if (type === "board") {
     state.lastBoardWriteAt = now;
+    const question = currentPageQuestion();
+    if (question?.id) {
+      state.boardVersionByQuestion[question.id] =
+        Number(state.boardVersionByQuestion[question.id] || 0) + 1;
+    }
     state.currentQuestionCompleted = false;
   }
   state.lastUserInputAt = now;
@@ -716,6 +733,59 @@ function markUserInput(type) {
   }
 
   if (state.isListening) resetSilenceTimer(false);
+}
+
+function getBoardVersion(question = currentPageQuestion()) {
+  return question?.id ? Number(state.boardVersionByQuestion[question.id] || 0) : 0;
+}
+
+function rememberHandwritingRequestStatus(requestId, status) {
+  const id = Number(requestId || 0);
+  if (!id) return;
+  state.handwritingRequestStatusById[id] = status;
+  const ids = Object.keys(state.handwritingRequestStatusById)
+    .map(Number)
+    .sort((left, right) => left - right);
+  ids.slice(0, Math.max(0, ids.length - 40)).forEach((oldId) => {
+    delete state.handwritingRequestStatusById[oldId];
+  });
+}
+
+function createHandwritingRequestMeta(question, kind = "recognition") {
+  const memory = getQuestionMemory(question);
+  return {
+    requestId: ++state.handwritingRequestId,
+    sessionId: state.answerSessionId,
+    interactionSessionId: state.lectureSessionId,
+    questionId: question?.id || "",
+    boardVersion: getBoardVersion(question),
+    memoryId: memory?.memoryId || state.questionMemoryIdsByQuestion[question?.id] || "",
+    kind
+  };
+}
+
+function beginHandwritingRequest(meta) {
+  state.handwritingActiveRequest = { ...meta };
+  state.handwritingRequestInFlight = true;
+  rememberHandwritingRequestStatus(meta.requestId, "running");
+}
+
+function isCurrentHandwritingRequest(meta) {
+  const active = state.handwritingActiveRequest;
+  if (!meta || !active || active.requestId !== meta.requestId) return false;
+  if (active.sessionId !== state.answerSessionId || meta.sessionId !== state.answerSessionId) return false;
+  if (meta.interactionSessionId !== state.lectureSessionId) return false;
+  if (currentPageQuestion()?.id !== meta.questionId) return false;
+  if (getBoardVersion(currentPageQuestion()) !== Number(meta.boardVersion)) return false;
+  if (meta.memoryId && active.memoryId && meta.memoryId !== active.memoryId) return false;
+  return true;
+}
+
+function finishHandwritingRequest(meta, status = "completed") {
+  rememberHandwritingRequestStatus(meta?.requestId, status);
+  if (state.handwritingActiveRequest?.requestId !== meta?.requestId) return;
+  state.handwritingActiveRequest = null;
+  state.handwritingRequestInFlight = false;
 }
 
 function getInteractionToken() {
@@ -888,7 +958,7 @@ function clearIssueTracking() {
 
 function registerPossibleIssue(result) {
   const now = Date.now();
-  const issueKey = `${result.issueType}:${result.expectedNextStep || result.issueSummary}`;
+  const issueKey = `${result.issueType}:${result.errorLocation || ""}:${result.errorEvidence || result.issueSummary || ""}`;
   const isDuplicate = issueKey === state.lastHandwritingIssueKey && now - state.lastHandwritingGuideAt < 25000;
   if (isDuplicate) return { issueKey, duplicate: true, escalated: false };
 
@@ -1317,7 +1387,6 @@ async function runAutoSegment(options = {}) {
     state.questions = questions;
     state.selectedIds = questions.map((question) => question.id);
   }
-  scheduleVerifiedAnswerKeyPrefetch(questions);
   if (!options.append) dom.processingBox.classList.add("hidden");
   const statusMessage = usedWholePageFallback
       ? "AI 没有可靠拆成单题，已先保留整页，可手动框选细分"
@@ -2145,6 +2214,18 @@ dom.startLectureBtn.addEventListener("click", () => {
 });
 
 function startLecture(queue) {
+  state.answerSessionId += 1;
+  state.handwritingRequestId += 1;
+  state.handwritingActiveRequest = null;
+  state.handwritingRequestInFlight = false;
+  state.handwritingQueuedReason = "";
+  state.handwritingQueuedMeta = null;
+  queue.forEach((question) => {
+    delete state.questionMemoryStatusByQuestion[question.id];
+    delete state.questionMemoriesByQuestion[question.id];
+    delete state.questionMemoryFetchPromises[question.id];
+    state.questionMemoryIdsByQuestion[question.id] = `qm:${state.answerSessionId}:${question.id}`;
+  });
   state.lecture = queue.map((question, index) => ({
     ...question,
     title: question.title || `第 ${index + 1} 题`
@@ -2171,9 +2252,6 @@ function startLecture(queue) {
   state.hasExplicitFinalAnswer = false;
   state.pendingLianQuestion = null;
   dom.finishQuestionBtn.disabled = false;
-  const firstQuestion = state.lecture[0];
-  if (firstQuestion?.image) void prefetchVerifiedAnswerKey(firstQuestion);
-  scheduleVerifiedAnswerKeyPrefetch(state.lecture.slice(1));
   initCurrentQuestion();
   showView("teachView");
 }
@@ -2428,7 +2506,10 @@ function loadCurrentPage() {
   if (!question) return;
   dom.transcriptInput.value = state.transcriptsByQuestion[question.id] || "";
   dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
-  scheduleVerifiedAnswerKeyPrefetch([question]);
+  // Entering a question is the only place that may create its Question Memory.
+  // Returning to the same question reuses the frozen terminal result, including
+  // an unavailable result, so board recognition can never trigger a retry.
+  void initializeQuestionMemory(question);
   if (dom.boardQuestionImage.src !== question.image) dom.boardQuestionImage.src = question.image;
   const pages = pagesForQuestion(question.id);
   drawDataUrlToCanvas(pages[0] || "", {
@@ -2441,101 +2522,121 @@ function loadCurrentPage() {
   applyBoardImageState();
 }
 
-async function prefetchVerifiedAnswerKey(question) {
-  if (!question?.id || !question.image) return;
-  const currentStatus = state.answerKeyStatusByQuestion[question.id];
-  if (currentStatus === "ready" && state.answerKeysByQuestion[question.id]) {
-    return state.answerKeysByQuestion[question.id];
-  }
-  if (currentStatus === "loading" && state.answerKeyFetchPromises[question.id]) {
-    return await state.answerKeyFetchPromises[question.id];
-  }
-  state.answerKeyStatusByQuestion[question.id] = "loading";
-  state.answerKeyFetchPromises[question.id] = (async () => {
-    const response = await fetch("/api/answer-key", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        questionImage: question.image,
-        problemText: question.problemText || ""
-      })
-    });
-    const result = await response.json().catch(() => ({}));
-    state.answerKeyStatusByQuestion[question.id] = response.ok && result.ready ? "ready" : "unverified";
-    state.answerKeysByQuestion[question.id] = {
-      ready: Boolean(response.ok && result.ready),
-      status: result.status || (response.ok ? "unverified" : "error"),
-      confidence: Number(result.confidence) || 0,
-      canonicalAnswer: String(result.canonicalAnswer || "").trim(),
-      acceptedAnswers: Array.isArray(result.acceptedAnswers) ? result.acceptedAnswers : [],
-      choiceAnalysis: result.choiceAnalysis || {
-        options: [],
-        statementVerdicts: [],
-        selectedOption: "",
-        selectedOptionText: ""
-      },
-      problemText: String(result.problemText || "").trim(),
-      questionType: String(result.questionType || "").trim(),
-      knowledge: String(result.knowledge || "").trim(),
-      solutionOutline: Array.isArray(result.solutionOutline) ? result.solutionOutline : [],
-      verificationChecks: Array.isArray(result.verificationChecks) ? result.verificationChecks : [],
-      studentTrace: result.studentTrace || null,
-      reason: String(result.reason || "").trim(),
-      provider: result.provider || "",
-      elapsedMs: Number(result.elapsedMs) || 0,
-      fetchedAt: new Date().toISOString()
-    };
-    return state.answerKeysByQuestion[question.id];
-  })();
-  try {
-    return await state.answerKeyFetchPromises[question.id];
-  } catch {
-    state.answerKeyStatusByQuestion[question.id] = "unverified";
-    state.answerKeysByQuestion[question.id] = {
-      ready: false,
-      status: "network-error",
-      confidence: 0,
-      canonicalAnswer: "",
-      acceptedAnswers: [],
-      choiceAnalysis: {
-        options: [],
-        statementVerdicts: [],
-        selectedOption: "",
-        selectedOptionText: ""
-      },
-      solutionOutline: [],
-      verificationChecks: [],
-      reason: "standard answer service unavailable",
-      fetchedAt: new Date().toISOString()
-    };
-    return state.answerKeysByQuestion[question.id];
-  } finally {
-    delete state.answerKeyFetchPromises[question.id];
-  }
+function freezeQuestionMemory(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Object.values(value).forEach((item) => freezeQuestionMemory(item));
+  return Object.freeze(value);
 }
 
-function scheduleVerifiedAnswerKeyPrefetch(questions) {
-  (Array.isArray(questions) ? questions : []).forEach((question) => {
-    if (!question?.id || !question.image) return;
-    if (["loading", "ready"].includes(state.answerKeyStatusByQuestion[question.id])) return;
-    if (state.answerKeyPrefetchQueuedIds.has(question.id)) return;
-    state.answerKeyPrefetchQueuedIds.add(question.id);
-    state.answerKeyPrefetchQueue.push(question);
+function normalizeQuestionMemory(question, payload = {}) {
+  const source = payload?.questionMemory && typeof payload.questionMemory === "object"
+    ? payload.questionMemory
+    : payload;
+  return freezeQuestionMemory({
+    version: Number(source.version) || 1,
+    memoryId: String(source.memoryId || state.questionMemoryIdsByQuestion[question.id] || ""),
+    sessionId: Number(source.sessionId || state.answerSessionId || 0),
+    questionId: String(source.questionId || question.id || ""),
+    ready: Boolean(source.ready),
+    status: String(source.status || "unverified"),
+    confidence: Number(source.confidence) || 0,
+    canonicalAnswer: String(source.canonicalAnswer || "").trim(),
+    acceptedAnswers: Array.isArray(source.acceptedAnswers) ? source.acceptedAnswers : [],
+    choiceAnalysis: source.choiceAnalysis || {
+      options: [],
+      statementVerdicts: [],
+      selectedOption: "",
+      selectedOptionText: ""
+    },
+    problemText: String(source.problemText || "").trim(),
+    questionType: String(source.questionType || "").trim(),
+    knowledge: String(source.knowledge || "").trim(),
+    solutionOutline: Array.isArray(source.solutionOutline) ? source.solutionOutline : [],
+    verificationChecks: Array.isArray(source.verificationChecks) ? source.verificationChecks : [],
+    studentTrace: source.studentTrace || null,
+    reason: String(source.reason || "").trim(),
+    provider: String(source.provider || ""),
+    elapsedMs: Number(source.elapsedMs) || 0,
+    createdAt: String(source.createdAt || new Date().toISOString())
   });
-  drainVerifiedAnswerKeyPrefetchQueue();
 }
 
-function drainVerifiedAnswerKeyPrefetchQueue() {
-  while (state.answerKeyPrefetchActive < 2 && state.answerKeyPrefetchQueue.length) {
-    const question = state.answerKeyPrefetchQueue.shift();
-    state.answerKeyPrefetchQueuedIds.delete(question.id);
-    if (["loading", "ready"].includes(state.answerKeyStatusByQuestion[question.id])) continue;
-    state.answerKeyPrefetchActive += 1;
-    void prefetchVerifiedAnswerKey(question).finally(() => {
-      state.answerKeyPrefetchActive = Math.max(0, state.answerKeyPrefetchActive - 1);
-      drainVerifiedAnswerKeyPrefetchQueue();
-    });
+function getQuestionMemory(question) {
+  const memory = question?.id ? state.questionMemoriesByQuestion[question.id] || null : null;
+  if (!memory || Number(memory.sessionId || 0) !== Number(state.answerSessionId || 0)) return null;
+  return memory;
+}
+
+async function initializeQuestionMemory(question) {
+  if (!question?.id || !question.image) return null;
+  const requestSessionId = state.answerSessionId;
+  const memoryId = state.questionMemoryIdsByQuestion[question.id] ||
+    `qm:${requestSessionId}:${question.id}`;
+  state.questionMemoryIdsByQuestion[question.id] = memoryId;
+  const currentStatus = state.questionMemoryStatusByQuestion[question.id];
+  if (currentStatus === "loading") {
+    return state.questionMemoryFetchPromises[question.id]
+      ? await state.questionMemoryFetchPromises[question.id]
+      : null;
   }
+  if (currentStatus) return getQuestionMemory(question);
+
+  state.questionMemoryStatusByQuestion[question.id] = "loading";
+  let request;
+  request = (async () => {
+    try {
+      const response = await fetch("/api/question-memory", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          questionId: question.id,
+          questionImage: question.image,
+          problemText: question.problemText || "",
+          sessionId: requestSessionId,
+          memoryId
+        })
+      });
+      const result = await response.json().catch(() => ({}));
+      const memory = normalizeQuestionMemory(question, response.ok ? result : {
+        status: result.status || result.code || "request-error",
+        reason: result.error || "standard answer service unavailable"
+      });
+      if (
+        state.answerSessionId !== requestSessionId ||
+        state.questionMemoryIdsByQuestion[question.id] !== memoryId ||
+        state.questionMemoryFetchPromises[question.id] !== request
+      ) return null;
+      state.questionMemoriesByQuestion[question.id] = memory;
+      state.questionMemoryStatusByQuestion[question.id] = memory.ready ? "ready" : "unavailable";
+      return memory;
+    } catch (error) {
+      const memory = normalizeQuestionMemory(question, {
+        status: "network-error",
+        reason: error?.message || "standard answer service unavailable"
+      });
+      if (
+        state.answerSessionId !== requestSessionId ||
+        state.questionMemoryIdsByQuestion[question.id] !== memoryId ||
+        state.questionMemoryFetchPromises[question.id] !== request
+      ) return null;
+      state.questionMemoriesByQuestion[question.id] = memory;
+      state.questionMemoryStatusByQuestion[question.id] = "unavailable";
+      return memory;
+    } finally {
+      if (state.questionMemoryFetchPromises[question.id] === request) {
+        delete state.questionMemoryFetchPromises[question.id];
+      }
+    }
+  })();
+  state.questionMemoryFetchPromises[question.id] = request;
+  return await request;
+}
+
+async function waitForEnteredQuestionMemory(question) {
+  const memory = getQuestionMemory(question);
+  if (memory) return memory;
+  const pending = question?.id ? state.questionMemoryFetchPromises[question.id] : null;
+  return pending ? await pending : null;
 }
 
 function showBoardStatusPill(text, duration = 1200) {
@@ -2964,6 +3065,20 @@ function scheduleHandwritingRecognition(reason) {
     paused: state.teachSessionPaused
   });
   if (!hasInk) return;
+  if (state.handwritingRequestInFlight) {
+    state.handwritingQueuedReason = reason;
+    state.handwritingQueuedMeta = {
+      sessionId: state.answerSessionId,
+      interactionSessionId: state.lectureSessionId,
+      questionId: question?.id || "",
+      boardVersion: getBoardVersion(question)
+    };
+    console.log("[handwriting] queued while another request is in flight", {
+      reason,
+      questionId: question?.id || ""
+    });
+    return;
+  }
   if (state.teachSessionPaused) {
     state.resumeHandwritingAfterNavigation = true;
     return;
@@ -2989,6 +3104,7 @@ function showPausedHandwritingNotice() {
 function explainHandwritingError(error) {
   const message = String(error?.message || "");
   const code = String(error?.code || "");
+  const stage = String(error?.stage || "");
   if (code === "insufficient_quota" || /quota|billing|额度不足|配额/.test(message)) {
     return {
       pill: "识别额度不足",
@@ -3010,11 +3126,39 @@ function explainHandwritingError(error) {
       pauseMs: 0
     };
   }
+  if (code === "empty_board_snapshot") {
+    return {
+      pill: "板书截图为空",
+      log: "这次没有拿到有效的板书截图，板书内容已保留；请继续写完后再停笔。",
+      pauseMs: 0
+    };
+  }
+  if (code === "question_memory_missing" || code === "question_memory_mismatch") {
+    return {
+      pill: "题目记忆未就绪",
+      log: "当前题目的 Question Memory 未建立或不匹配；板书识别已停止，且没有重新请求标准答案。请重新进入这道题。",
+      pauseMs: 0
+    };
+  }
   if (/Failed to fetch|NetworkError|fetch/i.test(message)) {
     return {
       pill: "识别服务未连接",
       log: "本地识别服务没有连上，请从 http://127.0.0.1:4173/index.html 打开页面。",
       pauseMs: 60 * 1000
+    };
+  }
+  if (code === "invalid_model_output") {
+    return {
+      pill: "模型返回格式异常",
+      log: `板书图片已送达 Qwen，但${stage ? `${stage}阶段` : "模型"}没有返回可解析的结构化结果；已保留本次板书，下一版板书会重新识别。`,
+      pauseMs: 0
+    };
+  }
+  if (code === "qwen_error" || code === "model_not_found" || code === "server_error") {
+    return {
+      pill: "板书服务返回异常",
+      log: `板书识别接口返回异常${error?.status ? `（HTTP ${error.status}）` : ""}：${message || "未知错误"}。这不是板书内容判错。`,
+      pauseMs: 0
     };
   }
   return {
@@ -3045,8 +3189,11 @@ async function runHandwritingRecognition(reason) {
     return;
   }
 
-  const requestId = ++state.handwritingRequestId;
-  const questionId = question.id;
+  const requestMeta = createHandwritingRequestMeta(question, "recognition");
+  const requestId = requestMeta.requestId;
+  const questionId = requestMeta.questionId;
+  const boardVersion = requestMeta.boardVersion;
+  beginHandwritingRequest(requestMeta);
   const recognitionInputSnapshot = getStudentInputSnapshot();
   const responseToken = getInteractionToken();
   saveCurrentPage();
@@ -3054,12 +3201,16 @@ async function runHandwritingRecognition(reason) {
   dom.recognitionPill.classList.remove("hidden");
 
   try {
-    const result = normalizeHandwritingResult(await requestHandwritingAnalysis(question, reason));
+    const result = normalizeHandwritingResult(
+      await requestHandwritingAnalysis(question, reason, requestMeta)
+    );
     if (
-      requestId !== state.handwritingRequestId ||
-      currentPageQuestion()?.id !== questionId ||
+      !isCurrentHandwritingRequest(requestMeta) ||
       !isCurrentInteraction(responseToken)
-    ) return;
+    ) {
+      rememberHandwritingRequestStatus(requestId, "stale");
+      return;
+    }
     if (skipStaleHandwritingFeedback("recognition-result", recognitionInputSnapshot)) return;
     state.latestHandwritingResult = result;
     state.lastHandwritingRecognizedAt = Date.now();
@@ -3074,63 +3225,115 @@ async function runHandwritingRecognition(reason) {
 
     if (isIncompleteHandwritingIssue(result)) {
       dom.recognitionPill.textContent = "等你写完";
-      maybeSpeakHandwritingGuidance(result);
+      if (result.writingState === "stalled" && String(result.guidance || "").trim()) {
+        maybeSpeakHandwritingGuidance(result);
+      }
       return;
     }
 
-    if (await maybeVerifyFinalAnswerFromHandwriting(result)) return;
-
-    if (await maybePromptSaveFromHandwriting(result)) return;
-
-    if (isIncompleteHandwritingIssue(result)) {
-      dom.recognitionPill.textContent = "等你写完";
-      maybeSpeakHandwritingGuidance(result);
-    } else if (isHandwritingCalculationWrong(result)) {
-      dom.recognitionPill.textContent = "发现需检查";
-      maybeSpeakHandwritingGuidance(result);
-    } else if (isHandwritingCalculationCorrect(result)) {
-      dom.recognitionPill.textContent = "板书看过了";
+    if (isHandwritingCalculationCorrect(result)) {
+      dom.recognitionPill.textContent = "板书已记录";
       clearIssueTracking();
       if (state.guideState === GUIDE_STATES.MICRO_HINT) setGuideState(GUIDE_STATES.HEURISTIC);
-      maybeSpeakHandwritingSuccess(result);
-    } else if (shouldAskForHandwritingConfirmation(result)) {
-      dom.recognitionPill.textContent = "需要确认";
-      maybeSpeakHandwritingUnclear(result);
     } else {
-      dom.recognitionPill.textContent = result.isRelevant ? "板书看过了" : "板书较少";
+      dom.recognitionPill.textContent = result.isRelevant ? "板书已记录" : "板书较少";
       if (result.isRelevant) {
         clearIssueTracking();
         if (state.guideState === GUIDE_STATES.MICRO_HINT) setGuideState(GUIDE_STATES.HEURISTIC);
       }
     }
   } catch (error) {
-    if (requestId !== state.handwritingRequestId || currentPageQuestion()?.id !== questionId) return;
+    if (
+      !isCurrentHandwritingRequest(requestMeta) ||
+      !isCurrentInteraction(responseToken)
+    ) {
+      rememberHandwritingRequestStatus(requestId, "stale");
+      return;
+    }
     console.warn("Handwriting recognition fallback:", error);
     const info = explainHandwritingError(error);
     dom.recognitionPill.textContent = info.pill;
-    addLog("提示", info.log);
+    addLog("提示", info.log, {
+      key: `handwriting-failure:${questionId}:${boardVersion}:${info.pill}`
+    });
     state.lastHandwritingServiceError = info.pill;
     if (info.pauseMs) state.handwritingDisabledUntil = Date.now() + info.pauseMs;
   } finally {
+    finishHandwritingRequest(requestMeta, isCurrentHandwritingRequest(requestMeta) ? "completed" : "stale");
     setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
+    const queuedReason = state.handwritingQueuedReason;
+    const queuedMeta = state.handwritingQueuedMeta;
+    state.handwritingQueuedReason = "";
+    state.handwritingQueuedMeta = null;
+    if (
+      queuedReason &&
+      queuedMeta?.sessionId === state.answerSessionId &&
+      queuedMeta?.interactionSessionId === state.lectureSessionId &&
+      queuedMeta?.questionId === currentPageQuestion()?.id &&
+      queuedMeta?.boardVersion === getBoardVersion(currentPageQuestion()) &&
+      currentPageQuestion() &&
+      hasCurrentBoardInk(currentPageQuestion())
+    ) {
+      state.recognitionTimer = setTimeout(
+        () => runHandwritingRecognition(queuedReason),
+        BOARD_RECOGNITION_DELAY_MS
+      );
+    }
   }
 }
 
-async function requestHandwritingAnalysis(question, reason) {
+async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
+  const requestStartedAt = Date.now();
+  const boardVersion = Number(requestMeta.boardVersion ?? getBoardVersion(question));
+  const requestId = Number(requestMeta.requestId || 0);
+  const sessionId = Number(requestMeta.sessionId ?? state.answerSessionId);
+  const questionMemory = await waitForEnteredQuestionMemory(question);
+  if (!questionMemory) {
+    const error = new Error("Question Memory 尚未在进入题目时建立，已停止本次板书识别");
+    error.code = "question_memory_missing";
+    error.stage = "question-memory";
+    throw error;
+  }
+  requestMeta.memoryId = questionMemory.memoryId || requestMeta.memoryId || "";
+  if (
+    sessionId !== state.answerSessionId ||
+    currentPageQuestion()?.id !== question.id ||
+    (requestId && !isCurrentHandwritingRequest(requestMeta))
+  ) {
+    const error = new Error("stale handwriting request");
+    error.code = "stale_request";
+    error.stage = "request-identity";
+    throw error;
+  }
   const boardOnlyImage = await createCurrentBoardOnlySnapshot();
-  const isCompletionCheck = /完成讲解前检查/.test(String(reason || ""));
-  const boardImage = isCompletionCheck ? await createCurrentBoardSnapshot() : "";
+  const boardIdleSeconds = Math.max(0, Math.round((Date.now() - (state.lastBoardWriteAt || Date.now())) / 1000));
+  const diagnostics = {
+    requestId,
+    sessionId,
+    memoryId: requestMeta.memoryId,
+    questionId: question.id,
+    boardVersion,
+    reason: String(reason || ""),
+    canvasWidth: Number(dom.canvas.width || 0),
+    canvasHeight: Number(dom.canvas.height || 0),
+    boardOnlyBytes: String(boardOnlyImage || "").length,
+    boardImageBytes: 0,
+    capturedAt: new Date().toISOString()
+  };
+  console.log("[handwriting] request snapshot", diagnostics);
   const response = await fetch("/api/handwriting", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      questionImage: question.image,
+      questionId: question.id,
+      sessionId,
+      requestId,
+      memoryId: requestMeta.memoryId,
+      questionMemory,
       boardOnlyImage,
-      ...(boardImage ? { boardImage } : {}),
       reason,
-      transcript: dom.transcriptInput.value.trim(),
-      problemText: question.problemText || "",
-      knowledgePoints: question.knowledgePoints || []
+      boardIdleSeconds,
+      handwritingDiagnostics: diagnostics
     })
   });
   const result = await response.json().catch(() => ({}));
@@ -3138,8 +3341,26 @@ async function requestHandwritingAnalysis(question, reason) {
     const error = new Error(result.error || "板书识别失败");
     error.code = result.code || "";
     error.status = response.status;
+    error.stage = result.stage || "";
     throw error;
   }
+  if (
+    (result.requestId != null && Number(result.requestId) !== requestId) ||
+    (result.sessionId != null && Number(result.sessionId) !== sessionId) ||
+    (result.questionId && String(result.questionId) !== String(question.id)) ||
+    (result.memoryId && String(result.memoryId) !== String(requestMeta.memoryId))
+  ) {
+    const error = new Error("handwriting response identity mismatch");
+    error.code = "stale_request";
+    error.stage = "response-identity";
+    throw error;
+  }
+  console.log("[handwriting] response", {
+    ...diagnostics,
+    elapsedMs: Date.now() - requestStartedAt,
+    calculationStatus: result.calculationStatus || "",
+    confidence: result.confidence ?? null
+  });
   state.handwritingDisabledUntil = 0;
   state.lastHandwritingServiceError = "";
   return result;
@@ -3155,20 +3376,27 @@ async function verifyCurrentBoardForCompletion(question) {
     };
   }
 
-  const requestId = ++state.handwritingRequestId;
-  const questionId = question.id;
+  const requestMeta = createHandwritingRequestMeta(question, "completion");
+  const requestId = requestMeta.requestId;
+  const questionId = requestMeta.questionId;
   const recognitionInputSnapshot = getStudentInputSnapshot();
   const responseToken = getInteractionToken();
   saveCurrentPage();
   dom.recognitionPill.textContent = "正在检查板书步骤";
   dom.recognitionPill.classList.remove("hidden");
 
+  const boardVersion = requestMeta.boardVersion;
+  beginHandwritingRequest(requestMeta);
+  try {
   const result = normalizeHandwritingResult(
-    await requestHandwritingAnalysis(question, "完成讲解前检查：判断板书是否至少包含一个与本题相关且正确的关键步骤")
+    await requestHandwritingAnalysis(
+      question,
+      "完成讲解前检查：判断板书是否至少包含一个与本题相关且正确的关键步骤",
+      requestMeta
+    )
   );
   if (
-    requestId !== state.handwritingRequestId ||
-    currentPageQuestion()?.id !== questionId ||
+    !isCurrentHandwritingRequest(requestMeta) ||
     !isCurrentInteraction(responseToken)
   ) {
     return { verified: false, stale: true, result: null, guidance: "题目已经切换，本次板书检查已取消。" };
@@ -3194,6 +3422,9 @@ async function verifyCurrentBoardForCompletion(question) {
     result,
     guidance: verified ? "" : getBoardCompletionGuidance(result)
   };
+  } finally {
+    finishHandwritingRequest(requestMeta, isCurrentHandwritingRequest(requestMeta) ? "completed" : "stale");
+  }
 }
 
 async function createCurrentBoardSnapshot() {
@@ -3255,6 +3486,7 @@ async function composeStrokeOcrSnapshot(strokesDataUrl) {
 
 function isIncompleteHandwritingIssue(result) {
   const text = [
+    result.writingState,
     result.calculationStatus,
     result.issueType,
     result.issueSummary,
@@ -3264,7 +3496,7 @@ function isIncompleteHandwritingIssue(result) {
   ]
     .filter(Boolean)
     .join(" ");
-  return /incomplete|不完整|没写完|未写完|还没|未完成|缺少|缺项|没有看到|只写出|继续写|补全|补上|放进/.test(text);
+  return /in_progress|stalled|incomplete|不完整|没写完|未写完|还没|未完成|缺少|缺项|没有看到|只写出|继续写|补全|补上|放进/.test(text);
 }
 
 function extractVariableAssignments(text) {
@@ -3326,23 +3558,49 @@ function normalizeHandwritingResult(result) {
   const confidence = Number(result.confidence);
   const normalized = {
     ...result,
+    writingState: String(result.writingState || "").trim(),
+    completedSteps: Array.isArray(result.completedSteps)
+      ? result.completedSteps.map((step) => String(step || "").trim()).filter(Boolean).slice(0, 8)
+      : [],
+    errorLocation: String(result.errorLocation || "").trim(),
+    errorEvidence: String(result.errorEvidence || "").trim(),
     boardComplete: result.boardComplete === true,
     missingBoardContent: String(result.missingBoardContent || "").trim(),
     confidence: Number.isFinite(confidence) ? confidence : 0
   };
 
   if (normalized.calculationStatus === "wrong") {
+    const explicitError = Boolean(
+      normalized.errorLocation &&
+      (normalized.errorEvidence || normalized.issueSummary) &&
+      normalized.confidence >= 0.72
+    );
+    if (!explicitError) {
+      return {
+        ...normalized,
+        calculationStatus: "unclear",
+        hasPossibleIssue: false,
+        issueType: "unclear",
+        issueSummary: "",
+        errorLocation: "",
+        errorEvidence: "",
+        expectedNextStep: "",
+        guidance: "",
+        positiveFeedback: "",
+        boardComplete: false,
+        confidence: Math.min(normalized.confidence || 0.5, 0.55)
+      };
+    }
     return {
       ...normalized,
       hasPossibleIssue: true,
       issueType: normalized.issueType && normalized.issueType !== "none" ? normalized.issueType : "wrong_number",
-      issueSummary: normalized.issueSummary || "板书中的计算或结论需要检查。",
-      expectedNextStep: normalized.expectedNextStep || "回到前面的关系式，重新核对等号后的结果。",
-      guidance: normalized.guidance || "我们一起检查一下最后这个结果，按前面的关系式再算一遍。",
+      issueSummary: normalized.issueSummary || normalized.errorEvidence,
+      expectedNextStep: normalized.expectedNextStep || "",
+      guidance: normalized.guidance || `先检查${normalized.errorLocation}：${normalized.errorEvidence || normalized.issueSummary}`,
       positiveFeedback: "",
       boardComplete: false,
-      missingBoardContent: normalized.missingBoardContent || "板书中的计算或最终结论还需要修正。",
-      confidence: Math.max(normalized.confidence, 0.65)
+      missingBoardContent: normalized.missingBoardContent || `需要修正${normalized.errorLocation}。`
     };
   }
 
@@ -3363,19 +3621,27 @@ function normalizeHandwritingResult(result) {
     ...normalized,
     calculationStatus: "wrong",
     hasPossibleIssue: true,
-    issueType: normalized.issueType && normalized.issueType !== "none" ? normalized.issueType : "wrong_number",
-    issueSummary: normalized.issueSummary || "板书中的结论和前面的比例式不一致。",
-    expectedNextStep: normalized.expectedNextStep || "按比例式交叉相乘，重新算等号后的 x 值。",
-    guidance: normalized.guidance || "我们一起检查一下最后这个 x 值，按前面的比例式交叉相乘再算一遍。",
+    issueType: normalized.issueType && normalized.issueType !== "none" ? normalized.issueType : "wrong_operation",
+    issueSummary: normalized.issueSummary || "同一未知量在板书中出现了不一致的结果。",
+    errorLocation: normalized.errorLocation || "同一未知量的两处赋值",
+    errorEvidence: normalized.errorEvidence || "板书中同一未知量出现了不同数值。",
+    expectedNextStep: "",
+    guidance: normalized.guidance || "先检查同一未知量的两处赋值：它们目前写成了不同数值。",
     positiveFeedback: "",
     boardComplete: false,
-    missingBoardContent: normalized.missingBoardContent || "板书中的计算与最终结论还没有一致。",
+    missingBoardContent: normalized.missingBoardContent || "需要先统一同一未知量的计算结果。",
     confidence: Math.max(normalized.confidence, 0.72)
   };
 }
 
 function isHandwritingCalculationWrong(result) {
-  return result?.calculationStatus === "wrong" || (result?.hasPossibleIssue && result.confidence >= 0.45);
+  return Boolean(
+    result?.calculationStatus === "wrong" &&
+    result?.hasPossibleIssue === true &&
+    Number(result?.confidence) >= 0.72 &&
+    String(result?.errorLocation || "").trim() &&
+    String(result?.errorEvidence || result?.issueSummary || "").trim()
+  );
 }
 
 function isHandwritingCalculationCorrect(result) {
@@ -3389,7 +3655,7 @@ function isHandwritingCalculationCorrect(result) {
 
 function isBoardCompletionVerified(result) {
   return Boolean(
-    ["double-verified", "structured-single-pass"].includes(result?.answerVerification) &&
+    ["double-verified", "structured-single-pass", "question-memory"].includes(result?.answerVerification) &&
     result?.boardComplete === true &&
     result?.isRelevant === true &&
     result?.calculationStatus === "correct" &&
@@ -3500,7 +3766,7 @@ function hasReviewableBoardStep(result) {
 
 function shouldPromptSaveFromHandwriting(result) {
   return Boolean(
-    ["double-verified", "structured-single-pass"].includes(result?.answerVerification) &&
+    ["double-verified", "structured-single-pass", "question-memory"].includes(result?.answerVerification) &&
     result?.isRelevant === true &&
     isHandwritingCalculationCorrect(result) &&
     hasReviewableBoardStep(result)
@@ -3683,6 +3949,7 @@ function maybeSpeakHandwritingGuidance(result) {
   if (hasStudentInputSinceHandwritingRecognition()) return false;
   const now = Date.now();
   if (isIncompleteHandwritingIssue(result) && hasHandwritingProgressForGuidance(result)) {
+    if (result.writingState !== "stalled") return false;
     const issueKey = `incomplete:${result.expectedNextStep || result.missingBoardContent || result.mathExpression || result.detectedWriting || ""}`
       .replace(/\s+/g, "")
       .slice(0, 140);
@@ -3704,19 +3971,15 @@ function maybeSpeakHandwritingGuidance(result) {
     return false;
   }
 
+  if (!isHandwritingCalculationWrong(result)) return false;
   const issue = registerPossibleIssue(result);
   if (issue.escalated) return true;
   if (issue.duplicate) return false;
 
   state.lastHandwritingIssueKey = issue.issueKey;
   state.lastHandwritingGuideAt = now;
-  const guidance =
-    result.guidance ||
-    pickPrompt("handwriting-issue", [
-      "这里先停一下，我们检查刚写的数量关系。",
-      "先回头看一眼这一步，刚才的数量关系需要再核一下。",
-      "我们先把这一行检查一遍，看看各个量是不是对应得上。"
-    ]);
+  const guidance = String(result.guidance || "").trim();
+  if (!guidance) return false;
   lianSpeak(guidance, { dedupeKey: `handwriting-issue:${issue.issueKey}` });
   return true;
 }
@@ -6049,11 +6312,19 @@ async function saveCurrentQuestionAndContinue(options = {}) {
 
   let record = null;
   try {
-    record = await buildNotebookRecord(question);
+    const enrichmentInput = {
+      pages: pagesForQuestion(question.id),
+      boardImage: getBoardImageForGuide(),
+      lectureText: getNotebookLectureText(),
+      latestHandwritingResult: state.latestHandwritingResult
+    };
+    record = buildNotebookRecord(question);
     state.notebook.unshift(record);
     state.completedThisSession.push(record);
     state.completedLectureQuestionIds.add(question.id);
     saveNotebook();
+    // Do not block moving to the next question on remote enrichment.
+    void enrichNotebookRecord(record.id, question, enrichmentInput);
   } catch (error) {
     console.warn("Notebook save failed:", error);
     if (record) state.completedThisSession = state.completedThisSession.filter((item) => item.id !== record.id);
@@ -6220,7 +6491,7 @@ function dedupeMistakePoints(points = [], lianSummary = "") {
   return unique.slice(0, 4);
 }
 
-async function requestArchiveSummary(question, lectureText, boardImage) {
+async function requestArchiveSummary(question, lectureText, boardImage, latestHandwritingResult = state.latestHandwritingResult) {
   const response = await fetch("/api/archive-summary", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -6232,7 +6503,7 @@ async function requestArchiveSummary(question, lectureText, boardImage) {
       knowledgePoints: question.knowledgePoints || [],
       lectureText,
       verifiedFinalAnswer: state.verifiedFinalAnswerText || "",
-      latestHandwritingResult: state.latestHandwritingResult || null
+      latestHandwritingResult: latestHandwritingResult || null
     })
   });
   const result = await response.json().catch(() => ({}));
@@ -6278,16 +6549,12 @@ function buildReviewPlan(fromDate = new Date()) {
   });
 }
 
-async function buildNotebookRecord(question) {
-  const pages = pagesForQuestion(question.id);
-  const strokeImages = await compactStrokePages(pages);
+function buildNotebookRecord(question) {
   const lectureText = getNotebookLectureText();
   const now = new Date();
   const reviewAt = new Date(now.getTime() + 4 * 60 * 60 * 1000);
-  const boardImage = getBoardImageForGuide();
   const verifiedAnswerKey =
-    state.answerKeysByQuestion[question.id] ||
-    (await prefetchVerifiedAnswerKey(question)) ||
+    state.questionMemoriesByQuestion[question.id] ||
     {
       ready: false,
       status: "not-fetched",
@@ -6297,7 +6564,7 @@ async function buildNotebookRecord(question) {
       solutionOutline: [],
       verificationChecks: []
     };
-  let archiveSummary = {
+  const archiveSummary = {
     lianSummary: buildLianArchiveSummary(question, lectureText),
     mistakePoints: buildMistakePoints(question, lectureText),
     observedWrongTrace: "",
@@ -6306,12 +6573,6 @@ async function buildNotebookRecord(question) {
     archiveModel: "",
     archiveConfidence: 0
   };
-  try {
-    const generated = await requestArchiveSummary(question, lectureText, boardImage);
-    if (generated.lianSummary && generated.mistakePoints.length) archiveSummary = generated;
-  } catch (error) {
-    console.warn("Archive summary fallback:", error);
-  }
   const reviewPlan = buildReviewPlan(now);
 
   return {
@@ -6319,7 +6580,7 @@ async function buildNotebookRecord(question) {
     sourceQuestionId: question.id,
     title: `错题 ${state.notebook.length + 1}`,
     questionImage: question.image,
-    strokeImages,
+    strokeImages: [],
     lectureText,
     transcript: lectureText,
     answerKey: verifiedAnswerKey,
@@ -6341,14 +6602,57 @@ async function buildNotebookRecord(question) {
   };
 }
 
+async function enrichNotebookRecord(recordId, question, input = {}) {
+  try {
+    const lectureText = String(input.lectureText || "").trim();
+    const answerKeyPromise = waitForEnteredQuestionMemory(question).catch((error) => {
+      console.warn("Notebook Question Memory enrichment skipped:", error);
+      return null;
+    });
+    const archivePromise = requestArchiveSummary(
+      question,
+      lectureText,
+      input.boardImage,
+      input.latestHandwritingResult
+    ).catch((error) => {
+      console.warn("Archive summary enrichment skipped:", error);
+      return null;
+    });
+    const strokePromise = compactStrokePages(Array.isArray(input.pages) ? input.pages : []).catch((error) => {
+      console.warn("Notebook stroke enrichment skipped:", error);
+      return [];
+    });
+    const [verifiedAnswerKey, archiveSummary, strokeImages] = await Promise.all([
+      answerKeyPromise,
+      archivePromise,
+      strokePromise
+    ]);
+    const record = state.notebook.find((item) => item.id === recordId);
+    if (!record) return;
+    if (verifiedAnswerKey) {
+      record.answerKey = verifiedAnswerKey;
+      record.verifiedAnswer = verifiedAnswerKey.ready
+        ? verifiedAnswerKey.canonicalAnswer
+        : state.verifiedFinalAnswerText;
+      record.answerKeyStatus = verifiedAnswerKey.status;
+      record.answerKeyConfidence = verifiedAnswerKey.confidence;
+    }
+    if (archiveSummary?.lianSummary && archiveSummary.mistakePoints?.length) {
+      Object.assign(record, archiveSummary);
+    }
+    if (strokeImages.length) record.strokeImages = strokeImages;
+    record.updatedAt = new Date().toISOString();
+    saveNotebook();
+    if (views.notebookView?.classList.contains("active")) renderNotebook();
+  } catch (error) {
+    console.warn("Notebook background enrichment failed:", error);
+  }
+}
+
 async function compactStrokePages(pages) {
   const nonEmptyPages = pages.filter(Boolean);
-  const results = [];
-  for (const page of nonEmptyPages) {
-    const compacted = await compactStrokeImage(page);
-    if (compacted) results.push(compacted);
-  }
-  return results;
+  const results = await Promise.all(nonEmptyPages.map((page) => compactStrokeImage(page)));
+  return results.filter(Boolean);
 }
 
 async function compactStrokeImage(dataUrl) {

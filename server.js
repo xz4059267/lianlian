@@ -162,6 +162,9 @@ const ocrCache = new Map();
 const segmentCache = new Map();
 const answerKeyCache = new Map();
 const answerKeyInflight = new Map();
+const questionMemoryIdentityRegistry = new Map();
+const handwritingRequestRegistry = new Map();
+const REQUEST_REGISTRY_LIMIT = 2048;
 let paddleOcrService = null;
 let paddleOcrRequestId = 0;
 let paddleLayoutService = null;
@@ -205,8 +208,8 @@ const HANDWRITING_CONSISTENCY_RULES = [
   "Use latestHandwritingResult as the freshest structured reading of the current board.",
   "Never praise, correct, or extend an equation, variable, answer, or method that is not supported by the current question, current board image, latestHandwritingResult, or the student's latest speech.",
   "If latestHandwritingResult.calculationStatus is wrong, guide from its guidance, issueSummary, or expectedNextStep. State the specific mismatch briefly and do not replace it with an unrelated old equation.",
-  "If latestHandwritingResult.calculationStatus is correct, do not claim that the visible step is wrong. Give concise content-based encouragement or ask for the next relevant step.",
-  "If calculationStatus is unclear or incomplete, avoid definitive claims about correctness and ask the student to continue or restate the latest visible relation.",
+  "If latestHandwritingResult.calculationStatus is correct, do not interrupt solely to praise it. Only respond when another user event already requires a response, and ground that response in completedSteps.",
+  "If calculationStatus is unclear or incomplete, avoid definitive claims and do not interrupt unless the student explicitly asks for help or is already in a stalled/silence event.",
   "The board has higher priority than speech for mathematical judgment. When board evidence and speech conflict, use the latest board status to judge the written calculation; use speech only to understand the student's intended explanation.",
   "If hasBoardInk is false, speech alone is not evidence that any question's step or final answer is correct, including choice questions. Ask the student to write the key relation, option, or calculation on the board before checking it.",
   "If boardPendingRecognition is true, the board may have changed after the last recognition. Do not make a definitive judgment about the new strokes; ask the student to continue while recognition updates.",
@@ -364,25 +367,20 @@ const LECTURE_COMPLETION_RULES = [
 ].join("\n");
 
 const HANDWRITING_PROMPT = [
-  "你是初中数学黑板板书的异步辅助识别器。",
-  "你会同时看到当前题目图片和学生黑板板书截图。",
-  "任务是识别学生写下的关键公式、数字、等式、结论，并结合题目条件进行一次数学核算。",
-  "先读题目条件和学生板书，再计算或验算学生写出的关系式、推导和结论是否成立；不要只做文字转写。",
-  "你会看到多个图片来源：题目图片、纯板书截图、包含题目区域的板书截图。它们互相补充，若纯板书截图有字迹遮挡，可参考合成截图；若合成截图混入题目印刷内容，以纯板书和题意为准。",
-  "例如板书写出 2/3 = x/6 且结论 x=4 时，需要实际验算比例关系是否能推出这个结果。",
-  "如果板书写出 2/3 = x/6 但最后结论写成 x=-2，必须判为 calculationStatus=\"wrong\"，因为由 2/3 = x/6 应推出 x=4。",
-  "如果能看出学生写了等式、比例式或 x/y 的结论，就要尽量判断 correct 或 wrong；只有关键数字/符号确实看不出时，才返回 unclear。",
-  "必须优先以纯板书截图判断学生写了什么；题目图片和包含题目区域的截图只用于理解题目，不能把题目原图里的答案、红叉、批改痕迹或印刷文字当成学生板书。",
-  "判断 correct 必须同时满足：学生写出的关键关系式成立，且学生最后写出的结论/答案也与关系式和题意一致。只要最后结论错，就必须 hasPossibleIssue=true。",
-  "不要做逐笔批改，不要因为字迹潦草就判错；只在数学关系、关键数字、符号或结论明显不合理时标记 hasPossibleIssue=true。",
-  "如果核算正确，calculationStatus=\"correct\"，hasPossibleIssue=false，并在 positiveFeedback 写一句贴着内容的短鼓励，避免固定说“很好/很棒”。",
-  "如果核算错误，calculationStatus=\"wrong\"，hasPossibleIssue=true，guidance 要转成恋恋可以说出口的温和检查提醒，不要直接说“你错了”。",
-  "如果学生只是还没写完、只写出一部分比例/方程、缺少后续项，不能判为错误：hasPossibleIssue=false，guidance 置空或只说明继续观察。",
+  "你是初中数学黑板板书的异步观察器，只负责识别和分析学生当前写下的内容。",
+  "你只会看到纯板书截图；题目、正确答案、标准步骤和知识点只能读取输入中的 questionMemory，不得重新分析题目图片。",
+  "你的职责只有四项：忠实转写可见笔迹；判断当前书写状态；列出学生已经明确完成且在板书上可见的步骤；定位明确错误。",
+  "禁止重新解整道题、禁止生成新的完整答案、禁止根据学生零散板书反推出未写出的步骤或最终答案。",
+  "detectedWriting 和 mathExpression 必须忠实对应板书；completedSteps 只能包含板书上已经出现并可辨认的步骤，不能补齐 Question Memory 中但学生没写的内容。",
+  "判断某个可见步骤是否正确时，只能与 questionMemory 中的题意、答案、标准步骤和核验点比较。Question Memory 不足时返回 unclear，不能自行解题补足。",
+  "writingState=in_progress 表示学生显然还在写或只完成部分步骤；只有输入显示长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
+  "只有能指出具体 errorLocation，并能在 errorEvidence 中说明可见数字、符号、运算或结论与 Question Memory 的明确冲突时，才返回 calculationStatus=wrong。",
+  "可见步骤与 Question Memory 一致时返回 correct，但这只说明已经写出的步骤成立，不代表学生完成了整道题，也不得推断后续答案。",
+  "不要生成鼓励、提示、讲解或下一步建议；反馈由板书观察之后的独立流程生成。",
   "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
-  "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；学生可以在口头讲解中给出最终答案。比如正确写出 2:3=x:6，即使没有继续写 3x=12 和 x=4，boardComplete 也应为 true。",
+  "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；只要一个可见关键关系或计算步骤与 Question Memory 一致，就可以作为可核验步骤。",
   "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
-  "guidance 应指出需要检查的位置或关系，并给一个很小的下一步，例如“圆周角/圆心角”“360 度乘几分之几”“等号后面的数”。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");
 
@@ -571,7 +569,17 @@ const handwritingSchema = {
       },
       mathExpression: {
         type: "string",
-        description: "Main formula, relation, or conclusion inferred from the board."
+        description: "Faithful normalized transcription of the main visible formula, relation, or conclusion."
+      },
+      writingState: {
+        type: "string",
+        enum: ["in_progress", "stalled", "complete", "unclear", "not_relevant"],
+        description: "The student's current visible writing state. Do not mark stalled from an ordinary short pause."
+      },
+      completedSteps: {
+        type: "array",
+        items: { type: "string" },
+        description: "Only steps explicitly visible and already completed on the board. Never infer missing steps."
       },
       isRelevant: {
         type: "boolean",
@@ -580,11 +588,11 @@ const handwritingSchema = {
       calculationStatus: {
         type: "string",
         enum: ["not_relevant", "incomplete", "unclear", "correct", "wrong"],
-        description: "Result of checking the student's visible math against the problem."
+        description: "Result of comparing only the student's visible work with Question Memory."
       },
       calculationCheck: {
         type: "string",
-        description: "Short private explanation of the verification or calculation performed."
+        description: "Short private note comparing visible work with Question Memory, without solving missing work."
       },
       hasPossibleIssue: {
         type: "boolean",
@@ -599,17 +607,13 @@ const handwritingSchema = {
         type: "string",
         description: "Short private summary of the issue."
       },
-      expectedNextStep: {
+      errorLocation: {
         type: "string",
-        description: "A small next step or relation the student should check."
+        description: "Exact visible line, expression, number, or symbol where a definite error occurs. Empty unless wrong."
       },
-      guidance: {
+      errorEvidence: {
         type: "string",
-        description: "Warm Chinese guidance Lian can speak. Avoid saying the student is wrong directly."
-      },
-      positiveFeedback: {
-        type: "string",
-        description: "Short Chinese feedback Lian can speak when calculationStatus is correct. Keep empty otherwise."
+        description: "Concise evidence for the error based on visible writing and Question Memory. Empty unless wrong."
       },
       boardComplete: {
         type: "boolean",
@@ -627,15 +631,16 @@ const handwritingSchema = {
     required: [
       "detectedWriting",
       "mathExpression",
+      "writingState",
+      "completedSteps",
       "isRelevant",
       "calculationStatus",
       "calculationCheck",
       "hasPossibleIssue",
       "issueType",
       "issueSummary",
-      "expectedNextStep",
-      "guidance",
-      "positiveFeedback",
+      "errorLocation",
+      "errorEvidence",
       "boardComplete",
       "missingBoardContent",
       "confidence"
@@ -659,13 +664,10 @@ const handwritingAuditSchema = {
         enum: ["not_relevant", "incomplete", "unclear", "correct", "wrong"],
         description: "The audited calculation status."
       },
-      correctedFeedback: {
-        type: "string",
-        description: "Short Chinese feedback to use when the board is correct. Empty otherwise."
-      },
-      correctedGuidance: {
-        type: "string",
-        description: "Short Chinese guidance to use when the board is wrong or incomplete. Empty otherwise."
+      completedSteps: {
+        type: "array",
+        items: { type: "string" },
+        description: "Audited list of steps that are explicitly visible and completed."
       },
       correctedCheck: {
         type: "string",
@@ -679,6 +681,14 @@ const handwritingAuditSchema = {
       issueSummary: {
         type: "string",
         description: "Short private summary of the concrete issue, if any."
+      },
+      errorLocation: {
+        type: "string",
+        description: "Audited exact visible error location. Empty unless correctedStatus is wrong."
+      },
+      errorEvidence: {
+        type: "string",
+        description: "Audited evidence from visible writing and Question Memory. Empty unless wrong."
       },
       boardComplete: {
         type: "boolean",
@@ -700,11 +710,12 @@ const handwritingAuditSchema = {
     required: [
       "safeToSpeak",
       "correctedStatus",
-      "correctedFeedback",
-      "correctedGuidance",
+      "completedSteps",
       "correctedCheck",
       "issueType",
       "issueSummary",
+      "errorLocation",
+      "errorEvidence",
       "boardComplete",
       "missingBoardContent",
       "confidence",
@@ -714,15 +725,14 @@ const handwritingAuditSchema = {
 };
 
 const HANDWRITING_AUDIT_PROMPT = [
-  "你是初中数学板书反馈的审校员。",
-  "你的任务不是重新长篇讲题，而是检查初次板书识别结果是否可以安全说给学生听。",
-  "你会看到当前题目图片、纯板书截图、可能包含题目区域的板书截图、已双重核验的标准答案，以及初次板书判断。",
-  "必须只基于当前题目图片和当前板书，不要套用历史题目、旧答案、旧比例式或上一题上下文。",
-  "题目原图里的红叉、批改笔迹、印刷答案、旧手写痕迹不能当成学生当前黑板板书；当前黑板板书以纯板书截图为准。",
-  "如果初次结果说 correct，但板书中的关键式子或最终答案与标准答案/题意不一致，必须改为 wrong 或 unclear。",
-  "如果初次结果说 wrong，但你不能明确指出哪一个数字、符号、等式或结论与题意冲突，必须降级为 unclear 或 incomplete，不能误导学生。",
+  "你是初中数学板书观察结果的安全审校员，不负责重新解题或生成教学反馈。",
+  "你只会看到纯板书截图、Question Memory 和初次板书观察；禁止要求或分析题目图片。",
+  "题意、答案、标准步骤和知识点只能来自 Question Memory，不得根据板书重新推导完整答案或补写学生没有写出的步骤。",
+  "completedSteps 只能保留板书上明确可见且已经完成的步骤。",
+  "如果初次结果说 correct，但可见步骤与 Question Memory 不一致，必须改为 wrong 或 unclear。",
+  "如果初次结果说 wrong，但不能同时给出具体 errorLocation 和可核对的 errorEvidence，必须降级为 unclear 或 incomplete。",
   "如果板书已经包含本题相关且数学上成立的关键式子、推理、代入、计算步骤或正确结论，就可以 boardComplete=true；不要求完整抄出所有步骤。",
-  "如果只有孤立答案、看不出关键关系式，boardComplete=false；如果答案正确但缺少关键式子，要提示补一个关键关系式。",
+  "如果只有孤立答案或看不出关键关系式，boardComplete=false；只记录缺少什么，不生成提示话术。",
   "输出必须严格 JSON，不要输出 Markdown 或 JSON 外文字。"
 ].join("\n");
 
@@ -2372,8 +2382,17 @@ async function callDeepSeekJson({ model, content, schema, instructions, maxOutpu
     throw error;
   }
 
-  const parsed = parseModelJson(extractDeepSeekText(data));
+  const rawText = extractDeepSeekText(data);
+  const parsed = parseModelJson(rawText);
   if (!parsed) {
+    console.warn("[qwen] invalid structured output", {
+      model,
+      schema: schema?.name || "",
+      responseKeys: Object.keys(data || {}),
+      choiceCount: Array.isArray(data?.choices) ? data.choices.length : 0,
+      finishReason: data?.choices?.[0]?.finish_reason || "",
+      textLength: String(rawText || "").length
+    });
     const error = new Error("DeepSeek 没有返回可解析的结构化结果");
     error.statusCode = 502;
     error.code = "invalid_model_output";
@@ -2463,6 +2482,13 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true) {
   if (!response.ok) {
     const rawMessage = data.error?.message || `Qwen 多模态 API 请求失败：${response.status}`;
     const rawCode = data.error?.code || data.error?.type || "qwen_error";
+    console.warn("[qwen] http failure", {
+      status: response.status,
+      code: rawCode,
+      message: rawMessage,
+      model: payload.model,
+      useJsonFormat
+    });
     const friendlyMessage =
       rawCode === "access_denied"
         ? "Qwen API 访问被拒绝，请确认 .env 里的 Qwen_api_key 是阿里云百炼 API Key，并已开通对应多模态模型权限。"
@@ -2516,14 +2542,55 @@ async function callQwenMultimodalJson({ model, content, schema, instructions, ma
     data = await requestQwenChatCompletion(payload, false);
   }
 
-  const parsed = parseModelJson(extractDeepSeekText(data));
+  const rawText = extractDeepSeekText(data);
+  const parsed = parseModelJson(rawText);
   if (!parsed) {
+    console.warn("[qwen] invalid structured output", {
+      model,
+      schema: schema?.name || "",
+      responseKeys: Object.keys(data || {}),
+      choiceCount: Array.isArray(data?.choices) ? data.choices.length : 0,
+      finishReason: data?.choices?.[0]?.finish_reason || "",
+      textLength: String(rawText || "").length
+    });
     const error = new Error("Qwen 多模态模型没有返回可解析的结构化结果");
     error.statusCode = 502;
     error.code = "invalid_model_output";
     throw error;
   }
   return parsed;
+}
+
+function summarizeHandwritingDiagnostics(diagnostics = {}) {
+  return {
+    requestId: Number(diagnostics.requestId || 0),
+    sessionId: Number(diagnostics.sessionId || 0),
+    memoryId: String(diagnostics.memoryId || ""),
+    questionId: String(diagnostics.questionId || ""),
+    boardVersion: Number(diagnostics.boardVersion || 0),
+    reason: String(diagnostics.reason || "").slice(0, 120),
+    canvasWidth: Number(diagnostics.canvasWidth || 0),
+    canvasHeight: Number(diagnostics.canvasHeight || 0),
+    boardOnlyBytes: Number(diagnostics.boardOnlyBytes || 0),
+    boardImageBytes: Number(diagnostics.boardImageBytes || 0),
+    capturedAt: String(diagnostics.capturedAt || "")
+  };
+}
+
+async function callHandwritingQwenJson(options, diagnostics = {}) {
+  try {
+    return await callQwenMultimodalJson(options);
+  } catch (error) {
+    error.stage = error.stage || "handwriting-model";
+    console.warn("[handwriting] model request failed", {
+      ...summarizeHandwritingDiagnostics(diagnostics),
+      stage: error.stage,
+      code: error.code || "",
+      status: error.statusCode || error.status || 0,
+      message: error.message || String(error)
+    });
+    throw error;
+  }
 }
 
 function sanitizeKnowledge(value) {
@@ -7162,6 +7229,31 @@ function privateAnswerReference(answerKey) {
   };
 }
 
+function privateQuestionMemoryReference(answerKey) {
+  if (!answerKey?.trusted) {
+    return {
+      ready: false,
+      status: answerKey?.status || "question-memory-unavailable",
+      instruction: "Question Memory 不完整。只能转写板书并返回 unclear/incomplete，禁止自行解题或判断对错。"
+    };
+  }
+  return {
+    ready: true,
+    status: answerKey.status || "question-memory-ready",
+    questionText: answerKey.problemText || "",
+    questionType: answerKey.questionType || "",
+    knowledgePoints: [answerKey.knowledge].filter(Boolean),
+    answer: {
+      canonicalAnswer: answerKey.canonicalAnswer,
+      acceptedAnswers: answerKey.acceptedAnswers,
+      choiceAnalysis: normalizeChoiceAnalysis(answerKey.choiceAnalysis)
+    },
+    standardSteps: Array.isArray(answerKey.solutionOutline) ? answerKey.solutionOutline : [],
+    verificationChecks: Array.isArray(answerKey.verificationChecks) ? answerKey.verificationChecks : [],
+    instruction: "这是唯一题目依据。只比较学生已经写出的可见步骤，不得重解题目、补全步骤或反推完整答案。"
+  };
+}
+
 function makeUnavailableAnswerKey(error, status = "answer-key-unavailable") {
   return {
     trusted: false,
@@ -7177,6 +7269,163 @@ function makeUnavailableAnswerKey(error, status = "answer-key-unavailable") {
     studentTrace: null,
     reason: error?.message || "standard answer service unavailable",
     elapsedMs: 0
+  };
+}
+
+function requestRegistryKey(sessionId, questionId) {
+  return `${String(sessionId || "")}:${String(questionId || "")}`;
+}
+
+function questionMemoryFingerprint(questionMemory) {
+  if (!questionMemory || typeof questionMemory !== "object") return "";
+  return JSON.stringify({
+    questionId: String(questionMemory.questionId || ""),
+    ready: Boolean(questionMemory.ready),
+    canonicalAnswer: String(questionMemory.canonicalAnswer || ""),
+    acceptedAnswers: Array.isArray(questionMemory.acceptedAnswers) ? questionMemory.acceptedAnswers : [],
+    choiceAnalysis: questionMemory.choiceAnalysis || null,
+    solutionOutline: Array.isArray(questionMemory.solutionOutline) ? questionMemory.solutionOutline : [],
+    verificationChecks: Array.isArray(questionMemory.verificationChecks) ? questionMemory.verificationChecks : []
+  });
+}
+
+function registerQuestionMemoryIdentity(sessionId, questionId, memoryId, fingerprint = "") {
+  const normalizedSessionId = String(sessionId || "").trim();
+  const normalizedQuestionId = String(questionId || "").trim();
+  const normalizedMemoryId = String(memoryId || "").trim();
+  if (!normalizedSessionId || !normalizedQuestionId || !normalizedMemoryId) {
+    const error = new Error("Question Memory identity is required");
+    error.statusCode = 409;
+    error.code = "question_memory_identity_missing";
+    throw error;
+  }
+  const key = requestRegistryKey(normalizedSessionId, normalizedQuestionId);
+  const previous = questionMemoryIdentityRegistry.get(key);
+  const normalizedFingerprint = String(fingerprint || "");
+  if (previous && previous.memoryId !== normalizedMemoryId) {
+    const error = new Error("Question Memory identity conflict");
+    error.statusCode = 409;
+    error.code = "question_memory_conflict";
+    throw error;
+  }
+  if (previous?.fingerprint && normalizedFingerprint && previous.fingerprint !== normalizedFingerprint) {
+    const error = new Error("Question Memory content conflict");
+    error.statusCode = 409;
+    error.code = "question_memory_conflict";
+    throw error;
+  }
+  questionMemoryIdentityRegistry.set(key, {
+    memoryId: normalizedMemoryId,
+    fingerprint: previous?.fingerprint || normalizedFingerprint
+  });
+  while (questionMemoryIdentityRegistry.size > REQUEST_REGISTRY_LIMIT) {
+    questionMemoryIdentityRegistry.delete(questionMemoryIdentityRegistry.keys().next().value);
+  }
+  return normalizedMemoryId;
+}
+
+function registerHandwritingRequest(sessionId, questionId, requestId) {
+  const normalizedRequestId = Number(requestId || 0);
+  if (!normalizedRequestId) {
+    const error = new Error("handwriting requestId is required");
+    error.statusCode = 400;
+    error.code = "request_id_missing";
+    throw error;
+  }
+  const key = requestRegistryKey(sessionId, questionId);
+  const previous = Number(handwritingRequestRegistry.get(key) || 0);
+  if (normalizedRequestId < previous) {
+    const error = new Error("stale handwriting request");
+    error.statusCode = 409;
+    error.code = "stale_request";
+    throw error;
+  }
+  handwritingRequestRegistry.set(key, normalizedRequestId);
+  while (handwritingRequestRegistry.size > REQUEST_REGISTRY_LIMIT) {
+    handwritingRequestRegistry.delete(handwritingRequestRegistry.keys().next().value);
+  }
+  return normalizedRequestId;
+}
+
+function isLatestHandwritingRequest(sessionId, questionId, requestId) {
+  return Number(handwritingRequestRegistry.get(requestRegistryKey(sessionId, questionId)) || 0) === Number(requestId || 0);
+}
+
+function buildQuestionMemory(questionId, answerKey = {}, memoryId = "", sessionId = 0) {
+  const ready = Boolean(answerKey.trusted);
+  return {
+    version: 1,
+    memoryId: String(memoryId || ""),
+    sessionId: Number(sessionId || 0),
+    questionId: String(questionId || ""),
+    ready,
+    status: String(answerKey.status || (ready ? "ready" : "unverified")),
+    confidence: ready ? Number(answerKey.confidence) || 0 : 0,
+    canonicalAnswer: ready ? String(answerKey.canonicalAnswer || "").trim() : "",
+    acceptedAnswers: ready && Array.isArray(answerKey.acceptedAnswers) ? answerKey.acceptedAnswers : [],
+    choiceAnalysis: ready ? normalizeChoiceAnalysis(answerKey.choiceAnalysis) : {
+      options: [],
+      statementVerdicts: [],
+      selectedOption: "",
+      selectedOptionText: ""
+    },
+    problemText: ready ? String(answerKey.problemText || "").trim() : "",
+    questionType: ready ? String(answerKey.questionType || "").trim() : "",
+    knowledge: ready ? String(answerKey.knowledge || "").trim() : "",
+    solutionOutline: ready && Array.isArray(answerKey.solutionOutline) ? answerKey.solutionOutline : [],
+    verificationChecks: ready && Array.isArray(answerKey.verificationChecks) ? answerKey.verificationChecks : [],
+    studentTrace: ready ? answerKey.studentTrace || null : null,
+    reason: String(answerKey.reason || "").trim(),
+    elapsedMs: Number(answerKey.elapsedMs) || 0,
+    provider: "qwen-structured-single-pass-question-memory",
+    createdAt: new Date().toISOString()
+  };
+}
+
+function questionMemoryToAnswerKey(questionMemory, expectedQuestionId = "", expectedMemoryId = "") {
+  if (!questionMemory || typeof questionMemory !== "object") {
+    const error = new Error("缺少进入题目时生成的 Question Memory，板书识别不会重新获取标准答案");
+    error.statusCode = 409;
+    error.code = "question_memory_missing";
+    error.stage = "question-memory";
+    throw error;
+  }
+
+  const memoryQuestionId = String(questionMemory.questionId || "");
+  if (expectedQuestionId && memoryQuestionId !== String(expectedQuestionId)) {
+    const error = new Error("Question Memory 与当前题目不匹配");
+    error.statusCode = 409;
+    error.code = "question_memory_mismatch";
+    error.stage = "question-memory";
+    throw error;
+  }
+
+  if (expectedMemoryId && String(questionMemory.memoryId || "") !== String(expectedMemoryId)) {
+    const error = new Error("Question Memory identity mismatch");
+    error.statusCode = 409;
+    error.code = "question_memory_conflict";
+    error.stage = "question-memory";
+    throw error;
+  }
+
+  const trusted = Boolean(questionMemory.ready);
+  return {
+    trusted,
+    status: String(questionMemory.status || (trusted ? "question-memory-ready" : "question-memory-unavailable")),
+    confidence: trusted ? Number(questionMemory.confidence) || 0 : 0,
+    canonicalAnswer: trusted ? String(questionMemory.canonicalAnswer || "").trim() : "",
+    acceptedAnswers: trusted && Array.isArray(questionMemory.acceptedAnswers) ? questionMemory.acceptedAnswers : [],
+    choiceAnalysis: trusted ? normalizeChoiceAnalysis(questionMemory.choiceAnalysis) : normalizeChoiceAnalysis(null),
+    problemText: trusted ? String(questionMemory.problemText || "").trim() : "",
+    questionType: trusted ? String(questionMemory.questionType || "").trim() : "",
+    knowledge: trusted ? String(questionMemory.knowledge || "").trim() : "",
+    solutionOutline: trusted && Array.isArray(questionMemory.solutionOutline) ? questionMemory.solutionOutline : [],
+    verificationChecks: trusted && Array.isArray(questionMemory.verificationChecks)
+      ? questionMemory.verificationChecks
+      : [],
+    studentTrace: trusted ? questionMemory.studentTrace || null : null,
+    reason: String(questionMemory.reason || "").trim(),
+    elapsedMs: Number(questionMemory.elapsedMs) || 0
   };
 }
 
@@ -7650,10 +7899,15 @@ function applyLatestHandwritingConsistency(result, body = {}) {
   }
 
   if (status === "wrong") {
+    const hasExplicitError = Boolean(
+      String(handwriting.errorLocation || "").trim() &&
+      String(handwriting.errorEvidence || handwriting.issueSummary || "").trim() &&
+      Number(handwriting.confidence) >= 0.72
+    );
     const correction = String(
       handwriting.guidance || handwriting.expectedNextStep || handwriting.issueSummary || ""
     ).trim();
-    if (correction) {
+    if (hasExplicitError && correction) {
       return {
         ...output,
         shouldSpeak: true,
@@ -7669,10 +7923,13 @@ function applyLatestHandwritingConsistency(result, body = {}) {
   if (status === "correct") {
     const contradictory = /错|错误|不对|不一致|算错|不符合|wrong|incorrect/i.test(speech);
     if (contradictory) {
+      const completedStep = Array.isArray(handwriting.completedSteps)
+        ? String(handwriting.completedSteps.at(-1) || "").trim()
+        : "";
       return {
         ...output,
-        shouldSpeak: true,
-        speech: String(handwriting.positiveFeedback || "这一步和题目条件是吻合的，可以接着讲下一步。").trim(),
+        shouldSpeak: Boolean(completedStep),
+        speech: completedStep ? `你已经写出的“${completedStep}”与 Question Memory 一致。` : "",
         hintLevel: "encourage",
         formulaOrStep: "",
         lectureComplete: false
@@ -7683,10 +7940,11 @@ function applyLatestHandwritingConsistency(result, body = {}) {
   if (status === "unclear" || status === "incomplete") {
     const definitive = /正确|错误|不对|答案是|结果是|wrong|incorrect/i.test(speech);
     if (definitive) {
+      const canPrompt = ["active_help", "stuck", "silence", "silence_followup", "error_silence"].includes(eventType);
       return {
         ...output,
-        shouldSpeak: true,
-        speech: "我先不急着判断刚才这一步。你把黑板上最后写的关系式再说一遍，我按题目条件帮你核对。",
+        shouldSpeak: canPrompt,
+        speech: canPrompt ? "我先不判断这一步。你把最后写的关系式说一遍，我按 Question Memory 帮你核对。" : "",
         hintLevel: "light",
         formulaOrStep: "",
         lectureComplete: false
@@ -7814,62 +8072,111 @@ async function handleGuide(req, res) {
 async function handleHandwriting(req, res) {
   const requestStartedAt = Date.now();
   const body = await readJsonBody(req);
-  if (!body.questionImage || !(body.boardOnlyImage || body.boardImage)) {
-    sendJson(res, 400, { error: "缺少 questionImage 或 boardOnlyImage" });
+  const sessionId = String(body.sessionId || "").trim();
+  const questionId = String(body.questionId || "").trim();
+  const memoryId = String(body.memoryId || body.questionMemory?.memoryId || "").trim();
+  if (!sessionId || !questionId || !memoryId) {
+    sendJson(res, 409, {
+      error: "handwriting request identity is incomplete",
+      code: "request_identity_missing",
+      stage: "request-identity"
+    });
+    return;
+  }
+  if (!body.boardOnlyImage) {
+    sendJson(res, 400, { error: "缺少纯板书截图 boardOnlyImage" });
     return;
   }
 
-  const boardForOcr = body.boardOnlyImage || body.boardImage;
-  let answerKey;
-  try {
-    answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
-    console.log(`[handwriting-timing] answer-key=${Date.now() - requestStartedAt}ms trusted=${answerKey.trusted}`);
-  } catch (error) {
-    console.warn(`[handwriting] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
-    answerKey = makeUnavailableAnswerKey(error);
+  const boardForOcr = body.boardOnlyImage;
+  const diagnostics = summarizeHandwritingDiagnostics(body.handwritingDiagnostics);
+  if (
+    (diagnostics.sessionId && diagnostics.sessionId !== Number(sessionId)) ||
+    (diagnostics.requestId && diagnostics.requestId !== Number(body.requestId || 0)) ||
+    (diagnostics.memoryId && diagnostics.memoryId !== memoryId)
+  ) {
+    sendJson(res, 409, { error: "handwriting request identity mismatch", code: "request_identity_mismatch", stage: "request-identity" });
+    return;
   }
+  try {
+    registerQuestionMemoryIdentity(
+      sessionId,
+      questionId,
+      memoryId,
+      questionMemoryFingerprint(body.questionMemory)
+    );
+    registerHandwritingRequest(sessionId, questionId, body.requestId);
+  } catch (error) {
+    sendJson(res, error.statusCode || 409, {
+      error: error.message || "handwriting request rejected",
+      code: error.code || "request_rejected",
+      stage: error.stage || "request-identity"
+    });
+    return;
+  }
+  if (
+    body.questionMemory?.sessionId != null &&
+    Number(body.questionMemory.sessionId) !== Number(sessionId)
+  ) {
+    sendJson(res, 409, { error: "Question Memory session mismatch", code: "question_memory_conflict", stage: "question-memory" });
+    return;
+  }
+  console.log("[handwriting] request", diagnostics);
+  if (String(boardForOcr || "").length < 100) {
+    sendJson(res, 400, {
+      error: "板书快照为空或过小，请保留板书后重试",
+      code: "empty_board_snapshot",
+      stage: "snapshot"
+    });
+    return;
+  }
+  // First-stage invariant: handwriting consumes the frozen Question Memory
+  // created when the question was entered. It must never call the answer model.
+  const answerKey = questionMemoryToAnswerKey(body.questionMemory, questionId, memoryId);
+  console.log(
+    `[handwriting-timing] question-memory=${Date.now() - requestStartedAt}ms trusted=${answerKey.trusted} q=${diagnostics.questionId} v=${diagnostics.boardVersion}`
+  );
 
-  let result = await callQwenMultimodalJson({
+  let result = await callHandwritingQwenJson({
     model: QWEN_HANDWRITING_MODEL,
     schema: handwritingSchema,
-    instructions: [HANDWRITING_PROMPT, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES].join("\n\n"),
+    instructions: HANDWRITING_PROMPT,
     content: [
       {
         type: "input_text",
         text: JSON.stringify({
           trigger: body.reason || "停笔后异步识别",
-          transcript: body.transcript || "",
-          knownProblemText: body.problemText || "",
-          knownKnowledgePoints: body.knowledgePoints || [],
-          verifiedAnswerReference: privateAnswerReference(answerKey),
+          boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
+          questionMemory: privateQuestionMemoryReference(answerKey),
           instruction:
-            "请直接观察题目图片、纯板书截图、包含题目区域的板书截图。纯板书截图用来判断学生真正写了什么；题目图片和包含题目区域的截图用于理解题意、确认题目条件和板书所在位置。不要把题目原图里的印刷答案、红叉、批改痕迹当成学生板书。然后根据题目条件实际计算/验算。若 verifiedAnswerReference.trusted=true，所有对错判断必须与这份双重核验基线一致；若 trusted=false，只能返回 unclear 或 incomplete，禁止判 correct/wrong。若可见关键步骤数学上成立，即使后续推导和最终答案没有写在板书上，也可返回 calculationStatus=correct；若可见步骤或最后结论算错，必须返回 calculationStatus=wrong；若明显不符合题意，给温和检查提醒；若只是字迹不清，不要轻易判错。若 trigger 表示完成讲解前检查，boardComplete 只判断是否至少存在一个与本题相关、可复核且正确的关键步骤，不要求完整推导或板书最终答案。"
+            "只观察纯板书截图。用 Question Memory 核对学生已经写出的步骤；不要重解题目、不要补全学生未写的步骤、不要反推完整答案，也不要生成反馈话术。"
         })
       },
-      { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high" },
-      { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" },
-      ...(body.boardImage ? [{ type: "input_image", label: "包含题目区域的板书截图", image_url: body.boardImage, detail: "high" }] : [])
+      { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
     ],
     maxOutputTokens: 1000
-  });
+  }, diagnostics);
   console.log(`[handwriting-timing] initial=${Date.now() - requestStartedAt}ms`);
 
   result = await auditHandwritingResult(result, answerKey, body, boardForOcr);
   result = applyStatementEvaluationSafety(result, answerKey);
+  result = buildHandwritingProcessFeedback(result, answerKey, body);
 
   if (!answerKey.trusted && ["correct", "wrong"].includes(result.calculationStatus)) {
     result = {
       ...result,
       calculationStatus: "unclear",
-      calculationCheck: "标准答案尚未通过双重核验，暂不判断板书对错。",
+      calculationCheck: "Question Memory 尚未就绪，暂不判断板书对错。",
       hasPossibleIssue: false,
       issueType: "unclear",
       issueSummary: "",
+      errorLocation: "",
+      errorEvidence: "",
       expectedNextStep: "",
       guidance: "",
       positiveFeedback: "",
       boardComplete: false,
-      missingBoardContent: result.missingBoardContent || "标准答案尚未通过双重核验，暂时不能确认板书完整。"
+      missingBoardContent: result.missingBoardContent || "Question Memory 尚未就绪，暂时不能确认板书完整。"
     };
   }
 
@@ -7887,12 +8194,25 @@ async function handleHandwriting(req, res) {
 
   const timingMs = Date.now() - requestStartedAt;
   console.log(`[handwriting-timing] total=${timingMs}ms`);
+  if (!isLatestHandwritingRequest(sessionId, questionId, body.requestId)) {
+    sendJson(res, 409, {
+      error: "stale handwriting request",
+      code: "stale_request",
+      stage: "response-order"
+    });
+    return;
+  }
   sendJson(res, 200, {
     ...result,
-    answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
+    requestId: Number(body.requestId || 0),
+    sessionId: Number(sessionId),
+    questionId,
+    memoryId,
+    answerVerification: answerKey.trusted ? "question-memory" : answerKey.status,
     model: QWEN_HANDWRITING_MODEL,
     provider: "qwen-structured-answer-handwriting",
-    timingMs
+    timingMs,
+    handwritingDiagnostics: diagnostics
   });
 }
 
@@ -7926,10 +8246,96 @@ function makeHandwritingUncertain(result, reason = "板书判断还需要再核�
     hasPossibleIssue: false,
     issueType: "unclear",
     issueSummary: "",
+    errorLocation: "",
+    errorEvidence: "",
     guidance: "",
     positiveFeedback: "",
     confidence: Math.min(Number(result?.confidence) || 0.5, 0.55)
   };
+}
+
+function normalizeVisibleCompletedSteps(value) {
+  const seen = new Set();
+  return (Array.isArray(value) ? value : [])
+    .map((item) => String(item || "").trim())
+    .filter((item) => item && !seen.has(item) && seen.add(item))
+    .slice(0, 8);
+}
+
+function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
+  const completedSteps = normalizeVisibleCompletedSteps(result?.completedSteps);
+  const idleSeconds = Math.max(0, Number(body.boardIdleSeconds) || 0);
+  const initialWritingState = String(result?.writingState || "").trim();
+  const writingState = initialWritingState === "stalled" && idleSeconds < 15
+    ? "in_progress"
+    : initialWritingState || (
+      result?.calculationStatus === "incomplete"
+        ? "in_progress"
+        : result?.calculationStatus === "not_relevant"
+          ? "not_relevant"
+          : result?.calculationStatus === "unclear"
+            ? "unclear"
+            : "complete"
+    );
+  const errorLocation = String(result?.errorLocation || "").trim();
+  const errorEvidence = String(result?.errorEvidence || result?.issueSummary || "").trim();
+  const explicitWrong =
+    result?.calculationStatus === "wrong" &&
+    Number(result?.confidence) >= 0.72 &&
+    Boolean(errorLocation && errorEvidence);
+
+  if (result?.calculationStatus === "wrong" && !explicitWrong) {
+    return {
+      ...makeHandwritingUncertain(result, "没有同时确认明确错误位置和可核对证据，暂不打断学生。"),
+      writingState: writingState === "complete" ? "unclear" : writingState,
+      completedSteps,
+      expectedNextStep: ""
+    };
+  }
+
+  const memorySteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
+    ? answerKey.solutionOutline.map((step) => String(step || "").trim()).filter(Boolean)
+    : [];
+  const nextMemoryStep = memorySteps[Math.min(completedSteps.length, Math.max(0, memorySteps.length - 1))] || "";
+  const latestVisibleStep = completedSteps.at(-1) || "";
+  const output = {
+    ...(result || {}),
+    writingState,
+    completedSteps,
+    errorLocation: explicitWrong ? errorLocation : "",
+    errorEvidence: explicitWrong ? errorEvidence : "",
+    expectedNextStep: "",
+    guidance: "",
+    positiveFeedback: ""
+  };
+
+  if (explicitWrong) {
+    return {
+      ...output,
+      hasPossibleIssue: true,
+      boardComplete: false,
+      guidance: `先检查${errorLocation}：${errorEvidence}`
+    };
+  }
+
+  if (result?.calculationStatus === "incomplete" && writingState === "stalled" && nextMemoryStep) {
+    return {
+      ...output,
+      expectedNextStep: nextMemoryStep,
+      guidance: latestVisibleStep
+        ? `你已经写到“${latestVisibleStep}”。可以从 Question Memory 的下一小步“${nextMemoryStep}”继续。`
+        : `可以从 Question Memory 的下一小步“${nextMemoryStep}”开始。`
+    };
+  }
+
+  if (result?.calculationStatus === "correct" && latestVisibleStep) {
+    return {
+      ...output,
+      positiveFeedback: `你已经写出了“${latestVisibleStep}”。`
+    };
+  }
+
+  return output;
 }
 
 function answerKeyTextForSafety(answerKey) {
@@ -7956,8 +8362,8 @@ function applyStatementEvaluationSafety(result, answerKey) {
   const issueText = [
     result?.calculationCheck,
     result?.issueSummary,
-    result?.expectedNextStep,
-    result?.guidance
+    result?.errorLocation,
+    result?.errorEvidence
   ].filter(Boolean).join(" ").normalize("NFKC");
   const saysConditionMismatch = /(?:\u4e0d\u7b26|\u4e0d\u7b26\u5408|\u4e0d\u4e00\u81f4|\u51b2\u7a81|inconsistent|conflict|violate)/i.test(issueText);
   const hasConcreteArithmeticFault = /(?:\u7b97\u9519|\u8fd0\u7b97\u9519|\u7b26\u53f7\u9519|\u6b63\u8d1f|\u7b49\u53f7\u9519|\u4ee3\u5165\u9519|\u5217\u5f0f\u9519|arithmetic|sign error|wrong equation)/i.test(issueText);
@@ -7980,15 +8386,14 @@ function applyHandwritingAudit(result, audit) {
     ...(result || {}),
     calculationStatus: auditedStatus,
     calculationCheck: audit?.correctedCheck || audit?.reason || result?.calculationCheck || "",
+    completedSteps: normalizeVisibleCompletedSteps(audit?.completedSteps || result?.completedSteps),
     hasPossibleIssue: hasIssue,
     issueType: hasIssue ? (audit?.issueType || result?.issueType || "unclear") : "none",
     issueSummary: hasIssue ? (audit?.issueSummary || audit?.reason || "") : "",
-    guidance: hasIssue || auditedStatus === "incomplete"
-      ? (audit?.correctedGuidance || result?.guidance || "")
-      : "",
-    positiveFeedback: auditedStatus === "correct"
-      ? (audit?.correctedFeedback || result?.positiveFeedback || "")
-      : "",
+    errorLocation: hasIssue ? String(audit?.errorLocation || result?.errorLocation || "").trim() : "",
+    errorEvidence: hasIssue ? String(audit?.errorEvidence || result?.errorEvidence || "").trim() : "",
+    guidance: "",
+    positiveFeedback: "",
     boardComplete: auditedStatus === "correct" && Boolean(audit?.boardComplete),
     missingBoardContent: audit?.missingBoardContent || "",
     confidence: confidence || Number(result?.confidence) || 0.5
@@ -8006,24 +8411,20 @@ async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
     const audit = await callQwenMultimodalJson({
       model: QWEN_HANDWRITING_MODEL,
       schema: handwritingAuditSchema,
-      instructions: [HANDWRITING_AUDIT_PROMPT, ORDERED_PROPORTION_RULES, STATEMENT_EVALUATION_RULES].join("\n\n"),
+      instructions: HANDWRITING_AUDIT_PROMPT,
       content: [
         {
           type: "input_text",
           text: JSON.stringify({
             trigger: body.reason || "",
-            transcript: body.transcript || "",
-            knownProblemText: body.problemText || "",
-            knownKnowledgePoints: body.knowledgePoints || [],
-            verifiedAnswerReference: privateAnswerReference(answerKey),
+            boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
+            questionMemory: privateQuestionMemoryReference(answerKey),
             initialHandwritingResult: result,
             instruction:
-              "请审校 initialHandwritingResult 是否能安全播给学生。若对错判断无法由当前题图、标准答案和纯板书共同确认，必须降级为 unclear/incomplete，不要误导。"
+              "只根据纯板书与 Question Memory 审校可见步骤。不得重解题目、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和证据。"
           })
         },
-        { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high" },
-        { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" },
-        ...(body.boardImage ? [{ type: "input_image", label: "包含题目区域的板书截图", image_url: body.boardImage, detail: "high" }] : [])
+        { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
       ],
       maxOutputTokens: 700
     });
@@ -8041,35 +8442,35 @@ async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
   }
 }
 
-async function handleAnswerKeyPrefetch(req, res) {
+async function handleQuestionMemory(req, res) {
   const body = await readJsonBody(req);
+  const questionId = String(body.questionId || "").trim();
+  const sessionId = String(body.sessionId || "").trim();
+  const memoryId = String(body.memoryId || "").trim();
+  if (!questionId || !sessionId || !memoryId) {
+    sendJson(res, 409, {
+      error: "Question Memory identity is incomplete",
+      code: "question_memory_identity_missing",
+      stage: "question-memory"
+    });
+    return;
+  }
   if (!body.questionImage) {
     sendJson(res, 400, { error: "缺少 questionImage" });
     return;
   }
+  try {
+    registerQuestionMemoryIdentity(sessionId, questionId, memoryId);
+  } catch (error) {
+    sendJson(res, error.statusCode || 409, {
+      error: error.message || "Question Memory identity rejected",
+      code: error.code || "question_memory_conflict",
+      stage: "question-memory"
+    });
+    return;
+  }
   const answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
-  sendJson(res, 200, {
-    ready: answerKey.trusted,
-    status: answerKey.status,
-    confidence: answerKey.trusted ? answerKey.confidence : 0,
-    canonicalAnswer: answerKey.trusted ? answerKey.canonicalAnswer : "",
-    acceptedAnswers: answerKey.trusted ? answerKey.acceptedAnswers : [],
-    choiceAnalysis: answerKey.trusted ? normalizeChoiceAnalysis(answerKey.choiceAnalysis) : {
-      options: [],
-      statementVerdicts: [],
-      selectedOption: "",
-      selectedOptionText: ""
-    },
-    problemText: answerKey.trusted ? answerKey.problemText : "",
-    questionType: answerKey.trusted ? answerKey.questionType : "",
-    knowledge: answerKey.trusted ? answerKey.knowledge || "" : "",
-    solutionOutline: answerKey.trusted ? answerKey.solutionOutline : [],
-    verificationChecks: answerKey.trusted ? answerKey.verificationChecks : [],
-    studentTrace: answerKey.trusted ? answerKey.studentTrace || null : null,
-    reason: answerKey.reason || "",
-    elapsedMs: answerKey.elapsedMs || 0,
-    provider: "qwen-structured-single-pass-answer-key"
-  });
+  sendJson(res, 200, { questionMemory: buildQuestionMemory(questionId, answerKey, memoryId, sessionId) });
 }
 
 function supabaseNotebookConfigured() {
@@ -8263,7 +8664,7 @@ async function handleRequest(req, res) {
     if (req.method === "POST" && pathname === "/api/segment") return await handleSegmentV2(req, res);
     if (req.method === "POST" && pathname === "/api/transcript-correct") return await handleTranscriptCorrection(req, res);
     if (req.method === "POST" && pathname === "/api/archive-summary") return await handleArchiveSummary(req, res);
-    if (req.method === "POST" && pathname === "/api/answer-key") return await handleAnswerKeyPrefetch(req, res);
+    if (req.method === "POST" && pathname === "/api/question-memory") return await handleQuestionMemory(req, res);
     if (req.method === "POST" && pathname === "/api/tts") return await handleTextToSpeech(req, res);
     if (req.method === "POST" && pathname === "/api/asr") return await handleSpeechRecognition(req, res);
     if (req.method === "POST" && pathname === "/api/final-answer") return await handleFinalAnswerCheck(req, res);
@@ -8274,7 +8675,8 @@ async function handleRequest(req, res) {
   } catch (error) {
     sendJson(res, error.statusCode || 500, {
       error: error.message || "服务器错误",
-      code: error.code || "server_error"
+      code: error.code || "server_error",
+      stage: error.stage || ""
     });
   }
 }
@@ -8332,5 +8734,12 @@ module.exports = {
   studentAnswerMatchesVerifiedKey,
   isOnlyDirectAnswerWriting,
   applyStatementEvaluationSafety,
-  applyLatestHandwritingConsistency
+  applyLatestHandwritingConsistency,
+  summarizeHandwritingDiagnostics,
+  buildQuestionMemory,
+  questionMemoryToAnswerKey,
+  buildHandwritingProcessFeedback,
+  registerQuestionMemoryIdentity,
+  registerHandwritingRequest,
+  isLatestHandwritingRequest
 };
