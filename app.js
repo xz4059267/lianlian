@@ -263,6 +263,7 @@ const state = {
   currentQuestionCompleted: false,
   hasExplicitFinalAnswer: false,
   pendingLianQuestion: null,
+  pendingLianOpeningText: "",
   logItemsByKey: new Map(),
   lastSilentNoticeAtByKey: new Map(),
   promptVariantLastByKey: new Map(),
@@ -274,6 +275,8 @@ const state = {
   lianAudioElement: null,
   lianAudioUnlocked: false,
   lianAudioUnlockPromise: null,
+  lianTtsPrefetch: null,
+  lianTtsPrefetchPromise: null,
   lianVoiceIdentity: "",
   lianVoiceSelectionLocked: false,
   lianSpeechRequestId: 0,
@@ -874,6 +877,35 @@ function unlockLianAudio() {
       return false;
     });
   return state.lianAudioUnlockPromise;
+}
+
+function primeLianCloudSpeech(text) {
+  const speechText = prepareLianSpeechText(text);
+  if (state.isMuted || !speechText) return Promise.resolve(null);
+  if (state.lianTtsPrefetch?.text === speechText) return Promise.resolve(state.lianTtsPrefetch.blob);
+  if (state.lianTtsPrefetchPromise?.text === speechText) return state.lianTtsPrefetchPromise.promise;
+
+  const promise = (async () => {
+    try {
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: speechText, responseId: "lian-prefetch" })
+      });
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      if (!blob.size) return null;
+      state.lianTtsPrefetch = { text: speechText, blob, createdAt: Date.now() };
+      return blob;
+    } catch (error) {
+      console.warn("[tts] cloud prefetch failed:", error?.message || error);
+      return null;
+    } finally {
+      if (state.lianTtsPrefetchPromise?.text === speechText) state.lianTtsPrefetchPromise = null;
+    }
+  })();
+  state.lianTtsPrefetchPromise = { text: speechText, promise };
+  return promise;
 }
 
 if (typeof document !== "undefined") {
@@ -2251,6 +2283,13 @@ function startLecture(queue) {
   state.currentQuestionCompleted = false;
   state.hasExplicitFinalAnswer = false;
   state.pendingLianQuestion = null;
+  state.pendingLianOpeningText = pickPrompt("lecture-opening", [
+    "我们开始讲解这道错题吧。你慢慢说，先从题目给了什么条件开始。",
+    "现在开始看这道题，你先说说题目给了哪些条件。",
+    "不用着急，我们从已知条件讲起，你按自己的思路慢慢说。",
+    "来，先把题目里的条件说一遍，我跟着你一起理顺。"
+  ]);
+  void primeLianCloudSpeech(state.pendingLianOpeningText);
   dom.finishQuestionBtn.disabled = false;
   initCurrentQuestion();
   showView("teachView");
@@ -2310,14 +2349,14 @@ function initCurrentQuestion() {
     resizeBoardCanvas();
     loadCurrentPage();
     updatePageLabel();
-    lianSpeak(
-      pickPrompt("lecture-opening", [
-        "我们开始讲解这道错题吧。你慢慢说，先从题目给了什么条件开始。",
-        "现在开始看这道题，你先说说题目给了哪些条件。",
-        "不用着急，我们从已知条件讲起，你按自己的思路慢慢说。",
-        "来，先把题目里的条件说一遍，我跟着你一起理顺。"
-      ])
-    );
+    const openingText = state.pendingLianOpeningText || pickPrompt("lecture-opening", [
+      "我们开始讲解这道错题吧。你慢慢说，先从题目给了什么条件开始。",
+      "现在开始看这道题，你先说说题目给了哪些条件。",
+      "不用着急，我们从已知条件讲起，你按自己的思路慢慢说。",
+      "来，先把题目里的条件说一遍，我跟着你一起理顺。"
+    ]);
+    state.pendingLianOpeningText = "";
+    lianSpeak(openingText);
   });
 }
 
@@ -5944,15 +5983,30 @@ async function playCloudLianSpeech(
   responseId
 ) {
   if (state.isMuted || !speechText) return false;
-  const response = await fetch("/api/tts", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: speechText, responseId }),
-    signal: abortController?.signal
-  });
-  if (!response.ok) return false;
-  const audioBlob = await response.blob();
-  if (!audioBlob.size || speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) return false;
+  let audioBlob = null;
+  if (state.lianTtsPrefetch?.text === speechText) {
+    audioBlob = state.lianTtsPrefetch.blob;
+    state.lianTtsPrefetch = null;
+  } else if (state.lianTtsPrefetchPromise?.text === speechText) {
+    audioBlob = await state.lianTtsPrefetchPromise.promise;
+    if (state.lianTtsPrefetch?.text === speechText) {
+      audioBlob = state.lianTtsPrefetch.blob;
+      state.lianTtsPrefetch = null;
+    }
+  }
+
+  // 首句可能遇到云端令牌刚建立、网络瞬时抖动等情况，云端请求最多重试一次。
+  for (let attempt = 0; !audioBlob && attempt < 2; attempt += 1) {
+    const response = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: speechText, responseId }),
+      signal: abortController?.signal
+    });
+    if (response.ok) audioBlob = await response.blob();
+    if (!audioBlob?.size && attempt === 0) await new Promise((resolve) => setTimeout(resolve, 180));
+  }
+  if (!audioBlob?.size || speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) return false;
 
   const audioUrl = URL.createObjectURL(audioBlob);
   const audio = getLianAudioElement();
@@ -6152,7 +6206,10 @@ function lianSpeak(text, options = {}) {
         finishSpeaking();
         return;
       }
-      if (playBrowserSpeech()) return;
+      // 恋恋的声音必须保持云端同一音色。云端失败时保留文字并记录状态，
+      // 不再静默切换到浏览器自带语音，避免第一句和后续声音不一致。
+      if (options.allowBrowserFallback === true && playBrowserSpeech()) return;
+      dom.lianState.textContent = "云端语音暂时不可用";
       publishText();
       fallbackTimer = setTimeout(finishSpeaking, 260);
     })();
