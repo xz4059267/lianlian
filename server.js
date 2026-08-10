@@ -777,6 +777,7 @@ function azureTtsEndpoint() {
 }
 
 async function handleTextToSpeech(req, res) {
+  const startedAt = Date.now();
   const body = await readJsonBody(req, 256 * 1024);
   const text = String(body.text || "").replace(/\s+/g, " ").trim();
   if (!text) {
@@ -794,10 +795,15 @@ async function handleTextToSpeech(req, res) {
         "X-TTS-Voice": aliyunAudio.voice
       });
       res.end(aliyunAudio.buffer);
+      console.info(`[tts] provider=aliyun voice=${aliyunAudio.voice} bytes=${aliyunAudio.buffer.length} elapsed=${Date.now() - startedAt}ms`);
       return;
     }
   } catch (error) {
-    console.warn("[tts] Aliyun TTS fallback:", error.message || error);
+    console.error("[tts] Aliyun TTS failed:", {
+      code: error.code || "aliyun_tts_failed",
+      message: describeAliyunNetworkError(error),
+      elapsed: Date.now() - startedAt
+    });
     if (!AZURE_TTS_KEY || !AZURE_TTS_REGION) {
       sendJson(res, error.statusCode || 502, {
         error: error.message || "Aliyun TTS 调用失败",
@@ -1458,6 +1464,60 @@ let aliyunNlsTokenCache = {
   expireAt: 0
 };
 
+const ALIYUN_TTS_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.ALIYUN_TTS_TIMEOUT_MS || 8000)
+);
+
+function describeAliyunNetworkError(error) {
+  const cause = error?.cause;
+  const code = cause?.code || cause?.errno || error?.code || "";
+  const detail = cause?.message || error?.message || "Aliyun speech request failed";
+  return code ? `${detail} (${code})` : detail;
+}
+
+async function fetchAliyunWithRetry(url, options = {}, label = "request") {
+  let lastError = null;
+  let lastResponse = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ALIYUN_TTS_TIMEOUT_MS);
+    try {
+      lastResponse = await fetch(url, {
+        ...options,
+        signal: controller.signal
+      });
+
+      if (
+        lastResponse.ok ||
+        (lastResponse.status >= 400 && lastResponse.status < 500 && lastResponse.status !== 429)
+      ) {
+        return lastResponse;
+      }
+    } catch (error) {
+      lastError = error;
+      console.warn(`[tts] Aliyun ${label} attempt=${attempt + 1} failed:`, describeAliyunNetworkError(error));
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (attempt === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+  }
+
+  if (lastError) {
+    throw Object.assign(new Error(describeAliyunNetworkError(lastError)), {
+      code: "aliyun_network_error",
+      statusCode: 502,
+      cause: lastError
+    });
+  }
+
+  return lastResponse;
+}
+
 function aliyunSpeechConfigured() {
   return Boolean(
     ALIYUN_SPEECH_ENABLED &&
@@ -1491,7 +1551,7 @@ async function getAliyunNlsToken() {
   };
   if (ALIYUN_OCR_SECURITY_TOKEN) query.SecurityToken = ALIYUN_OCR_SECURITY_TOKEN;
   const url = buildAliyunRpcSignedUrl(ALIYUN_NLS_TOKEN_ENDPOINT, query, ALIYUN_OCR_ACCESS_KEY_SECRET, "GET");
-  const response = await fetch(url, { method: "GET" });
+  const response = await fetchAliyunWithRetry(url, { method: "GET" }, "nls-token");
   const raw = await response.text();
   let payload = {};
   try {
@@ -1536,7 +1596,7 @@ async function synthesizeAliyunSpeech(text) {
   url.searchParams.set("volume", process.env.ALIYUN_NLS_TTS_VOLUME || "50");
   url.searchParams.set("speech_rate", process.env.ALIYUN_NLS_TTS_SPEECH_RATE || "-30");
   url.searchParams.set("pitch_rate", process.env.ALIYUN_NLS_TTS_PITCH_RATE || "0");
-  const response = await fetch(url, { method: "GET" });
+  const response = await fetchAliyunWithRetry(url, { method: "GET" }, "tts");
   const buffer = Buffer.from(await response.arrayBuffer());
   const contentType = response.headers.get("content-type") || "";
   if (!response.ok || !/^audio\//i.test(contentType)) {

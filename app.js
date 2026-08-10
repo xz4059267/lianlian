@@ -6134,13 +6134,22 @@ async function playCloudLianSpeech(
 
   // 首句可能遇到云端令牌刚建立、网络瞬时抖动等情况，云端请求最多重试一次。
   for (let attempt = 0; !audioBlob && attempt < 2; attempt += 1) {
-    const response = await fetch("/api/tts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: speechText, responseId }),
-      signal: abortController?.signal
-    });
-    if (response.ok) audioBlob = await response.blob();
+    try {
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: speechText, responseId }),
+        signal: abortController?.signal
+      });
+      if (response.ok) {
+        audioBlob = await response.blob();
+      } else {
+        const errorText = await response.text().catch(() => "");
+        console.warn(`[tts] cloud request status=${response.status}:`, errorText.slice(0, 160));
+      }
+    } catch (error) {
+      console.warn(`[tts] cloud request attempt=${attempt + 1} failed:`, error?.message || error);
+    }
     if (!audioBlob?.size && attempt === 0) await new Promise((resolve) => setTimeout(resolve, 180));
   }
   if (!audioBlob?.size || speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) return false;
