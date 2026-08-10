@@ -7959,6 +7959,50 @@ function applyLatestHandwritingConsistency(result, body = {}) {
   return output;
 }
 
+function ensureConcreteSilenceGuide(result, body = {}) {
+  const output = result && typeof result === "object" ? { ...result } : {};
+  const eventType = String(body.eventType || "");
+  const silenceStage = Math.max(0, Math.min(4, Number(body.silenceStage) || 0));
+  const contextualStep = String(body.silenceContextStep || "").replace(/\s+/g, " ").trim();
+
+  // Stages 1-3 must never fall back to a generic "write the formula" prompt
+  // when the entered Question Memory already supplied the next concrete step.
+  if (!/silence/.test(eventType) || silenceStage < 1 || silenceStage > 3 || !contextualStep) {
+    return output;
+  }
+  if (body.boardPendingRecognition === true) {
+    return output;
+  }
+
+  const stageSpeech = {
+    1: `先根据题目给出的条件写出：${contextualStep}。`,
+    2: `下一步直接用这个关系计算：${contextualStep}。算完后把结果写在黑板上。`,
+    3: `关键式是：${contextualStep}。请把它写在黑板上，再继续算。`
+  }[silenceStage];
+
+  const currentFormula = String(output.formulaOrStep || "").trim();
+  const currentSpeech = String(output.speech || "").trim();
+  const hasContextInResponse = currentFormula === contextualStep
+    || currentSpeech.includes(contextualStep);
+  if (hasContextInResponse) {
+    return { ...output, formulaOrStep: contextualStep };
+  }
+
+  console.warn(`[silence-guide] restored concrete step stage=${silenceStage}: ${contextualStep}`);
+  return {
+    ...output,
+    shouldSpeak: true,
+    speech: stageSpeech,
+    hintLevel: silenceStage >= 3 ? "worked_step" : "light",
+    formulaOrStep: contextualStep,
+    askStudentToRepeat: silenceStage >= 3,
+    studentAction: silenceStage >= 3
+      ? `请把${contextualStep}写在黑板上，或用自己的话复述。`
+      : `请先写出${contextualStep}。`,
+    lectureComplete: false
+  };
+}
+
 function getSilenceGuidePolicy(stage) {
   const level = Math.max(0, Math.min(4, Number(stage) || 0));
   return {
@@ -8107,6 +8151,7 @@ async function handleGuide(req, res) {
   });
   guideResult = await auditGuideMath(guideResult, answerKey, body);
   guideResult = applyLatestHandwritingConsistency(guideResult, body);
+  guideResult = ensureConcreteSilenceGuide(guideResult, body);
 
   sendJson(res, 200, {
     ...guideResult,
@@ -8784,6 +8829,7 @@ module.exports = {
   isOnlyDirectAnswerWriting,
   applyStatementEvaluationSafety,
   applyLatestHandwritingConsistency,
+  ensureConcreteSilenceGuide,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
   questionMemoryToAnswerKey,

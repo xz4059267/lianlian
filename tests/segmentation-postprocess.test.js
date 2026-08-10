@@ -32,6 +32,7 @@ const {
   isOnlyDirectAnswerWriting,
   applyStatementEvaluationSafety,
   applyLatestHandwritingConsistency,
+  ensureConcreteSilenceGuide,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
   questionMemoryToAnswerKey,
@@ -82,6 +83,28 @@ test("allows stage-4 silence to explain without a standard-answer key", async ()
     { allowUnverifiedFinalAnswer: false, silenceStage: 3 }
   );
   assert.notEqual(guarded.speech, detailed.speech);
+});
+
+test("restores the concrete Question Memory step after guide safety filtering", () => {
+  const result = ensureConcreteSilenceGuide(
+    {
+      shouldSpeak: true,
+      speech: "这一步我还需要重新核对，先不要把它当成最终结论。",
+      formulaOrStep: "",
+      hintLevel: "light",
+      lectureComplete: false
+    },
+    {
+      eventType: "silence_escalation",
+      silenceStage: 2,
+      silenceContextStep: "x - 2y = 3"
+    }
+  );
+
+  assert.equal(result.formulaOrStep, "x - 2y = 3");
+  assert.match(result.speech, /x - 2y = 3/);
+  assert.match(result.studentAction, /x - 2y = 3/);
+  assert.equal(result.lectureComplete, false);
 });
 
 test("captures one standard-answer result as a reusable Question Memory snapshot", () => {

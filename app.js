@@ -5765,12 +5765,12 @@ function trimGuideSpeech(text, eventType) {
   const isDetailedSilence = /silence/.test(eventType) && silenceStage >= MAX_SILENCE_GUIDE_STAGE;
   const maxLength = isDetailedSilence
     ? 240
-    : /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
+    : /silence|active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
     ? 120
     : 46;
   const maxSentences = isDetailedSilence
     ? 4
-    : /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
+    : /silence|active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType)
     ? 2
     : 1;
 
@@ -5795,7 +5795,7 @@ function formatGuideSpeech(eventType, result, fallbackText) {
   const silenceAllowsConcrete = /silence/.test(eventType) && silenceStage >= 1;
   const lectureUnlocked = state.guideState === GUIDE_STATES.INTERACTIVE || silenceAllowsConcrete;
   const tooExplicit = !lectureUnlocked && ["formula", "worked_step", "summary"].includes(result?.hintLevel);
-  const needsConcreteStep = lectureUnlocked && /active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType);
+  const needsConcreteStep = lectureUnlocked && /silence|active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType);
   const contextualStep = silenceAllowsConcrete ? getSilenceContextStep() : "";
 
   if (tooExplicit) speech = fallbackText;
