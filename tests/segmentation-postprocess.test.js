@@ -1282,6 +1282,28 @@ test("fails closed when a math judgment has no verified answer key", () => {
   assert.doesNotMatch(safe.speech, /正确/);
 });
 
+test("continues a concrete intermediate step instead of asking to recheck without a final answer", () => {
+  const safe = makeUnverifiedGuideSafe(
+    {
+      shouldSpeak: true,
+      speech: "\u8bf7\u628a\u5173\u7cfb\u5f0f\u5199\u51fa\u6765\u3002",
+      formulaOrStep: "x - 2y = 3",
+      hintLevel: "light",
+      lectureComplete: false
+    },
+    {
+      eventType: "silence",
+      silenceStage: 2,
+      silenceContextStep: "x - 2y = 3"
+    }
+  );
+
+  assert.match(safe.speech, /x - 2y = 3/);
+  assert.doesNotMatch(safe.speech, /\u91cd\u65b0\u6838\u5bf9|\u91cd\u65b0\u68c0\u67e5/);
+  assert.equal(safe.formulaOrStep, "x - 2y = 3");
+  assert.equal(safe.lectureComplete, false);
+});
+
 test("allows a correct verdict only when the student answer matches the verified key", () => {
   const key = {
     trusted: true,

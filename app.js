@@ -4076,7 +4076,7 @@ function buildIncompleteHandwritingGuidance(result) {
   if (expression) {
     return `我看到你写到 ${expression} 这里了。先沿着这个式子往下算一小步，把等号后面的结果写出来。`;
   }
-  return "我看到你停在中间步骤了。先把下一行关系式或计算结果补出来，我们再一起核对。";
+  return "我看到你停在中间步骤了。先把下一行关系式或计算结果补出来，再继续往下算。";
 }
 
 function maybeSpeakHandwritingGuidance(result) {

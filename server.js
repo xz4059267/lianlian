@@ -7435,8 +7435,44 @@ function guideHasCheckableMathClaim(result) {
   return /(?:正确|对的|成立|不成立|算错|结果|答案|选项|等于|推出|应该是|不是|[=＝]|\d\s*[:：/]\s*\d)/.test(value);
 }
 
-function makeUnverifiedGuideSafe(result) {
+function hasFinalAnswerEvidence(result = {}, body = {}) {
+  if (body?.answerVerified === true || body?.studentFinalAnswerEvidence === true) return true;
+  if (String(result?.finalAnswer || result?.canonicalAnswer || "").trim()) return true;
+  if (result?.lectureComplete === true) return true;
+
+  const text = [result?.speech, result?.formulaOrStep, result?.studentAction]
+    .filter(Boolean)
+    .join(" ");
+  return /(?:最终答案|最后答案|答案(?:是|为)|结论|解得|得到|所以)[^\n]{0,32}(?:=|等于|[A-D]|-?\d)/i.test(text);
+}
+
+function continueWithoutFinalAnswer(result = {}, body = {}) {
+  const concreteStep = String(
+    body?.silenceContextStep ||
+    result?.formulaOrStep ||
+    result?.expectedNextStep ||
+    ""
+  ).replace(/\s+/g, " ").trim();
+  const speech = concreteStep
+    ? `还在中间步骤，先继续这一步：${concreteStep}。写完后把下一步算出来。`
+    : "现在还没到最终答案，先根据题目条件继续写出下一步。";
+  return {
+    ...(result || {}),
+    shouldSpeak: true,
+    speech,
+    hintLevel: concreteStep ? "light" : "micro_hint",
+    formulaOrStep: concreteStep,
+    askStudentToRepeat: false,
+    studentAction: concreteStep
+      ? `请把${concreteStep}写在黑板上，再继续往下算。`
+      : "请先写出下一步关系式或计算。",
+    lectureComplete: false
+  };
+}
+
+function makeUnverifiedGuideSafe(result, body = {}) {
   if (!guideHasCheckableMathClaim(result)) return { ...(result || {}), lectureComplete: false };
+  if (!hasFinalAnswerEvidence(result, body)) return continueWithoutFinalAnswer(result, body);
   return {
     ...(result || {}),
     shouldSpeak: true,
@@ -7571,7 +7607,7 @@ function makeAnswerLockedGuideSafe(result, answerKey, body, reason = "answer con
 async function auditGuideMath(result, answerKey, body) {
   if (!answerKey?.trusted) {
     if (body?.allowUnverifiedFinalAnswer === true && Number(body?.silenceStage) >= 4) return result;
-    return makeUnverifiedGuideSafe(result);
+    return makeUnverifiedGuideSafe(result, body);
   }
   if (!guideHasCheckableMathClaim(result)) return result;
   const wrongClaims = guideContradictsVerifiedAnswer(result, answerKey);
@@ -7603,10 +7639,10 @@ async function auditGuideMath(result, answerKey, body) {
     });
     if (audit.safe === true && Number(audit.confidence) >= ANSWER_KEY_MIN_CONFIDENCE) return result;
     console.warn(`[guide-audit] blocked unsafe guidance: ${audit.issue || "unverified math claim"}`);
-    return makeUnverifiedGuideSafe(result);
+    return makeUnverifiedGuideSafe(result, body);
   } catch (error) {
     console.warn(`[guide-audit] failed closed: ${error.message}`);
-    return makeUnverifiedGuideSafe(result);
+    return makeUnverifiedGuideSafe(result, body);
   }
 }
 
@@ -7945,12 +7981,22 @@ function applyLatestHandwritingConsistency(result, body = {}) {
     const definitive = /正确|错误|不对|答案是|结果是|wrong|incorrect/i.test(speech);
     if (definitive) {
       const canPrompt = ["active_help", "stuck", "silence", "silence_followup", "silence_escalation", "error_silence"].includes(eventType);
+      const nextStep = String(
+        handwriting.expectedNextStep ||
+        handwriting.missingBoardContent ||
+        output.formulaOrStep ||
+        ""
+      ).replace(/\s+/g, " ").trim();
       return {
         ...output,
         shouldSpeak: canPrompt,
-        speech: canPrompt ? "我先不判断这一步。你把最后写的关系式说一遍，我按 Question Memory 帮你核对。" : "",
+        speech: canPrompt
+          ? nextStep
+            ? `这还是中间步骤，先继续：${nextStep}。写完后再往下算。`
+            : "还没到最终答案，先把下一步关系式或计算写出来。"
+          : "",
         hintLevel: "light",
-        formulaOrStep: "",
+        formulaOrStep: nextStep,
         lectureComplete: false
       };
     }
