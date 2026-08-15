@@ -42,6 +42,19 @@ const QWEN_VL_MODEL =
   "qwen3.7-plus";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
+const QWEN_REQUEST_TIMEOUT_MS = Math.max(
+  8000,
+  Math.min(60000, Number(process.env.QWEN_REQUEST_TIMEOUT_MS || 25000))
+);
+const QWEN_HANDWRITING_RETRY_COUNT = Math.max(
+  0,
+  Math.min(2, Number(process.env.QWEN_HANDWRITING_RETRY_COUNT || 1))
+);
+// A second multimodal audit doubles latency and creates a second failure point.
+// Keep it opt-in; the primary structured result and local safety rules remain authoritative.
+const HANDWRITING_AUDIT_ENABLED = !["0", "false", "off"].includes(
+  String(process.env.HANDWRITING_AUDIT_ENABLED || "0").toLowerCase()
+);
 const HANDWRITING_FAST_CONFIDENCE = Number(process.env.HANDWRITING_FAST_CONFIDENCE || 0.94);
 const AZURE_TTS_KEY =
   process.env.AZURE_TTS_KEY ||
@@ -2517,6 +2530,8 @@ function isQwenJsonFormatUnsupported(error) {
 
 async function requestQwenChatCompletion(payload, useJsonFormat = true) {
   let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), QWEN_REQUEST_TIMEOUT_MS);
   try {
     response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
       method: "POST",
@@ -2527,41 +2542,76 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true) {
       body: JSON.stringify({
         ...payload,
         ...(useJsonFormat ? { response_format: { type: "json_object" } } : {})
-      })
+      }),
+      signal: controller.signal
     });
-  } catch (fetchError) {
-    const causeCode = fetchError?.cause?.code || fetchError?.code || "";
-    const error = new Error("Qwen 多模态 API 网络连接失败");
-    error.statusCode = 502;
-    error.code = "network_error";
-    error.causeCode = causeCode;
-    console.warn(`[qwen] network failed code=${causeCode || "unknown"} message=${fetchError?.message || ""}`);
-    throw error;
-  }
 
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const rawMessage = data.error?.message || `Qwen 多模态 API 请求失败：${response.status}`;
-    const rawCode = data.error?.code || data.error?.type || "qwen_error";
-    console.warn("[qwen] http failure", {
-      status: response.status,
-      code: rawCode,
-      message: rawMessage,
-      model: payload.model,
-      useJsonFormat
-    });
-    const friendlyMessage =
-      rawCode === "access_denied"
-        ? "Qwen API 访问被拒绝，请确认 .env 里的 Qwen_api_key 是阿里云百炼 API Key，并已开通对应多模态模型权限。"
-        : rawCode === "invalid_api_key" || /api key|authentication|认证|鉴权/i.test(rawMessage)
-          ? "Qwen API key 无法通过认证，请检查 .env 里的 Qwen_api_key、QWEN_API_KEY 或 DASHSCOPE_API_KEY。"
-          : rawMessage;
-    const error = new Error(friendlyMessage);
-    error.statusCode = response.status;
-    error.code = rawCode;
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      const error = new Error("Qwen 多模态 API 返回了无法解析的响应");
+      error.statusCode = 502;
+      error.code = "upstream_invalid_response";
+      error.model = payload.model;
+      throw error;
+    }
+
+    if (!response.ok) {
+      const rawMessage = data.error?.message || `Qwen 多模态 API 请求失败：${response.status}`;
+      const rawCode = data.error?.code || data.error?.type || "qwen_error";
+      const normalizedCode = response.status === 429
+        ? "rate_limited"
+        : response.status === 408 || response.status === 504
+          ? "qwen_timeout"
+          : response.status >= 500
+            ? "upstream_5xx"
+            : rawCode;
+      console.warn("[qwen] http failure", {
+        status: response.status,
+        code: normalizedCode,
+        upstreamCode: rawCode,
+        message: rawMessage,
+        model: payload.model,
+        useJsonFormat
+      });
+      const friendlyMessage =
+        rawCode === "access_denied"
+          ? "Qwen API 访问被拒绝，请确认 .env 里的 Qwen_api_key 是阿里云百炼 API Key，并已开通对应多模态模型权限。"
+          : rawCode === "invalid_api_key" || /api key|authentication|认证|鉴权/i.test(rawMessage)
+            ? "Qwen API key 无法通过认证，请检查 .env 里的 Qwen_api_key、QWEN_API_KEY 或 DASHSCOPE_API_KEY。"
+            : rawMessage;
+      const error = new Error(friendlyMessage);
+      error.statusCode = response.status;
+      error.status = response.status;
+      error.code = normalizedCode;
+      error.model = payload.model;
+      throw error;
+    }
+
+    return data;
+  } catch (fetchError) {
+    if (fetchError?.code === "upstream_invalid_response" || fetchError?.statusCode) {
+      throw fetchError;
+    }
+    const causeCode = fetchError?.cause?.code || fetchError?.code || "";
+    const timedOut = fetchError?.name === "AbortError";
+    const error = new Error(
+      timedOut
+        ? `Qwen 多模态 API 请求超过 ${Math.round(QWEN_REQUEST_TIMEOUT_MS / 1000)} 秒未返回`
+        : "Qwen 多模态 API 网络连接失败"
+    );
+    error.statusCode = 502;
+    error.code = timedOut ? "qwen_timeout" : "network_error";
+    error.causeCode = causeCode;
+    error.model = payload.model;
+    console.warn(
+      `[qwen] ${timedOut ? "timeout" : "network"} failed model=${payload.model || ""} timeoutMs=${QWEN_REQUEST_TIMEOUT_MS} code=${causeCode || "unknown"} message=${fetchError?.message || ""}`
+    );
     throw error;
+  } finally {
+    clearTimeout(timeout);
   }
-  return data;
 }
 
 async function callQwenMultimodalJson({ model, content, schema, instructions, maxOutputTokens = 1200 }) {
@@ -2638,20 +2688,60 @@ function summarizeHandwritingDiagnostics(diagnostics = {}) {
   };
 }
 
+function isTransientQwenError(error) {
+  const code = String(error?.code || "");
+  const status = Number(error?.statusCode || error?.status || 0);
+  if ([
+    "invalid_model_output",
+    "missing_qwen_api_key",
+    "invalid_api_key",
+    "access_denied",
+    "model_not_found",
+    "question_memory_missing",
+    "question_memory_mismatch"
+  ].includes(code)) return false;
+  return (
+    code === "network_error" ||
+    code === "qwen_timeout" ||
+    code === "rate_limited" ||
+    code === "upstream_5xx" ||
+    status === 408 ||
+    status === 429 ||
+    status >= 500
+  );
+}
+
 async function callHandwritingQwenJson(options, diagnostics = {}) {
-  try {
-    return await callQwenMultimodalJson(options);
-  } catch (error) {
-    error.stage = error.stage || "handwriting-model";
-    console.warn("[handwriting] model request failed", {
-      ...summarizeHandwritingDiagnostics(diagnostics),
-      stage: error.stage,
-      code: error.code || "",
-      status: error.statusCode || error.status || 0,
-      message: error.message || String(error)
-    });
-    throw error;
+  let lastError = null;
+  for (let attempt = 0; attempt <= QWEN_HANDWRITING_RETRY_COUNT; attempt += 1) {
+    try {
+      const result = await callQwenMultimodalJson(options);
+      if (attempt > 0) {
+        console.log(`[handwriting] retry succeeded attempt=${attempt + 1} model=${options.model || ""}`);
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      error.stage = error.stage || "handwriting-model";
+      error.requestId = diagnostics.requestId || 0;
+      error.sessionId = diagnostics.sessionId || 0;
+      error.questionId = diagnostics.questionId || "";
+      error.model = error.model || options.model || "";
+      console.warn("[handwriting] model request failed", {
+        ...summarizeHandwritingDiagnostics(diagnostics),
+        attempt: attempt + 1,
+        retryable: isTransientQwenError(error),
+        stage: error.stage,
+        code: error.code || "",
+        status: error.statusCode || error.status || 0,
+        model: error.model,
+        message: error.message || String(error)
+      });
+      if (attempt >= QWEN_HANDWRITING_RETRY_COUNT || !isTransientQwenError(error)) break;
+      await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+    }
   }
+  throw lastError;
 }
 
 function sanitizeKnowledge(value) {
@@ -8486,6 +8576,7 @@ function isOnlyDirectAnswerWriting(value) {
 }
 
 function shouldAuditHandwritingResult(result, answerKey, body = {}) {
+  if (!HANDWRITING_AUDIT_ENABLED) return false;
   if (!answerKey?.trusted) return false;
   const status = String(result?.calculationStatus || "");
   if (!["correct", "wrong"].includes(status)) return false;
@@ -8896,6 +8987,11 @@ async function handleRequest(req, res) {
         runtime: IS_VERCEL ? "vercel" : "local",
         qwenConfigured: Boolean(QWEN_API_KEY),
         qwenModel: QWEN_VL_MODEL,
+        qwenGuideModel: QWEN_GUIDE_MODEL,
+        qwenHandwritingModel: QWEN_HANDWRITING_MODEL,
+        qwenRequestTimeoutMs: QWEN_REQUEST_TIMEOUT_MS,
+        qwenHandwritingRetryCount: QWEN_HANDWRITING_RETRY_COUNT,
+        handwritingAuditEnabled: HANDWRITING_AUDIT_ENABLED,
         aliyunOcrConfigured: Boolean(ALIYUN_OCR_APPCODE),
         aliyunOcrEnabled: ALIYUN_OCR_ENABLED,
         aliyunOfficialEduPaperCutConfigured: Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET),
@@ -8933,7 +9029,12 @@ async function handleRequest(req, res) {
     sendJson(res, error.statusCode || 500, {
       error: error.message || "服务器错误",
       code: error.code || "server_error",
-      stage: error.stage || ""
+      stage: error.stage || "",
+      requestId: error.requestId || 0,
+      sessionId: error.sessionId || 0,
+      questionId: error.questionId || "",
+      model: error.model || "",
+      retryable: isTransientQwenError(error)
     });
   }
 }
@@ -8998,6 +9099,7 @@ module.exports = {
   buildQuestionMemory,
   questionMemoryToAnswerKey,
   buildHandwritingProcessFeedback,
+  isTransientQwenError,
   registerQuestionMemoryIdentity,
   registerHandwritingRequest,
   isLatestHandwritingRequest,

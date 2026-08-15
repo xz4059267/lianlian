@@ -209,6 +209,8 @@ const state = {
   imageDragging: false,
   lastPoint: null,
   recognitionTimer: null,
+  handwritingRetryTimer: null,
+  handwritingRetryCountByKey: {},
   handwritingRequestId: 0,
   handwritingRequestInFlight: false,
   handwritingActiveRequest: null,
@@ -367,6 +369,7 @@ function pauseTeachSessionForNavigation() {
   state.pendingThoughtTimer = null;
   clearTimeout(state.recognitionTimer);
   state.recognitionTimer = null;
+  clearHandwritingRetryTimer();
   clearIssueSilenceTimer();
   clearTimeout(state.recognitionResumeTimer);
   state.recognitionResumeTimer = null;
@@ -746,6 +749,7 @@ function markUserInput(type) {
     state.lastRecognizedSpeechAt = now;
   }
   if (type === "board") {
+    clearHandwritingRetryTimer();
     state.lastBoardWriteAt = now;
     const question = currentPageQuestion();
     if (question?.id) {
@@ -818,6 +822,49 @@ function finishHandwritingRequest(meta, status = "completed") {
   if (state.handwritingActiveRequest?.requestId !== meta?.requestId) return;
   state.handwritingActiveRequest = null;
   state.handwritingRequestInFlight = false;
+}
+
+function clearHandwritingRetryTimer() {
+  clearTimeout(state.handwritingRetryTimer);
+  state.handwritingRetryTimer = null;
+}
+
+function scheduleTransientHandwritingRetry(meta, reason) {
+  const question = currentPageQuestion();
+  if (
+    !meta ||
+    !question ||
+    question.id !== meta.questionId ||
+    getBoardVersion(question) !== Number(meta.boardVersion) ||
+    state.currentQuestionCompleted ||
+    state.teachSessionPaused ||
+    !hasCurrentBoardInk(question)
+  ) return;
+
+  const key = `${meta.sessionId}:${meta.questionId}:${meta.boardVersion}`;
+  const attempt = Number(state.handwritingRetryCountByKey[key] || 0);
+  if (attempt >= 2) return;
+  state.handwritingRetryCountByKey[key] = attempt + 1;
+  const delay = attempt === 0 ? 1200 : 3500;
+  clearHandwritingRetryTimer();
+  console.log("[handwriting] schedule transient retry", {
+    key,
+    attempt: attempt + 1,
+    delay,
+    reason
+  });
+  state.handwritingRetryTimer = setTimeout(() => {
+    state.handwritingRetryTimer = null;
+    const current = currentPageQuestion();
+    if (
+      !current ||
+      current.id !== meta.questionId ||
+      getBoardVersion(current) !== Number(meta.boardVersion) ||
+      state.currentQuestionCompleted ||
+      !hasCurrentBoardInk(current)
+    ) return;
+    scheduleHandwritingRecognition(`${reason}：临时故障自动重试`);
+  }, delay);
 }
 
 function getInteractionToken() {
@@ -3081,6 +3128,7 @@ function resetQuestionGuideState(options = {}) {
   setGuideState(GUIDE_STATES.HEURISTIC);
   clearPendingThought();
   clearTimeout(state.recognitionTimer);
+  clearHandwritingRetryTimer();
   state.lastSpeechAt = now;
   state.lastRecognizedSpeechAt = 0;
   state.lastBoardWriteAt = 0;
@@ -3100,6 +3148,7 @@ function resetQuestionGuideState(options = {}) {
   state.lianSpeechRequestId += 1;
   state.transcriptCorrectionRequestId += 1;
   state.handwritingRequestId += 1;
+  state.handwritingRetryCountByKey = {};
   if ("speechSynthesis" in window) window.speechSynthesis.cancel();
   stopLianSpeechOutput();
   dom.lianAvatar.classList.remove("speaking");
@@ -3232,10 +3281,52 @@ function explainHandwritingError(error) {
       pauseMs: 0
     };
   }
+  if (code === "invalid_board_snapshot") {
+    return {
+      pill: "板书截图无效",
+      log: "这次生成的板书截图尺寸或数据无效，板书内容已保留；请继续写完后再停笔。",
+      pauseMs: 0
+    };
+  }
   if (code === "question_memory_missing" || code === "question_memory_mismatch") {
     return {
       pill: "题目记忆未就绪",
       log: "当前题目的 Question Memory 未建立或不匹配；板书识别已停止，且没有重新请求标准答案。请重新进入这道题。",
+      pauseMs: 0
+    };
+  }
+  if (code === "qwen_timeout") {
+    return {
+      pill: "识别请求超时",
+      log: `Qwen 在${stage ? `${stage}阶段` : "板书识别"}超过规定时间没有返回。板书已保留，稍后会用同一份最新板书重试。`,
+      pauseMs: 0
+    };
+  }
+  if (code === "network_error") {
+    return {
+      pill: "识别网络暂时不通",
+      log: "Qwen 多模态服务暂时连接失败。板书已保留，请稍后停笔重试；这不是板书内容错误。",
+      pauseMs: 0
+    };
+  }
+  if (code === "rate_limited") {
+    return {
+      pill: "识别请求繁忙",
+      log: "Qwen 多模态服务当前请求较多，系统已保留板书并会稍后重试。",
+      pauseMs: 2500
+    };
+  }
+  if (code === "upstream_5xx") {
+    return {
+      pill: "识别服务暂时异常",
+      log: `Qwen 服务暂时返回异常${error?.status ? `（HTTP ${error.status}）` : ""}。系统已自动重试一次，板书内容已保留。`,
+      pauseMs: 0
+    };
+  }
+  if (code === "upstream_invalid_response") {
+    return {
+      pill: "模型响应异常",
+      log: "Qwen 返回了无法解析的响应，板书内容已保留，系统会自动重试一次。",
       pauseMs: 0
     };
   }
@@ -3295,6 +3386,7 @@ async function runHandwritingRecognition(reason) {
   beginHandwritingRequest(requestMeta);
   const recognitionInputSnapshot = getStudentInputSnapshot();
   const responseToken = getInteractionToken();
+  let shouldRetryTransiently = false;
   saveCurrentPage();
   dom.recognitionPill.textContent = "板书识别中";
   dom.recognitionPill.classList.remove("hidden");
@@ -3408,8 +3500,16 @@ async function runHandwritingRecognition(reason) {
     });
     state.lastHandwritingServiceError = info.pill;
     if (info.pauseMs) state.handwritingDisabledUntil = Date.now() + info.pauseMs;
+    shouldRetryTransiently = [
+      "qwen_timeout",
+      "network_error",
+      "rate_limited",
+      "upstream_5xx",
+      "upstream_invalid_response"
+    ].includes(String(error?.code || ""));
   } finally {
     finishHandwritingRequest(requestMeta, isCurrentHandwritingRequest(requestMeta) ? "completed" : "stale");
+    if (shouldRetryTransiently) scheduleTransientHandwritingRetry(requestMeta, reason);
     setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
     const queuedReason = state.handwritingQueuedReason;
     const queuedMeta = state.handwritingQueuedMeta;
@@ -3471,27 +3571,65 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     capturedAt: new Date().toISOString()
   };
   console.log("[handwriting] request snapshot", diagnostics);
-  const response = await fetch("/api/handwriting", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      questionId: question.id,
-      sessionId,
-      requestId,
-      memoryId: requestMeta.memoryId,
-      questionMemory,
-      boardOnlyImage,
-      reason,
-      boardIdleSeconds,
-      handwritingDiagnostics: diagnostics
-    })
-  });
-  const result = await response.json().catch(() => ({}));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 35000);
+  let response;
+  try {
+    response = await fetch("/api/handwriting", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        questionId: question.id,
+        sessionId,
+        requestId,
+        memoryId: requestMeta.memoryId,
+        questionMemory,
+        boardOnlyImage,
+        reason,
+        boardIdleSeconds,
+        handwritingDiagnostics: diagnostics
+      }),
+      signal: controller.signal
+    });
+  } catch (cause) {
+    const error = new Error(
+      cause?.name === "AbortError" ? "板书识别请求超时" : "板书识别网络连接失败"
+    );
+    error.code = cause?.name === "AbortError" ? "qwen_timeout" : "network_error";
+    error.stage = "handwriting-request";
+    error.causeCode = cause?.cause?.code || cause?.code || "";
+    error.requestId = requestId;
+    error.sessionId = sessionId;
+    error.questionId = question.id;
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+  let result;
+  try {
+    result = await response.json();
+  } catch (cause) {
+    const error = new Error("板书识别服务返回了无法解析的结果");
+    error.code = "upstream_invalid_response";
+    error.stage = "handwriting-response";
+    error.status = response.status;
+    error.statusCode = response.status;
+    error.requestId = requestId;
+    error.sessionId = sessionId;
+    error.questionId = question.id;
+    error.causeCode = cause?.name || "invalid_json";
+    throw error;
+  }
   if (!response.ok) {
     const error = new Error(result.error || "板书识别失败");
-    error.code = result.code || "";
+    error.code = result.code || "server_error";
     error.status = response.status;
+    error.statusCode = response.status;
     error.stage = result.stage || "";
+    error.requestId = result.requestId || requestId;
+    error.sessionId = result.sessionId || sessionId;
+    error.questionId = result.questionId || question.id;
+    error.model = result.model || "";
     throw error;
   }
   if (
@@ -3596,6 +3734,11 @@ async function createCurrentBoardOnlySnapshot() {
 async function composeStrokeOcrSnapshot(strokesDataUrl) {
   if (!strokesDataUrl) return "";
   const strokes = await loadImage(strokesDataUrl);
+  if (!strokes.naturalWidth || !strokes.naturalHeight) {
+    const error = new Error("板书快照尺寸无效");
+    error.code = "invalid_board_snapshot";
+    throw error;
+  }
   // Keep the handwriting payload readable while avoiding a large PNG upload.
   const maxWidth = 1024;
   const scale = Math.min(1, maxWidth / strokes.naturalWidth);
@@ -3631,7 +3774,13 @@ async function composeStrokeOcrSnapshot(strokesDataUrl) {
     }
   }
   ocrCtx.putImageData(imageData, 0, 0);
-  return canvas.toDataURL("image/jpeg", 0.84);
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.84);
+  if (!dataUrl || dataUrl.length < 100) {
+    const error = new Error("板书快照生成失败");
+    error.code = "invalid_board_snapshot";
+    throw error;
+  }
+  return dataUrl;
 }
 
 function isIncompleteHandwritingIssue(result) {
@@ -5997,11 +6146,13 @@ function markCurrentQuestionComplete() {
   state.currentQuestionCompleted = true;
   clearPendingThought();
   clearTimeout(state.recognitionTimer);
+  clearHandwritingRetryTimer();
   clearIssueTracking();
   clearSilenceFollowup();
   state.silenceGuidePending = false;
   state.activeGuideRequestId += 1;
   state.handwritingRequestId += 1;
+  state.handwritingRetryCountByKey = {};
   setGuideState(GUIDE_STATES.ARCHIVE);
   dom.lianState.textContent = "本题讲解完成";
   return true;

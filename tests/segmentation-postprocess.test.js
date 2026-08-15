@@ -37,11 +37,22 @@ const {
   buildQuestionMemory,
   questionMemoryToAnswerKey,
   buildHandwritingProcessFeedback,
+  isTransientQwenError,
   registerQuestionMemoryIdentity,
   registerHandwritingRequest,
   isLatestHandwritingRequest,
   getSilenceGuidePolicy
 } = require("../server.js");
+
+test("classifies only retryable Qwen transport failures as transient", () => {
+  assert.equal(isTransientQwenError({ code: "qwen_timeout" }), true);
+  assert.equal(isTransientQwenError({ code: "network_error" }), true);
+  assert.equal(isTransientQwenError({ code: "rate_limited" }), true);
+  assert.equal(isTransientQwenError({ code: "upstream_5xx", statusCode: 503 }), true);
+  assert.equal(isTransientQwenError({ code: "upstream_invalid_response", statusCode: 502 }), true);
+  assert.equal(isTransientQwenError({ code: "invalid_model_output", statusCode: 502 }), false);
+  assert.equal(isTransientQwenError({ code: "missing_qwen_api_key", statusCode: 503 }), false);
+});
 
 test("escalates silence guidance from a concrete entry point to a complete answer", () => {
   const stage0 = getSilenceGuidePolicy(0);
