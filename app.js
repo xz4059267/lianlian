@@ -3981,6 +3981,22 @@ function extractAnswerTextFromHandwriting(result) {
   ).trim();
 }
 
+function getVisibleHandwritingEvidence(result) {
+  const completedSteps = Array.isArray(result?.completedSteps)
+    ? result.completedSteps.join("\n")
+    : "";
+  return [
+    result?.mathExpression,
+    result?.detectedWriting,
+    result?.recognizedText,
+    result?.boardText,
+    completedSteps
+  ]
+    .filter((value) => value != null && String(value).trim())
+    .map((value) => String(value).trim())
+    .join("\n");
+}
+
 function getHandwritingAnswerEvidence(result) {
   const completedSteps = Array.isArray(result?.completedSteps)
     ? result.completedSteps.join("\n")
@@ -4001,27 +4017,53 @@ function getHandwritingAnswerEvidence(result) {
     .normalize("NFKC");
 }
 
+function hasExplicitHandwritingFinality(value) {
+  return /(?:最终答案|最后答案|答案|结果|所以|因此|解得|得到|得出|答\s*[:：])/i.test(
+    String(value || "")
+  );
+}
+
 function extractHandwritingFinalAnswerCandidate(result) {
-  const combined = getHandwritingAnswerEvidence(result);
+  const combined = getVisibleHandwritingEvidence(result);
   if (!combined.trim()) return "";
 
+  const explicitFinality = hasExplicitHandwritingFinality(combined);
+  const compactVisible = combined.replace(/\s+/g, "");
+  const standaloneAssignment = /^[a-zA-Z](?:=|＝|等于|为)[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/i.test(compactVisible);
   const assignmentMatches = [
     ...combined.matchAll(/([a-zA-Z])\s*(?:=|＝|等于|为)\s*([-+]?\d+(?:\.\d+)?(?:\s*\/\s*[-+]?\d+(?:\.\d+)?)?)\s*(°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?/g)
   ];
-  if (assignmentMatches.length) {
-    const latest = assignmentMatches.at(-1);
-    return `${latest[1].toLowerCase()}=${latest[2].replace(/\s+/g, "")}${latest[3] || ""}`;
+
+  // An embedded equation such as m-n=8 or 2y-3x=n is a calculation step,
+  // not a final answer. Only an explicit final-answer signal or an explicit
+  // complete state can make an assignment eligible for verification.
+  if (assignmentMatches.length && (explicitFinality || (result?.writingState === "complete" && standaloneAssignment))) {
+    for (const match of [...assignmentMatches].reverse()) {
+      const before = combined
+        .slice(0, match.index)
+        .replace(/\s+$/g, "")
+        .slice(-1);
+      if (before && /[A-Za-z0-9_+\-−*/×÷]/.test(before)) continue;
+      return `${match[1].toLowerCase()}=${match[2].replace(/\s+/g, "")}${match[3] || ""}`;
+    }
   }
 
   const explicitAnswer = combined.match(
-    /(?:答案|结果|最终|最后|解得|所以|得到|得出|为|是|等于|=|＝)\s*([A-D]|[-+]?\d+(?:\.\d+)?(?:\s*\/\s*[-+]?\d+(?:\.\d+)?)?\s*(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?)/i
+    /(?:最终答案|最后答案|答案|结果|所以|因此|解得|得到|得出|答)\s*(?:是|为|等于|[:：=＝])?\s*([A-DＡ-Ｄ]|[-+]?\d+(?:\.\d+)?(?:\s*\/\s*[-+]?\d+(?:\.\d+)?)?\s*(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?)/i
   );
-  if (explicitAnswer?.[1]) return explicitAnswer[1].replace(/\s+/g, "");
+  if (explicitAnswer?.[1]) {
+    return explicitAnswer[1]
+      .replace(/[ＡＢＣＤ]/gi, (value) => ({ Ａ: "A", Ｂ: "B", Ｃ: "C", Ｄ: "D" }[value] || value))
+      .replace(/\s+/g, "");
+  }
 
-  const shortText = combined.replace(/\s+/g, "");
-  if (/^[A-D]$/i.test(shortText)) return shortText.toUpperCase();
-  if (/^[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/.test(shortText)) {
-    return shortText;
+  // A bare number or option is ambiguous while the student is still writing.
+  if (explicitFinality || (result?.writingState === "complete" && standaloneAssignment)) {
+    const shortText = compactVisible;
+    if (/^[A-D]$/i.test(shortText)) return shortText.toUpperCase();
+    if (/^[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/.test(shortText)) {
+      return shortText;
+    }
   }
   return "";
 }
@@ -4031,13 +4073,20 @@ function shouldVerifyHandwritingFinalAnswer(result) {
   if (!candidate) return false;
   if (isHandwritingCalculationWrong(result)) return false;
 
-  const evidence = getHandwritingAnswerEvidence(result);
+  const evidence = getVisibleHandwritingEvidence(result);
+  const compactEvidence = evidence.replace(/\s+/g, "");
+  const standaloneAnswer = /^[A-DＡ-Ｄ]$|^[a-zA-Z](?:=|＝|等于|为)[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$|^[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/i.test(compactEvidence);
   const hasFinalitySignal = Boolean(
-    result?.boardComplete === true ||
-    result?.writingState === "complete" ||
-    /(?:最终答案|最后答案|答案|结果|所以|因此|解得|得到|得出|答[:：])/.test(evidence) ||
-    hasReviewableBoardStep(result)
+    hasExplicitHandwritingFinality(evidence) ||
+    (result?.writingState === "complete" && standaloneAnswer)
   );
+
+  console.log("[handwriting] final-answer-gate", {
+    candidate,
+    hasFinalitySignal,
+    writingState: result?.writingState || "",
+    hasReviewableBoardStep: hasReviewableBoardStep(result)
+  });
 
   // The model may omit isRelevant when it returns a valid structured answer
   // candidate. Keep the safety gate, but do not discard usable board evidence.
@@ -5951,7 +6000,6 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     });
     return false;
   }
-  const fallbackText = options.fallbackText || buildFallbackGuide(eventType, question);
   const requestId = ++state.activeGuideRequestId;
   const guideGeneration = state.guideGeneration;
   const questionId = question?.id || "";
@@ -5987,10 +6035,21 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     }
     if (skipStaleHandwritingFeedback("guide-result", guideInputSnapshot)) return false;
     const lectureComplete = shouldCompleteCurrentLecture(result, latestStudentSpeech);
-    const speech = formatGuideSpeech(eventType, result, fallbackText);
+    // Only Qwen may provide guide speech. Local formula/generic fallbacks are disabled.
+    const speech = formatGuideSpeech(result);
     if (result.shouldSpeak === false && !options.force) {
       dom.lianState.textContent = guideIdleText();
       if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
+      return false;
+    }
+    if (!speech) {
+      console.warn("[guide] Qwen returned no speech; local fallback is disabled", {
+        eventType,
+        requestId,
+        questionId,
+        provider: result?.provider || "qwen-structured-answer-guidance"
+      });
+      dom.lianState.textContent = "大模型没有返回引导";
       return false;
     }
 
@@ -6025,7 +6084,12 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
     return true;
   } catch (error) {
-    console.warn("AI guide fallback:", error);
+    console.warn("[guide] Qwen request failed; local fallback is disabled", {
+      eventType,
+      requestId,
+      questionId,
+      error: error?.message || String(error)
+    });
     if (
       state.teachSessionPaused ||
       requestId !== state.activeGuideRequestId ||
@@ -6036,20 +6100,8 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     ) {
       return false;
     }
-    const safeFallback = isSilenceGuide
-      ? buildSilenceEscalationFallback(options.silenceStage || state.silenceGuideStage)
-      : fallbackText;
-    void lianSpeak(safeFallback, {
-      responseToken,
-      responseId,
-      guideRequestId: requestId,
-      guideGeneration,
-      questionId,
-      dedupeKey: `guide-fallback:${questionId}:${eventType}:${Number(options.silenceStage || state.silenceGuideStage || 0)}`,
-      cooldownMs: 90000
-    });
-    if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
-    return true;
+    dom.lianState.textContent = "大模型引导请求失败";
+    return false;
   } finally {
     if (isSilenceGuide) state.silenceGuidePending = false;
     if (state.guideRequestInFlight?.requestId === requestId) {
@@ -6197,46 +6249,10 @@ function trimGuideSpeech(text, eventType) {
   return `${(softBreak > 18 ? clipped.slice(0, softBreak) : clipped).trim()}。`;
 }
 
-function formatGuideSpeech(eventType, result, fallbackText) {
-  let speech = String(result?.speech || "").trim() || fallbackText;
-  const formulaOrStep = String(result?.formulaOrStep || "").trim();
-  const silenceStage = Number(state.silenceGuideStage || 0);
-  const silenceAllowsConcrete = /silence/.test(eventType) && silenceStage >= 1;
-  const lectureUnlocked = state.guideState === GUIDE_STATES.INTERACTIVE || silenceAllowsConcrete;
-  const tooExplicit = !lectureUnlocked && ["formula", "worked_step", "summary"].includes(result?.hintLevel);
-  const needsConcreteStep = lectureUnlocked && /silence|active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType);
-  const silenceDetail = silenceAllowsConcrete ? getSilenceContextDetail() : { formula: "", explanation: "" };
-  const contextualStep = silenceDetail.formula;
-  const concreteFormula = extractConcreteMathRelation(formulaOrStep);
-
-  if (tooExplicit) speech = fallbackText;
-
-  if (needsConcreteStep) {
-    const modelFormula = concreteFormula || contextualStep;
-    const vagueSilenceSpeech = /下一步关系(?:式)?写出来|把对应的式子写|先把.*关系写|继续往下算|我来核对答案|核对服务.*没有返回|把最后答案再讲一次|在某个地方卡住|卡在哪里|先说说.*关系/i.test(speech);
-    const hasConcreteModelStep = Boolean(modelFormula && speech.includes(modelFormula.slice(0, 8)));
-
-    // Silence guidance is not allowed to degrade into a generic prompt. If
-    // the model omitted the concrete relation or returned a stale answer-check
-    // phrase, replace it with the locally assembled, question-specific step.
-    if (vagueSilenceSpeech || !hasConcreteModelStep) {
-      speech = buildConcreteSilenceFallback(silenceStage || 1, modelFormula);
-    }
-
-    if (modelFormula && !speech.includes(modelFormula.slice(0, 8))) {
-      speech += ` 先写出：${modelFormula}。`;
-    }
-  }
-
-  if (lectureUnlocked && result?.askStudentToRepeat && !/讲一遍|说一遍|写到黑板|复述|接着讲|继续讲|讲这一步/.test(speech)) {
-    speech += pickPrompt("ask-repeat", [
-      "听懂后，你用自己的话讲一遍，也可以写到黑板上。",
-      "你理解后，把这一步再讲一次，或者在黑板上写出来。",
-      "你用自己的话讲一遍就好。"
-    ]);
-  }
-
-  return trimGuideSpeech(speech, eventType);
+function formatGuideSpeech(result) {
+  // Speak exactly the structured text returned by Qwen. Do not append,
+  // replace, or repair it with local formulas or generic prompts.
+  return String(result?.speech || "").trim();
 }
 
 function buildFallbackGuide(eventType, question) {

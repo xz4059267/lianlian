@@ -238,6 +238,49 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
   assert.doesNotMatch(appHandwritingRun, /getVerifiedAnswerKey\(|fetch\("\/api\/answer-key"/);
 });
 
+  test("does not treat a reviewable intermediate equation as a final answer", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const gateSource = appSource.slice(
+    appSource.indexOf("function hasExplicitHandwritingFinality"),
+    appSource.indexOf("async function maybeVerifyFinalAnswerFromHandwriting")
+  );
+  const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const promptSource = serverSource.slice(
+    serverSource.indexOf("const HANDWRITING_PROMPT"),
+    serverSource.indexOf("const mimeTypes")
+  );
+
+  assert.match(gateSource, /hasExplicitHandwritingFinality/);
+  assert.match(gateSource, /writingState === "complete"/);
+  assert.doesNotMatch(
+    gateSource,
+    /hasReviewableBoardStep\(result\)\s*\n\s*\);/
+  );
+  assert.match(promptSource, /boardComplete=true 仅表示存在可核验关键步骤/);
+    assert.match(promptSource, /x-2y=m、m-n=8/);
+  });
+
+  test("does not trust a model-only finalAnswer over visible intermediate handwriting", () => {
+    const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+    const gateSource = appSource.slice(
+      appSource.indexOf("function getVisibleHandwritingEvidence"),
+      appSource.indexOf("async function maybeVerifyFinalAnswerFromHandwriting")
+    );
+    const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+    const promptSource = serverSource.slice(
+      serverSource.indexOf("const HANDWRITING_PROMPT"),
+      serverSource.indexOf("const mimeTypes")
+    );
+
+    assert.match(gateSource, /getVisibleHandwritingEvidence\(result\)/);
+    assert.match(gateSource, /standaloneAssignment/);
+    assert.doesNotMatch(
+      gateSource,
+      /String\(result\?\.finalAnswer \|\| ""\)\.trim\(\)/
+    );
+    assert.match(promptSource, /finalAnswer、answer 或 studentAnswer 不能凭空填写/);
+  });
+
 test("keeps correct board progress silent and grounds feedback in visible work", () => {
   const answerKey = questionMemoryToAnswerKey(buildQuestionMemory("q-1", {
     trusted: true,

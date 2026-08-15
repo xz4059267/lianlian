@@ -44,7 +44,7 @@ const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
 const QWEN_REQUEST_TIMEOUT_MS = Math.max(
   8000,
-  Math.min(60000, Number(process.env.QWEN_REQUEST_TIMEOUT_MS || 25000))
+  Math.min(55000, Number(process.env.QWEN_REQUEST_TIMEOUT_MS || 45000))
 );
 const QWEN_HANDWRITING_RETRY_COUNT = Math.max(
   0,
@@ -389,11 +389,13 @@ const HANDWRITING_PROMPT = [
   "writingState=in_progress 表示学生显然还在写或只完成部分步骤；只有输入显示长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
   "只有能指出具体 errorLocation，并能在 errorEvidence 中说明可见数字、符号、运算或结论与 Question Memory 的明确冲突时，才返回 calculationStatus=wrong。",
   "可见步骤与 Question Memory 一致时返回 correct，但这只说明已经写出的步骤成立，不代表学生完成了整道题，也不得推断后续答案。",
+  "writingState=complete 只有在当前截图明确出现最终结论、答案/结果/所以/解得等收束标记，或最后一行是独立且完整的最终答案时才允许；仅有 x-2y=m、m-n=8、代入式、过程式或一个正确关键步骤时，必须返回 in_progress 或 stalled。boardComplete=true 仅表示存在可核验关键步骤，绝不能作为最终答案信号。",
   "不要生成鼓励、提示、讲解或下一步建议；反馈由板书观察之后的独立流程生成。",
   "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
   "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；只要一个可见关键关系或计算步骤与 Question Memory 一致，就可以作为可核验步骤。",
   "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
   "如果板书已经出现最终结果或带有‘答案/所以/因此/解得’的结论，必须把该结果原样写入 detectedWriting 或 mathExpression，并把对应的最后一步保留在 completedSteps；不要只在 calculationCheck 里提到它。",
+  "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");
@@ -7849,7 +7851,21 @@ async function handleFinalAnswerCheck(req, res) {
   try {
     answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
   } catch (error) {
-    console.warn(`[final-answer] answer-key unavailable, using direct fallback: ${error.message || error}`);
+    console.warn(`[final-answer] answer-key unavailable code=${error.code || "unknown"}: ${error.message || error}`);
+    // A timeout is a transient upstream failure. Do not immediately send the
+    // same image to Qwen again: that doubles latency and often exceeds the
+    // Vercel function budget. The client can retry this single request later,
+    // while Question Memory will reuse the successful cache when available.
+    if (isTransientQwenError(error)) {
+      sendJson(res, 503, {
+        error: error.message || "Qwen 多模态请求暂时没有返回",
+        code: error.code || "qwen_unavailable",
+        stage: "final-answer-answer-key",
+        retryable: true,
+        model: error.model || QWEN_GUIDE_MODEL
+      });
+      return;
+    }
     sendJson(
       res,
       200,
@@ -8398,21 +8414,22 @@ async function handleGuide(req, res) {
     maxOutputTokens: 1200
   });
 
-  guideResult = enforceOrderedProportionConvention(guideResult, {
-    latestStudentSpeech: body.latestStudentSpeech || "",
-    problemText: guideBody.problemText || "",
-    knowledgePoints: body.knowledgePoints || []
+  // Model-only guide mode: return Qwen's structured response unchanged.
+  // Local formula builders and speech rewriters are intentionally bypassed so
+  // stale board context cannot masquerade as fresh model guidance.
+  console.info("[guide] qwen response accepted without local post-processing", {
+    eventType: body.eventType || "",
+    silenceStage: Number(body.silenceStage) || 0,
+    hasSpeech: Boolean(String(guideResult?.speech || "").trim()),
+    hasFormula: Boolean(String(guideResult?.formulaOrStep || "").trim())
   });
-  guideResult = await auditGuideMath(guideResult, answerKey, guideBody);
-  guideResult = applyLatestHandwritingConsistency(guideResult, guideBody);
-  guideResult = ensureConcreteSilenceGuide(guideResult, guideBody);
-
   sendJson(res, 200, {
     ...guideResult,
     model: QWEN_GUIDE_MODEL,
     answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
     provider: "qwen-structured-answer-guidance",
-    fallbackFrom: ""
+    fallbackFrom: "",
+    localPostProcessing: false
   });
 }
 
