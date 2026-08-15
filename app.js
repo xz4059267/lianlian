@@ -253,6 +253,7 @@ const state = {
   transcriptCorrectionRequestId: 0,
   awaitingFinalAnswer: false,
   pendingFinalAnswerText: "",
+  waitingForBoardBeforeFinalAnswer: false,
   finalAnswerVerified: false,
   verifiedFinalAnswerText: "",
   boardCompletionVerified: false,
@@ -688,6 +689,15 @@ function hasStudentInputSinceHandwritingRecognition() {
 }
 
 function skipStaleHandwritingFeedback(stage, snapshot) {
+  // A spoken final answer may arrive while the board request is still in flight.
+  // Let that request finish so it can satisfy the board-step gate, but still
+  // discard the result when the student has written anything newer.
+  if (
+    state.waitingForBoardBeforeFinalAnswer &&
+    (state.lastBoardWriteAt || 0) <= (snapshot?.boardWriteAt || 0)
+  ) {
+    return false;
+  }
   if (!hasStudentInputSince(snapshot)) return false;
   console.log("[handwriting] feedback skipped", {
     stage,
@@ -2286,6 +2296,7 @@ function startLecture(queue) {
   state.transcriptsByQuestion = {};
   state.awaitingFinalAnswer = false;
   state.pendingFinalAnswerText = "";
+  state.waitingForBoardBeforeFinalAnswer = false;
   state.finalAnswerVerified = false;
   state.verifiedFinalAnswerText = "";
   state.boardCompletionVerified = false;
@@ -3067,6 +3078,7 @@ function resetQuestionGuideState(options = {}) {
   state.currentQuestionCompleted = false;
   state.hasExplicitFinalAnswer = false;
   state.pendingFinalAnswerText = "";
+  state.waitingForBoardBeforeFinalAnswer = false;
   state.pendingLianQuestion = null;
   clearIssueTracking();
   clearSilenceFollowup();
@@ -3079,6 +3091,7 @@ function resetQuestionGuideState(options = {}) {
   dom.lianAvatar.classList.remove("speaking");
   dom.lianAvatar.classList.add("listening");
   state.awaitingFinalAnswer = false;
+  state.waitingForBoardBeforeFinalAnswer = false;
   state.finalAnswerVerified = false;
   state.verifiedFinalAnswerText = "";
   state.boardCompletionVerified = false;
@@ -3288,6 +3301,32 @@ async function runHandwritingRecognition(reason) {
     state.lastHandwritingRecognizedAt = Date.now();
     state.handwritingResults[question.id] = result;
     state.boardCompletionVerified = isBoardCompletionVerified(result);
+
+    if (state.waitingForBoardBeforeFinalAnswer) {
+      const pendingAnswer = state.pendingFinalAnswerText;
+      if (isHandwritingCalculationWrong(result)) {
+        dom.recognitionPill.textContent = "板书需要先检查";
+        maybeSpeakHandwritingGuidance(result);
+        return;
+      }
+      if (pendingAnswer && hasReviewableBoardStep(result)) {
+        state.waitingForBoardBeforeFinalAnswer = false;
+        state.pendingFinalAnswerText = "";
+        dom.recognitionPill.textContent = "正在核对最后答案";
+        void handleFinalAnswerSubmission(pendingAnswer, {
+          source: "speech-after-board",
+          silentLog: true
+        });
+        return;
+      }
+      dom.recognitionPill.textContent = "还需要关键步骤";
+      void lianSpeak("我还没看到可核验的关键步骤。请再写出一个关系式或计算步骤，写好后我就核对你刚才的答案。", {
+        dedupeKey: `final-answer-board-step-missing:${question.id}`,
+        cooldownMs: 0,
+        allowRepeat: true
+      });
+      return;
+    }
 
     const finalAnswerCandidate = extractHandwritingFinalAnswerCandidate(result);
     console.log("[handwriting] decision", {
@@ -3896,6 +3935,71 @@ function hasReviewableBoardStep(result) {
       hasRelation && variableCount >= 1 && numberCount >= 1 ||
       /(?:360|180).*(?:分之|\/|乘|×|x|X|\*).*(?:度|°|圆心角)/.test(boardText)
   );
+}
+
+function hasCurrentRecognizedBoardStep(question = currentPageQuestion()) {
+  if (!question || !hasCurrentBoardInk(question)) return false;
+  if (state.handwritingRequestInFlight) return false;
+  if (
+    state.lastBoardWriteAt &&
+    state.lastHandwritingRecognizedAt < state.lastBoardWriteAt
+  ) {
+    return false;
+  }
+  return hasReviewableBoardStep(state.latestHandwritingResult);
+}
+
+function handleSpokenFinalAnswer(answerText) {
+  const answer = String(answerText || "").trim();
+  const question = currentPageQuestion();
+  if (!answer || !question) return;
+
+  if (hasCurrentRecognizedBoardStep(question)) {
+    state.waitingForBoardBeforeFinalAnswer = false;
+    state.pendingFinalAnswerText = "";
+    void handleFinalAnswerSubmission(answer);
+    return;
+  }
+
+  // Keep the spoken answer, but require a freshly recognized key board step
+  // before the answer-check request is allowed to run.
+  state.waitingForBoardBeforeFinalAnswer = true;
+  state.pendingFinalAnswerText = answer;
+  state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.boardCompletionVerified = false;
+  addLog("我", answer);
+
+  if (!hasCurrentBoardInk(question)) {
+    dom.recognitionPill.textContent = "请先补充板书步骤";
+    dom.recognitionPill.classList.remove("hidden");
+    void lianSpeak("我先记下你的最后答案。请在黑板上写出一个关键关系式或计算步骤，写好后我再帮你核对答案。", {
+      dedupeKey: `final-answer-needs-board:${question.id}`,
+      cooldownMs: 0,
+      allowRepeat: true
+    });
+    return;
+  }
+
+  if (state.handwritingRequestInFlight) {
+    dom.recognitionPill.textContent = "正在检查板书步骤";
+    dom.recognitionPill.classList.remove("hidden");
+    void lianSpeak("我先等板书识别完成，再结合你写的关键步骤核对最后答案。", {
+      dedupeKey: `final-answer-waiting-board:${question.id}`,
+      cooldownMs: 0,
+      allowRepeat: true
+    });
+    return;
+  }
+
+  scheduleHandwritingRecognition("语音答案后检查关键步骤");
+  dom.recognitionPill.textContent = "请先补充板书步骤";
+  dom.recognitionPill.classList.remove("hidden");
+  void lianSpeak("我先记下你的最后答案。现在请把关键关系式或计算步骤写在黑板上，板书识别完成后我就开始核对。", {
+    dedupeKey: `final-answer-schedule-board:${question.id}`,
+    cooldownMs: 0,
+    allowRepeat: true
+  });
 }
 
 function shouldPromptSaveFromHandwriting(result) {
@@ -5136,32 +5240,30 @@ function handleSilenceTimeout() {
     return;
   }
 
-  setGuideState(GUIDE_STATES.MICRO_HINT);
-  state.silenceGuideStage = 1;
+  // Skip the vague first-stage care prompt. The first silence escalation
+  // should use the concrete guidance that previously appeared at 120s.
+  setGuideState(GUIDE_STATES.INTERACTIVE);
+  state.silenceGuideStage = 2;
   state.silenceGuidanceExhausted = false;
   state.awaitingSilenceFollowup = true;
   state.silenceCareAskedAt = now;
   console.info("[silence-guide] start", {
-    stage: 1,
+    stage: 2,
     silenceSeconds: Math.round(idleMs / 1000),
     allowConcreteStep: true,
     allowFormula: true,
     allowFinalAnswer: false
   });
-  requestSmartGuide("silence", "", {
+  requestSmartGuide("silence_followup", "", {
     force: true,
-    guideState: GUIDE_STATES.MICRO_HINT,
-    silenceStage: 1,
+    guideState: GUIDE_STATES.INTERACTIVE,
+    silenceStage: 2,
     allowConcreteStep: true,
     allowFormula: true,
     allowFinalAnswer: false,
     allowUnverifiedFinalAnswer: false,
     silenceSeconds: Math.round(idleMs / 1000),
-    fallbackText: buildSilenceEscalationFallback(1) /* pickPrompt("silence-care", [
-      "你停了一会儿。我们先接着刚才那一步想：题目里哪个条件还没有用上？",
-      "先不用急着往后算。回到刚才的思路，看看哪一个已知条件能接上这一步。",
-      "我们从刚才停下的位置接着看。你先找找题目里还没用到的那个关系。"
-    ]) */
+    fallbackText: buildSilenceEscalationFallback(2)
   });
 }
 
@@ -5235,7 +5337,7 @@ function handleStudentSpeech(text, options = {}) {
     state.awaitingFinalAnswer = false;
     state.pendingFinalAnswerText = "";
     dom.lianState.textContent = "正在核对最后答案";
-    void handleFinalAnswerSubmission(answerText);
+    handleSpokenFinalAnswer(answerText);
     return;
   }
 
@@ -5259,7 +5361,7 @@ function handleStudentSpeech(text, options = {}) {
       return;
     }
     state.pendingFinalAnswerText = "";
-    void handleFinalAnswerSubmission(combinedAnswer);
+    handleSpokenFinalAnswer(combinedAnswer);
     return;
   }
   recordFinalAnswerEvidence(text);
@@ -6746,7 +6848,7 @@ dom.finishQuestionBtn.addEventListener("click", () => {
   }
   const answerCandidate = extractFinalAnswerCandidate(dom.transcriptInput.value);
   if (answerCandidate) {
-    void handleFinalAnswerSubmission(answerCandidate);
+    handleSpokenFinalAnswer(answerCandidate);
     return;
   }
   if (state.awaitingFinalAnswer) return;

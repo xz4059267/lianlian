@@ -8176,7 +8176,7 @@ async function handleGuide(req, res) {
       STATEMENT_EVALUATION_RULES,
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
-      `SILENCE POLICY OVERRIDE: stage ${silenceStage}. After 60 seconds, give a concrete next operation tied to this problem, not a generic question. Stage 1 may give one problem-specific relation; stage 2 gives the next concrete operation; stage 3 gives the key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
+    `SILENCE POLICY OVERRIDE: stage ${silenceStage}. The first automatic silence response is stage 2 at 60 seconds; do not give the vague stage-1 care prompt. Stage 2 must give the first concrete problem-specific relation or operation; stage 3 gives the next key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
     ].join("\n\n"),
     content: [
       {
@@ -8230,7 +8230,7 @@ async function handleGuide(req, res) {
             "沉默时间越长，引导必须越具体：不能在后续阶段重复阶段1的泛泛提问，也不能把已经给过的提示原样重复。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
             "如果 eventType=active_help，学生已经明确提问或表示不会，必须 shouldSpeak=true，并直接回应这个问题；只给当前最需要的一个小步骤，不要先泛泛鼓励。",
-            "如果只是普通 1 分钟沉默且 awaitingSilenceFollowup=false，必须 shouldSpeak=true，并贴着学生最后讲到的内容给一个小切入点；不直接给完整公式或完整答案。只有 silenceStage>=3 才能逐步给出关键式；silenceStage>=4 且学生持续沉默时，允许直接完成题目讲解并给出最终答案，即使标准答案参考暂不可用，也必须从题图推导并检查。",
+            "普通沉默达到 60 秒时，必须 shouldSpeak=true，并直接给出贴着题目和学生当前进度的具体关系或下一步操作；不要再给泛泛的‘你卡在哪里’。只有 silenceStage>=3 才能逐步给出关键式；silenceStage>=4 且学生持续沉默时，允许直接完成题目讲解并给出最终答案，即使标准答案参考暂不可用，也必须从题图推导并检查。",
             "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
             "如果 eventType=thought_complete 且确实需要回应，speech 只能是一句短回应；不要展开完整讲解、不要连续解释多个概念。",
             "lectureComplete 默认必须为 false；只有 answerVerified=true、boardCompletionVerified=true，且学生已经讲完关键思路时才设为 true。点击‘我讲完了’本身不是完成证据。",
