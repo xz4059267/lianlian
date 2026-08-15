@@ -296,6 +296,7 @@ const state = {
   lianTtsAbortController: null,
   lianSpeechPausedRecognition: false,
   lianSpeechKeepAliveTimer: null,
+  openingSpeechWatchdogTimer: null,
   micPermissionGranted: false,
   micPermissionPending: false,
   silenceTimer: null,
@@ -363,6 +364,8 @@ function pauseTeachSessionForNavigation() {
   );
 
   stopSpeechNoResultTimer();
+  clearTimeout(state.openingSpeechWatchdogTimer);
+  state.openingSpeechWatchdogTimer = null;
   clearTimeout(state.silenceTimer);
   state.silenceTimer = null;
   clearTimeout(state.pendingThoughtTimer);
@@ -696,7 +699,7 @@ function hasStudentInputSinceHandwritingRecognition() {
   );
 }
 
-function skipStaleHandwritingFeedback(stage, snapshot) {
+function skipStaleHandwritingFeedback(stage, snapshot, options = {}) {
   // A spoken final answer may arrive while the board request is still in flight.
   // Let that request finish so it can satisfy the board-step gate, but still
   // discard the result when the student has written anything newer.
@@ -706,15 +709,47 @@ function skipStaleHandwritingFeedback(stage, snapshot) {
   ) {
     return false;
   }
-  if (!hasStudentInputSince(snapshot)) return false;
+  const hasNewBoard = (state.lastBoardWriteAt || 0) > (snapshot?.boardWriteAt || 0);
+  const hasNewSpeech = (state.lastRecognizedSpeechAt || 0) > (snapshot?.speechAt || 0);
+  const hasNewInput = options.boardOnly ? hasNewBoard : hasNewBoard || hasNewSpeech;
+  if (!hasNewInput) return false;
   console.log("[handwriting] feedback skipped", {
     stage,
-    reason: "new student board or speech input",
+    reason: options.boardOnly ? "newer student board input" : "new student board or speech input",
+    hasNewBoard,
+    hasNewSpeech,
     startedAt: snapshot,
     current: getStudentInputSnapshot()
   });
   dom.lianState.textContent = guideIdleText();
   return true;
+}
+
+function startSilenceTimerAfterOpening(questionId, openingStartedAt, source = "opening-finished") {
+  if (
+    currentPageQuestion()?.id !== questionId ||
+    state.currentQuestionCompleted ||
+    state.teachSessionPaused
+  ) return;
+
+  clearTimeout(state.openingSpeechWatchdogTimer);
+  state.openingSpeechWatchdogTimer = null;
+  state.openingSpeechInProgress = false;
+
+  // A student input already resets the timer. Do not move the anchor forward
+  // when the opening TTS finishes late.
+  if (state.lastUserInputAt <= openingStartedAt) {
+    state.lastUserInputAt = Date.now();
+    resetSilenceTimer(false);
+  } else if (!state.silenceTimer) {
+    resetSilenceTimer(false);
+  }
+  console.info("[silence-timer] armed", {
+    source,
+    questionId,
+    delayMs: state.silenceTimer ? SILENCE_CARE_MS : 0,
+    lastUserInputAt: state.lastUserInputAt
+  });
 }
 
 function clearSilenceFollowup() {
@@ -2439,18 +2474,17 @@ function initCurrentQuestion() {
     ]);
     state.pendingLianOpeningText = "";
     void lianSpeak(openingText, { isOpeningSpeech: true }).finally(() => {
-      if (currentPageQuestion()?.id === openingQuestionId) {
-        state.openingSpeechInProgress = false;
-      }
-      if (
-        currentPageQuestion()?.id === openingQuestionId &&
-        !state.currentQuestionCompleted &&
-        state.lastUserInputAt <= openingStartedAt
-      ) {
-        state.lastUserInputAt = Date.now();
-        resetSilenceTimer(false);
-      }
+      startSilenceTimerAfterOpening(openingQuestionId, openingStartedAt, "opening-finished");
     });
+    // Do not let a stalled cloud TTS request prevent the student-observation
+    // timer from ever starting. The opening text may remain visible, but the
+    // tutoring state must still progress after this safety window.
+    clearTimeout(state.openingSpeechWatchdogTimer);
+    state.openingSpeechWatchdogTimer = setTimeout(() => {
+      if (state.openingSpeechInProgress) {
+        startSilenceTimerAfterOpening(openingQuestionId, openingStartedAt, "opening-watchdog");
+      }
+    }, 15000);
   });
 }
 
@@ -3122,6 +3156,8 @@ dom.nextPageBtn.addEventListener("click", () => {
 
 function resetQuestionGuideState(options = {}) {
   const now = Date.now();
+  clearTimeout(state.openingSpeechWatchdogTimer);
+  state.openingSpeechWatchdogTimer = null;
   state.lectureSessionId += 1;
   state.inputSequenceId = 0;
   state.lastInputEvent = null;
@@ -3162,6 +3198,7 @@ function resetQuestionGuideState(options = {}) {
   state.autoSavePromptedQuestionId = "";
   state.finalAnswerRequestId += 1;
   state.silenceGuidePending = false;
+  state.openingSpeechInProgress = options.speak !== false;
   state.latestHandwritingResult = null;
   state.lastHandwritingIssueKey = "";
   state.lastHandwritingSuccessKey = "";
@@ -3186,16 +3223,16 @@ function resetQuestionGuideState(options = {}) {
       log: false,
       trackQuestion: false
     }).finally(() => {
-      if (
-        currentPageQuestion()?.id === questionId &&
-        !state.currentQuestionCompleted &&
-        state.lastUserInputAt <= speechStartedAt
-      ) {
-        state.lastUserInputAt = Date.now();
-        resetSilenceTimer(false);
-      }
+      startSilenceTimerAfterOpening(questionId, speechStartedAt, "question-change-finished");
     });
+    clearTimeout(state.openingSpeechWatchdogTimer);
+    state.openingSpeechWatchdogTimer = setTimeout(() => {
+      if (state.openingSpeechInProgress !== false) {
+        startSilenceTimerAfterOpening(questionId, speechStartedAt, "question-change-watchdog");
+      }
+    }, 15000);
   } else {
+    state.openingSpeechInProgress = false;
     dom.lianBubble.textContent = "";
     if (!options.deferSilenceTimer) resetSilenceTimer(false);
   }
@@ -3402,11 +3439,35 @@ async function runHandwritingRecognition(reason) {
       rememberHandwritingRequestStatus(requestId, "stale");
       return;
     }
-    if (skipStaleHandwritingFeedback("recognition-result", recognitionInputSnapshot)) return;
+    // Speech arriving while the board request is in flight does not invalidate
+    // the board observation. Only a newer board stroke can make this result
+    // stale; otherwise a spoken answer could erase a valid board response.
+    if (skipStaleHandwritingFeedback("recognition-result", recognitionInputSnapshot, { boardOnly: true })) return;
     state.latestHandwritingResult = result;
     state.lastHandwritingRecognizedAt = Date.now();
     state.handwritingResults[question.id] = result;
     state.boardCompletionVerified = isBoardCompletionVerified(result);
+
+    // A speech segment may finish while this board request is in flight.
+    // Keep the board observation as evidence, but never let the older board
+    // response speak over the student's newer explanation. The speech path
+    // already invalidates the old guide request and will submit the latest
+    // transcript with the current board evidence.
+    const speechArrivedAfterRecognitionStart =
+      (state.lastRecognizedSpeechAt || 0) > (recognitionInputSnapshot.speechAt || 0);
+    const boardArrivedAfterRecognitionStart =
+      (state.lastBoardWriteAt || 0) > (recognitionInputSnapshot.boardWriteAt || 0);
+    if (speechArrivedAfterRecognitionStart && !boardArrivedAfterRecognitionStart && !state.waitingForBoardBeforeFinalAnswer) {
+      console.info("[handwriting] board evidence kept; latest speech owns the response", {
+        questionId: question.id,
+        requestId,
+        boardVersion,
+        speechAt: state.lastRecognizedSpeechAt,
+        recognitionStartedWith: recognitionInputSnapshot
+      });
+      dom.recognitionPill.textContent = "板书已记录，按最新语音继续";
+      return;
+    }
 
     if (state.waitingForBoardBeforeFinalAnswer) {
       const pendingAnswer = state.pendingFinalAnswerText;
@@ -3477,6 +3538,14 @@ async function runHandwritingRecognition(reason) {
       dom.recognitionPill.textContent = "板书已记录";
       clearIssueTracking();
       if (state.guideState === GUIDE_STATES.MICRO_HINT) setGuideState(GUIDE_STATES.HEURISTIC);
+      const positiveFeedback = String(result.positiveFeedback || "").trim();
+      if (positiveFeedback && !hasStudentInputSinceHandwritingRecognition()) {
+        void lianSpeak(positiveFeedback, {
+          dedupeKey: `handwriting-positive:${question.id}:${boardVersion}`,
+          cooldownMs: 0,
+          allowRepeat: false
+        });
+      }
     } else {
       dom.recognitionPill.textContent = result.isRelevant ? "板书已记录" : "板书较少";
       if (result.isRelevant) {
@@ -5392,7 +5461,13 @@ function stopSpeechNoResultTimer() {
 function resetSilenceTimer(updateSpeechAt = true) {
   clearTimeout(state.silenceTimer);
   state.silenceTimer = null;
-  if (state.teachSessionPaused || state.silenceGuidanceExhausted) return;
+  if (state.teachSessionPaused || state.silenceGuidanceExhausted) {
+    console.info("[silence-timer] not armed", {
+      paused: state.teachSessionPaused,
+      exhausted: state.silenceGuidanceExhausted
+    });
+    return;
+  }
   const now = Date.now();
   if (updateSpeechAt || !state.lastSpeechAt) state.lastSpeechAt = now;
   if (!state.lastUserInputAt) state.lastUserInputAt = getLastUserInputAt() || now;
@@ -5401,9 +5476,21 @@ function resetSilenceTimer(updateSpeechAt = true) {
   const waitMs = state.awaitingSilenceFollowup ? SILENCE_AFTER_CARE_MS : SILENCE_CARE_MS;
   const delay = Math.max(0, waitMs - (now - anchor));
   state.silenceTimer = setTimeout(handleSilenceTimeout, delay);
+  console.info("[silence-timer] scheduled", {
+    followup: state.awaitingSilenceFollowup,
+    delayMs: delay,
+    silenceStage: state.silenceGuideStage,
+    questionId: currentPageQuestion()?.id || ""
+  });
 }
 
 function handleSilenceTimeout() {
+  console.info("[silence-timer] fired", {
+    questionId: currentPageQuestion()?.id || "",
+    idleSeconds: Math.round((Date.now() - getLastUserInputAt()) / 1000),
+    awaitingFollowup: state.awaitingSilenceFollowup,
+    stage: state.silenceGuideStage
+  });
   if (state.teachSessionPaused) return;
   if (!currentPageQuestion() || state.currentQuestionCompleted) return;
 
@@ -7156,20 +7243,22 @@ function goToLectureQuestion(index, openingText = "") {
   if (openingText) {
     const questionId = currentPageQuestion()?.id || "";
     const speechStartedAt = state.lastUserInputAt;
+    state.openingSpeechInProgress = true;
     void lianSpeak(openingText, {
       isOpeningSpeech: true,
       allowRepeat: true,
       cooldownMs: 0
     }).finally(() => {
-      if (
-        currentPageQuestion()?.id === questionId &&
-        !state.currentQuestionCompleted &&
-        state.lastUserInputAt <= speechStartedAt
-      ) {
-        state.lastUserInputAt = Date.now();
-        resetSilenceTimer(false);
-      }
+      startSilenceTimerAfterOpening(questionId, speechStartedAt, "question-change-finished");
     });
+    clearTimeout(state.openingSpeechWatchdogTimer);
+    state.openingSpeechWatchdogTimer = setTimeout(() => {
+      if (state.openingSpeechInProgress) {
+        startSilenceTimerAfterOpening(questionId, speechStartedAt, "question-change-watchdog");
+      }
+    }, 15000);
+  } else {
+    state.openingSpeechInProgress = false;
   }
   return true;
 }
