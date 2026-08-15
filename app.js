@@ -284,6 +284,9 @@ const state = {
   lianVoiceIdentity: "",
   lianVoiceSelectionLocked: false,
   lianSpeechRequestId: 0,
+  guideGeneration: 0,
+  guideRequestInFlight: null,
+  openingSpeechInProgress: false,
   lectureSessionId: 0,
   answerSessionId: 0,
   inputSequenceId: 0,
@@ -368,6 +371,8 @@ function pauseTeachSessionForNavigation() {
   clearTimeout(state.recognitionResumeTimer);
   state.recognitionResumeTimer = null;
   state.silenceGuidePending = false;
+  state.guideGeneration += 1;
+  state.guideRequestInFlight = null;
   state.activeGuideRequestId += 1;
   state.handwritingRequestId += 1;
   if (state.handwritingActiveRequest) {
@@ -730,7 +735,10 @@ function markUserInput(type) {
   // previous board or transcript. This prevents late network/TTS callbacks
   // from writing an answer after the student has already continued.
   state.activeGuideRequestId += 1;
+  state.guideGeneration += 1;
+  state.guideRequestInFlight = null;
   state.lianSpeechRequestId += 1;
+  state.openingSpeechInProgress = false;
   state.finalAnswerRequestId += 1;
   stopLianSpeechOutput();
   if (type === "speech") {
@@ -2367,6 +2375,9 @@ function initCurrentQuestion() {
   clearIssueTracking();
   clearSilenceFollowup();
   state.activeGuideRequestId += 1;
+  state.guideGeneration += 1;
+  state.guideRequestInFlight = null;
+  state.openingSpeechInProgress = true;
   const openingQuestionId = question.id;
   const openingStartedAt = state.lastUserInputAt;
   requestAnimationFrame(() => {
@@ -2381,6 +2392,9 @@ function initCurrentQuestion() {
     ]);
     state.pendingLianOpeningText = "";
     void lianSpeak(openingText, { isOpeningSpeech: true }).finally(() => {
+      if (currentPageQuestion()?.id === openingQuestionId) {
+        state.openingSpeechInProgress = false;
+      }
       if (
         currentPageQuestion()?.id === openingQuestionId &&
         !state.currentQuestionCompleted &&
@@ -5286,25 +5300,26 @@ function getSilenceContextDetail() {
   const questionChecks = Array.isArray(question?.verificationChecks)
     ? question.verificationChecks.map((step) => String(step || "").trim()).filter(Boolean)
     : [];
+  // A raw board transcript is evidence, not the source of truth for a
+  // problem relation. Prefer the answer-key outline that was produced when
+  // the question page was opened. This prevents OCR fragments such as
+  // “m-n=k” from becoming a new, incorrect guidance equation.
+  const trustedStep = outline[Math.min(completedSteps.length, Math.max(0, outline.length - 1))]
+    || outline[0]
+    || questionOutline[Math.min(completedSteps.length, Math.max(0, questionOutline.length - 1))]
+    || questionOutline[0];
   const candidates = [
+    trustedStep,
+    ...checks,
+    ...questionChecks,
     result.expectedNextStep,
     result.missingBoardContent,
-    result.detectedWriting,
-    result.mathExpression,
-    result.calculationCheck,
     result.currentStep,
+    result.calculationCheck,
+    result.mathExpression,
+    result.detectedWriting,
     result.boardText,
-    result.recognizedText,
-    outline[Math.min(completedSteps.length, Math.max(0, outline.length - 1))],
-    outline[0],
-    ...checks,
-    questionOutline[Math.min(completedSteps.length, Math.max(0, questionOutline.length - 1))],
-    questionOutline[0],
-    ...questionChecks,
-    memory?.problemText,
-    question?.problemText,
-    question?.standardAnswer,
-    question?.answer
+    result.recognizedText
   ]
     .map((step) => String(step || "").replace(/\s+/g, " ").trim())
     .filter(Boolean);
@@ -5351,23 +5366,24 @@ function extractConcreteMathRelation(value) {
   return "";
 }
 
-function buildConcreteSilenceFallback(stage) {
+function buildConcreteSilenceFallback(stage, formulaOverride = "") {
   const detail = getSilenceContextDetail();
   const normalizedStage = Math.max(1, Math.min(MAX_SILENCE_GUIDE_STAGE, Number(stage) || 1));
-  if (detail.formula) {
+  const formula = String(formulaOverride || detail.formula || "").trim();
+  if (formula) {
     const source = detail.explanation && detail.explanation !== detail.formula
       ? `这是根据题目条件“${detail.explanation.slice(0, 80)}”列出的`
       : "先把题目条件写成的";
     if (normalizedStage >= MAX_SILENCE_GUIDE_STAGE) {
-      return `${source}关键式 ${detail.formula}。现在沿着这个式子继续计算，并把最后答案写出来。`;
+      return `${source}关键式 ${formula}。现在沿着这个式子继续计算，并把最后答案写出来。`;
     }
     if (normalizedStage >= 3) {
-      return `关键式是 ${detail.formula}。请把它写在黑板上，再说明这一步是由哪些已知条件得到的。`;
+      return `关键式是 ${formula}。请把它写在黑板上，再说明这一步是由哪些已知条件得到的。`;
     }
     if (normalizedStage === 2) {
-      return `${source}关系式：${detail.formula}。先完成这一式，再继续下一步计算。`;
+      return `${source}关系式：${formula}。先完成这一式，再继续下一步计算。`;
     }
-    return `先写出这个具体关系式：${detail.formula}。它来自题目给出的已知条件。`;
+    return `先写出这个具体关系式：${formula}。它来自题目给出的已知条件。`;
   }
   if (detail.explanation) {
     return `根据题目中的“${detail.explanation.slice(0, 100)}”，先说明这一步的对应关系，再把得到的式子写在黑板上。`;
@@ -5761,6 +5777,10 @@ function buildThoughtPauseFallback(text, meta = {}) {
 async function requestSmartGuide(eventType, latestStudentSpeech = "", options = {}) {
   if (state.teachSessionPaused) return false;
   if (state.currentQuestionCompleted) return false;
+  if (state.openingSpeechInProgress && options.allowDuringOpening !== true) {
+    console.info("[guide] skipped while opening speech is active", { eventType });
+    return false;
+  }
   const now = Date.now();
   const cooldown = options.cooldown ?? 15000;
   if (!options.force && cooldown && now - state.lastGuideAt < cooldown) return false;
@@ -5769,13 +5789,38 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   if (isSilenceGuide && state.silenceGuidePending) return false;
 
   const question = currentPageQuestion();
+  if (!question) return false;
+  const activeRequest = state.guideRequestInFlight;
+  const activeRequestIsCurrent = Boolean(
+    activeRequest && activeRequest.requestId === state.activeGuideRequestId
+  );
+  if (activeRequestIsCurrent && options.replacePending !== true) {
+    console.info("[guide] skipped duplicate in-flight request", {
+      eventType,
+      requestId: activeRequest.requestId,
+      activeEventType: activeRequest.eventType
+    });
+    return false;
+  }
   const fallbackText = options.fallbackText || buildFallbackGuide(eventType, question);
   const requestId = ++state.activeGuideRequestId;
+  const guideGeneration = state.guideGeneration;
   const questionId = question?.id || "";
   const guideInputSnapshot = getStudentInputSnapshot();
   const responseToken = getInteractionToken();
   const responseId = `guide:${responseToken.sessionId}:${responseToken.sequenceId}:${requestId}`;
   const guideOptions = { ...options, inputSnapshot: guideInputSnapshot, responseToken, responseId };
+  state.guideRequestInFlight = {
+    requestId,
+    guideGeneration,
+    questionId,
+    eventType,
+    silenceStage: Number(options.silenceStage || state.silenceGuideStage || 0)
+  };
+  // Reserve the cooldown when the request starts, not only after TTS. This
+  // prevents a second trigger from starting while the first Qwen request is
+  // still waiting for the network.
+  state.lastGuideAt = now;
   setGuideState(targetGuideState);
   dom.lianState.textContent = targetGuideState === GUIDE_STATES.INTERACTIVE ? "准备分步讲解" : "在想提示";
   if (isSilenceGuide) state.silenceGuidePending = true;
@@ -5785,6 +5830,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     if (
       state.teachSessionPaused ||
       requestId !== state.activeGuideRequestId ||
+      guideGeneration !== state.guideGeneration ||
       currentPageQuestion()?.id !== questionId ||
       !isCurrentInteraction(responseToken)
     ) {
@@ -5800,10 +5846,26 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     }
 
     if (hasStudentInputSince(guideInputSnapshot)) return false;
-    await lianSpeak(speech, { responseToken, responseId });
+    const silenceStage = Number(options.silenceStage || state.silenceGuideStage || 0);
+    const guideFormula = /silence/.test(eventType)
+      ? extractConcreteMathRelation(String(result?.formulaOrStep || ""))
+      : "";
+    const speechDedupeKey = guideFormula
+      ? `step:${guideFormula}`
+      : normalizeGuidanceFingerprint(speech);
+    await lianSpeak(speech, {
+      responseToken,
+      responseId,
+      guideRequestId: requestId,
+      guideGeneration,
+      questionId,
+      dedupeKey: `guide:${questionId}:${/silence/.test(eventType) ? `silence-stage:${silenceStage}` : eventType}:${speechDedupeKey}`,
+      cooldownMs: 90000
+    });
     if (
       state.teachSessionPaused ||
       requestId !== state.activeGuideRequestId ||
+      guideGeneration !== state.guideGeneration ||
       currentPageQuestion()?.id !== questionId ||
       !isCurrentInteraction(responseToken) ||
       hasStudentInputSince(guideInputSnapshot)
@@ -5818,6 +5880,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     if (
       state.teachSessionPaused ||
       requestId !== state.activeGuideRequestId ||
+      guideGeneration !== state.guideGeneration ||
       currentPageQuestion()?.id !== questionId ||
       !isCurrentInteraction(responseToken) ||
       hasStudentInputSince(guideInputSnapshot)
@@ -5827,11 +5890,22 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     const safeFallback = isSilenceGuide
       ? buildSilenceEscalationFallback(options.silenceStage || state.silenceGuideStage)
       : fallbackText;
-    void lianSpeak(safeFallback, { responseToken, responseId });
+    void lianSpeak(safeFallback, {
+      responseToken,
+      responseId,
+      guideRequestId: requestId,
+      guideGeneration,
+      questionId,
+      dedupeKey: `guide-fallback:${questionId}:${eventType}:${Number(options.silenceStage || state.silenceGuideStage || 0)}`,
+      cooldownMs: 90000
+    });
     if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
     return true;
   } finally {
     if (isSilenceGuide) state.silenceGuidePending = false;
+    if (state.guideRequestInFlight?.requestId === requestId) {
+      state.guideRequestInFlight = null;
+    }
   }
 }
 
@@ -5840,6 +5914,17 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
   if (!question) throw new Error("没有当前题目");
 
   saveCurrentPage();
+  const memory = getQuestionMemory(question);
+  const trustedSteps = memory?.ready && Array.isArray(memory.solutionOutline)
+    ? memory.solutionOutline.map((step) => String(step || "").replace(/\s+/g, " ").trim()).filter(Boolean)
+    : [];
+  const completedStepCount = Array.isArray(state.latestHandwritingResult?.completedSteps)
+    ? state.latestHandwritingResult.completedSteps.length
+    : 0;
+  const trustedContextStep = trustedSteps[completedStepCount] || trustedSteps[0] || "";
+  const trustedProblemText = memory?.ready && memory.problemText
+    ? memory.problemText
+    : question.problemText || "";
   const response = await fetch("/api/guide", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -5851,13 +5936,19 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       transcript: dom.transcriptInput.value.trim(),
       latestStudentSpeech,
       lianQuestion: options.lianQuestion || "",
-      problemText: question.problemText || "",
+      problemText: trustedProblemText,
       questionType: question.problemType || question.questionType || question.type || "",
       knowledgePoints: question.knowledgePoints || [],
       boardImage: getBoardImageForGuide(),
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
       latestHandwritingResult: state.latestHandwritingResult || null,
-      silenceContextStep: /silence/.test(eventType) ? getSilenceContextStep() : "",
+      silenceContextStep: /silence/.test(eventType) ? (trustedContextStep || getSilenceContextStep()) : "",
+      verifiedGuideSteps: trustedSteps,
+      questionMemory: memory?.ready ? {
+        problemText: memory.problemText,
+        solutionOutline: trustedSteps,
+        verificationChecks: memory.verificationChecks || []
+      } : null,
       boardPendingRecognition: Boolean(
         state.lastBoardWriteAt &&
         state.lastBoardWriteAt > (state.lastHandwritingRecognizedAt || 0)
@@ -5978,7 +6069,7 @@ function formatGuideSpeech(eventType, result, fallbackText) {
     // the model omitted the concrete relation or returned a stale answer-check
     // phrase, replace it with the locally assembled, question-specific step.
     if (vagueSilenceSpeech || !hasConcreteModelStep) {
-      speech = buildConcreteSilenceFallback(silenceStage || 1);
+      speech = buildConcreteSilenceFallback(silenceStage || 1, modelFormula);
     }
 
     if (modelFormula && !speech.includes(modelFormula.slice(0, 8))) {
@@ -6402,6 +6493,13 @@ function lianSpeak(text, options = {}) {
   if (state.teachSessionPaused && options.allowWhilePaused !== true) return Promise.resolve(false);
   const responseToken = options.responseToken || getInteractionToken();
   if (!isCurrentInteraction(responseToken)) return Promise.resolve(false);
+  const isCurrentGuide = () => (
+    options.guideRequestId == null || (
+      Number(options.guideRequestId) === Number(state.activeGuideRequestId) &&
+      Number(options.guideGeneration) === Number(state.guideGeneration)
+    )
+  );
+  if (!isCurrentGuide()) return Promise.resolve(false);
   const now = Date.now();
   const dedupeKey = getGuidanceDedupeKey(text, options);
   const cooldownMs = Number.isFinite(options.cooldownMs) ? options.cooldownMs : REPEATED_GUIDANCE_COOLDOWN_MS;
@@ -6418,7 +6516,7 @@ function lianSpeak(text, options = {}) {
   dom.lianAvatar.classList.add("speaking");
   let textPublished = false;
   const publishText = () => {
-    if (textPublished || !isCurrentInteraction(responseToken)) return false;
+    if (textPublished || !isCurrentInteraction(responseToken) || !isCurrentGuide()) return false;
     textPublished = true;
     dom.lianBubble.textContent = text;
     if (options.log !== false) addLog("恋恋", text, { key: options.logKey || (dedupeKey ? `lian:${dedupeKey}` : "") });
@@ -6439,7 +6537,7 @@ function lianSpeak(text, options = {}) {
       if (finished) return;
       finished = true;
       if (fallbackTimer) clearTimeout(fallbackTimer);
-      const isCurrent = speechRequestId === state.lianSpeechRequestId && isCurrentInteraction(responseToken);
+      const isCurrent = speechRequestId === state.lianSpeechRequestId && isCurrentInteraction(responseToken) && isCurrentGuide();
       if (isCurrent) publishText();
       if (speechRequestId === state.lianSpeechRequestId) {
         clearInterval(state.lianSpeechKeepAliveTimer);
@@ -6457,7 +6555,7 @@ function lianSpeak(text, options = {}) {
     const playBrowserSpeech = () => {
       if (state.isMuted || !("speechSynthesis" in window)) return false;
       window.speechSynthesis.cancel();
-      if (speechRequestId !== state.lianSpeechRequestId) {
+      if (speechRequestId !== state.lianSpeechRequestId || !isCurrentGuide()) {
         finishSpeaking();
         return true;
       }
@@ -6470,7 +6568,7 @@ function lianSpeak(text, options = {}) {
           return true;
         }
         const startSpeech = (voice, chunkIndex = 0, retried = false) => {
-          if (finished || speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken)) {
+          if (finished || speechRequestId !== state.lianSpeechRequestId || !isCurrentInteraction(responseToken) || !isCurrentGuide()) {
             finishSpeaking();
             return;
           }
@@ -6514,7 +6612,7 @@ function lianSpeak(text, options = {}) {
         };
         clearInterval(state.lianSpeechKeepAliveTimer);
         state.lianSpeechKeepAliveTimer = setInterval(() => {
-          if (finished || speechRequestId !== state.lianSpeechRequestId) return;
+          if (finished || speechRequestId !== state.lianSpeechRequestId || !isCurrentGuide()) return;
           window.speechSynthesis.resume?.();
         }, 1200);
         startSpeech(getLianVoice());
@@ -6553,12 +6651,14 @@ function lianSpeak(text, options = {}) {
             !playedCloud &&
             options.isOpeningSpeech === true &&
             speechRequestId === state.lianSpeechRequestId &&
-            isCurrentInteraction(responseToken)
+            isCurrentInteraction(responseToken) &&
+            isCurrentGuide()
           ) {
             await new Promise((resolve) => setTimeout(resolve, 180));
             if (
               speechRequestId === state.lianSpeechRequestId &&
-              isCurrentInteraction(responseToken)
+              isCurrentInteraction(responseToken) &&
+              isCurrentGuide()
             ) {
               playedCloud = await playCloudLianSpeech(
                 speechText,
@@ -6578,7 +6678,7 @@ function lianSpeak(text, options = {}) {
           console.warn("Cloud Lian speech fallback:", error);
         }
       }
-      if (finished || !isCurrentInteraction(responseToken)) {
+      if (finished || !isCurrentInteraction(responseToken) || !isCurrentGuide()) {
         finishSpeaking();
         return;
       }

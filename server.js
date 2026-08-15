@@ -7126,7 +7126,7 @@ function getAnswerKeyCacheKey(questionImage, context = {}) {
     .createHash("sha256")
     .update(String(questionImage || ""))
     .update(`|problem:${String(context.problemText || "").replace(/\s+/g, " ").trim()}`)
-    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v9-choice-semantics`)
+    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v10-trusted-steps`)
     .digest("hex");
 }
 
@@ -7194,12 +7194,22 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     };
   }
 
-  if (solver.status !== "solved" || Number(solver.confidence) < ANSWER_KEY_MIN_CONFIDENCE || !solver.canonicalAnswer) {
+  const hasVerifiableWork = solver.solutionOutline.length > 0 && solver.verificationChecks.length > 0;
+  if (
+    solver.status !== "solved" ||
+    Number(solver.confidence) < ANSWER_KEY_MIN_CONFIDENCE ||
+    !solver.canonicalAnswer ||
+    !hasVerifiableWork
+  ) {
     return {
       trusted: false,
       status: solver.status || "unverified",
       confidence: Number(solver.confidence) || 0,
-      reason: solver.uncertainty || "独立解题未达到可信阈值",
+      reason: solver.uncertainty || (!hasVerifiableWork
+        ? "标准答案缺少可核验的关键步骤或验算记录"
+        : "独立解题未达到可信阈值"),
+      solutionOutline: solver.solutionOutline.slice(0, 8),
+      verificationChecks: solver.verificationChecks.slice(0, 8),
       elapsedMs: Date.now() - startedAt
     };
   }
@@ -7679,6 +7689,10 @@ async function auditGuideMath(result, answerKey, body) {
       wrongClaims.map((claim) => `${claim.raw}:${claim.reason}`).join(",")
     );
   }
+  // The answer-key solver already supplied the trusted solution outline and
+  // arithmetic checks. A second model audit here only adds latency and can
+  // replace a concrete, correct step with a vague fail-closed message.
+  if (body?.skipGuideModelAudit === true) return result;
   try {
     const audit = await callQwenMultimodalJson({
       model: QWEN_GUIDE_MODEL,
@@ -8185,6 +8199,29 @@ async function handleGuide(req, res) {
       }
     : privateAnswerReference(answerKey);
 
+  // The question image is the authority, and the answer-key outline is the
+  // authority for concrete guidance. The client can send a board/OCR-derived
+  // hint, but that hint must never replace a verified step: OCR fragments can
+  // concatenate unrelated symbols and create equations that are not in the
+  // question.
+  const verifiedGuideSteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
+    ? answerKey.solutionOutline.map((step) => String(step || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8)
+    : [];
+  const suppliedStep = String(body.silenceContextStep || "").replace(/\s+/g, " ").trim();
+  const suppliedStepIsTrusted = Boolean(
+    suppliedStep && verifiedGuideSteps.some((step) => step === suppliedStep || step.includes(suppliedStep) || suppliedStep.includes(step))
+  );
+  const verifiedGuideStep = verifiedGuideSteps.find((step) => /[A-Za-z0-9\u4e00-\u9fff][^\n]{0,100}(?:=|＝|:|：)[^\n]{0,100}[A-Za-z0-9\u4e00-\u9fff]/.test(step)) || "";
+  const guideBody = {
+    ...body,
+    skipGuideModelAudit: true,
+    problemText: answerKey?.trusted && answerKey.problemText
+      ? answerKey.problemText
+      : body.problemText || "",
+    silenceContextStep: suppliedStepIsTrusted ? suppliedStep : verifiedGuideStep,
+    verifiedGuideSteps
+  };
+
   let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
@@ -8195,6 +8232,7 @@ async function handleGuide(req, res) {
       STATEMENT_EVALUATION_RULES,
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
+      "Concrete guidance source: use verifiedGuideSteps and verifiedAnswerReference.solutionOutline as the only source for relations and formulas. Never copy equations from raw OCR or an unverified handwriting fragment into silenceContextStep.",
     `SILENCE POLICY OVERRIDE: stage ${silenceStage}. The first automatic silence response is stage 2 at 60 seconds; do not give the vague stage-1 care prompt. Stage 2 must give the first concrete problem-specific relation or operation; stage 3 gives the next key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
     ].join("\n\n"),
     content: [
@@ -8228,12 +8266,13 @@ async function handleGuide(req, res) {
           boardCompletionVerified: Boolean(body.boardCompletionVerified),
           transcript: body.transcript || "",
           latestStudentSpeech: body.latestStudentSpeech || "",
-          knownProblemText: body.problemText || "",
+          knownProblemText: guideBody.problemText || "",
           questionType: body.questionType || body.problemType || body.type || "",
           knownKnowledgePoints: body.knowledgePoints || [],
           hasBoardInk: body.hasBoardInk === true,
           latestHandwritingResult: body.latestHandwritingResult || null,
-          silenceContextStep: body.silenceContextStep || "",
+          silenceContextStep: guideBody.silenceContextStep || "",
+          verifiedGuideSteps,
           boardPendingRecognition: Boolean(body.boardPendingRecognition),
           verifiedAnswerReference: answerReference,
           boundaryRules: [
@@ -8271,12 +8310,12 @@ async function handleGuide(req, res) {
 
   guideResult = enforceOrderedProportionConvention(guideResult, {
     latestStudentSpeech: body.latestStudentSpeech || "",
-    problemText: body.problemText || "",
+    problemText: guideBody.problemText || "",
     knowledgePoints: body.knowledgePoints || []
   });
-  guideResult = await auditGuideMath(guideResult, answerKey, body);
-  guideResult = applyLatestHandwritingConsistency(guideResult, body);
-  guideResult = ensureConcreteSilenceGuide(guideResult, body);
+  guideResult = await auditGuideMath(guideResult, answerKey, guideBody);
+  guideResult = applyLatestHandwritingConsistency(guideResult, guideBody);
+  guideResult = ensureConcreteSilenceGuide(guideResult, guideBody);
 
   sendJson(res, 200, {
     ...guideResult,
