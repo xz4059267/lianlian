@@ -5267,7 +5267,7 @@ function handleSilenceTimeout() {
   });
 }
 
-function getSilenceContextStep() {
+function getSilenceContextDetail() {
   const result = state.latestHandwritingResult || {};
   const question = currentPageQuestion();
   const memory = getQuestionMemory(question);
@@ -5277,44 +5277,106 @@ function getSilenceContextStep() {
   const outline = Array.isArray(memory?.solutionOutline)
     ? memory.solutionOutline.map((step) => String(step || "").trim()).filter(Boolean)
     : [];
+  const checks = Array.isArray(memory?.verificationChecks)
+    ? memory.verificationChecks.map((step) => String(step || "").trim()).filter(Boolean)
+    : [];
+  const questionOutline = Array.isArray(question?.solutionOutline)
+    ? question.solutionOutline.map((step) => String(step || "").trim()).filter(Boolean)
+    : [];
+  const questionChecks = Array.isArray(question?.verificationChecks)
+    ? question.verificationChecks.map((step) => String(step || "").trim()).filter(Boolean)
+    : [];
   const candidates = [
     result.expectedNextStep,
     result.missingBoardContent,
+    result.detectedWriting,
+    result.mathExpression,
+    result.calculationCheck,
+    result.currentStep,
+    result.boardText,
+    result.recognizedText,
     outline[Math.min(completedSteps.length, Math.max(0, outline.length - 1))],
-    outline[0]
+    outline[0],
+    ...checks,
+    questionOutline[Math.min(completedSteps.length, Math.max(0, questionOutline.length - 1))],
+    questionOutline[0],
+    ...questionChecks,
+    memory?.problemText,
+    question?.problemText,
+    question?.standardAnswer,
+    question?.answer
   ]
     .map((step) => String(step || "").replace(/\s+/g, " ").trim())
     .filter(Boolean);
 
-  return candidates.find((step) => {
+  for (const candidate of candidates) {
+    const equation = extractConcreteMathRelation(candidate);
+    if (equation) return { formula: equation, explanation: candidate };
+  }
+  const explanation = candidates.find((step) => {
     if (/question memory|继续|下一步|关系式|列出|找出|想一想|再算|补写/i.test(step) && !/[=:+\-*/]/.test(step)) {
       return false;
     }
     return /[=:+\-*/]|\d|x|y|m|n|比例|面积|周长|体积|角度|方程|函数/i.test(step);
   }) || "";
+  return explanation ? { formula: "", explanation } : { formula: "", explanation: "" };
+}
+
+function getSilenceContextStep() {
+  return getSilenceContextDetail().formula;
+}
+
+function extractConcreteMathRelation(value) {
+  const text = String(value || "")
+    .normalize("NFKC")
+    .replace(/[−﹣－]/g, "-")
+    .replace(/[＝]/g, "=")
+    .replace(/[×]/g, "*")
+    .replace(/[÷]/g, "/")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+
+  const atom = "[-+A-Za-z0-9]+";
+  const candidates = [
+    ...text.matchAll(new RegExp(`${atom}(?:\\s*[+\\-*/]\\s*${atom}){0,5}\\s*(?:=|:|：)\\s*${atom}(?:\\s*[+\\-*/]\\s*${atom}){0,5}`, "g")),
+    ...text.matchAll(/\d+(?:\.\d+)?\s*[:：]\s*\d+(?:\.\d+)?\s*=\s*[-+A-Za-z0-9.]+\s*[:：]\s*[-+A-Za-z0-9.]+/g)
+  ];
+  for (const match of candidates) {
+    const relation = String(match[0] || "").replace(/\s+/g, " ").trim();
+    if (relation.length < 3 || relation.length > 80) continue;
+    if (!/[A-Za-z]/.test(relation) && !/\d\s*[:：=]/.test(relation)) continue;
+    return relation;
+  }
+  return "";
+}
+
+function buildConcreteSilenceFallback(stage) {
+  const detail = getSilenceContextDetail();
+  const normalizedStage = Math.max(1, Math.min(MAX_SILENCE_GUIDE_STAGE, Number(stage) || 1));
+  if (detail.formula) {
+    const source = detail.explanation && detail.explanation !== detail.formula
+      ? `这是根据题目条件“${detail.explanation.slice(0, 80)}”列出的`
+      : "先把题目条件写成的";
+    if (normalizedStage >= MAX_SILENCE_GUIDE_STAGE) {
+      return `${source}关键式 ${detail.formula}。现在沿着这个式子继续计算，并把最后答案写出来。`;
+    }
+    if (normalizedStage >= 3) {
+      return `关键式是 ${detail.formula}。请把它写在黑板上，再说明这一步是由哪些已知条件得到的。`;
+    }
+    if (normalizedStage === 2) {
+      return `${source}关系式：${detail.formula}。先完成这一式，再继续下一步计算。`;
+    }
+    return `先写出这个具体关系式：${detail.formula}。它来自题目给出的已知条件。`;
+  }
+  if (detail.explanation) {
+    return `根据题目中的“${detail.explanation.slice(0, 100)}”，先说明这一步的对应关系，再把得到的式子写在黑板上。`;
+  }
+  return "当前题目的具体步骤还没有加载完成，我暂时不猜式子以免误导。步骤加载后，我会直接给出对应关系式。";
 }
 
 function buildSilenceEscalationFallback(stage) {
-  const contextualStep = getSilenceContextStep();
-  if (contextualStep) {
-    const normalizedStage = Math.max(1, Math.min(MAX_SILENCE_GUIDE_STAGE, Number(stage) || 1));
-    if (normalizedStage === 1) {
-      return `先把这一步写出来：${contextualStep}。写好后再继续。`;
-    }
-    if (normalizedStage === 2) {
-      return `我们直接做这一小步：${contextualStep}。完成后再往下算。`;
-    }
-    if (normalizedStage === 3) {
-      return `把关键式写在黑板上：${contextualStep}。写好后再讲这一小步。`;
-    }
-  }
-  const fallbackByStage = {
-    1: "60秒了，我们直接做下一步：先从题目给出的条件列出对应关系式。",
-    2: "我们先把下一步关系写出来，再继续往下算。",
-    3: "现在把对应的式子写在黑板上，先完成这一小步。",
-    4: "我把这道题的关键式子和核验过的答案一起说清楚，你可以对照黑板检查。"
-  };
-  return fallbackByStage[Math.max(1, Math.min(MAX_SILENCE_GUIDE_STAGE, Number(stage) || 1))];
+  return buildConcreteSilenceFallback(stage);
 }
 
 function handleStudentSpeech(text, options = {}) {
@@ -5762,7 +5824,10 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     ) {
       return false;
     }
-    lianSpeak(fallbackText, { responseToken, responseId });
+    const safeFallback = isSilenceGuide
+      ? buildSilenceEscalationFallback(options.silenceStage || state.silenceGuideStage)
+      : fallbackText;
+    void lianSpeak(safeFallback, { responseToken, responseId });
     if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
     return true;
   } finally {
@@ -5898,20 +5963,27 @@ function formatGuideSpeech(eventType, result, fallbackText) {
   const lectureUnlocked = state.guideState === GUIDE_STATES.INTERACTIVE || silenceAllowsConcrete;
   const tooExplicit = !lectureUnlocked && ["formula", "worked_step", "summary"].includes(result?.hintLevel);
   const needsConcreteStep = lectureUnlocked && /silence|active_help|repeat_wrong|error_silence|silence_followup|silence_escalation|next_step/.test(eventType);
-  const contextualStep = silenceAllowsConcrete ? getSilenceContextStep() : "";
+  const silenceDetail = silenceAllowsConcrete ? getSilenceContextDetail() : { formula: "", explanation: "" };
+  const contextualStep = silenceDetail.formula;
+  const concreteFormula = extractConcreteMathRelation(formulaOrStep);
 
   if (tooExplicit) speech = fallbackText;
 
-  if (needsConcreteStep && contextualStep && !formulaOrStep && !speech.includes(contextualStep.slice(0, 8))) {
-    speech += ` 先把这一步写出来：${contextualStep}。写好后再继续。`;
-  }
+  if (needsConcreteStep) {
+    const modelFormula = concreteFormula || contextualStep;
+    const vagueSilenceSpeech = /下一步关系(?:式)?写出来|把对应的式子写|先把.*关系写|继续往下算|我来核对答案|核对服务.*没有返回|把最后答案再讲一次|在某个地方卡住|卡在哪里|先说说.*关系/i.test(speech);
+    const hasConcreteModelStep = Boolean(modelFormula && speech.includes(modelFormula.slice(0, 8)));
 
-  if (needsConcreteStep && formulaOrStep && !speech.includes(formulaOrStep.slice(0, 8))) {
-    speech += pickPrompt("formula-step", [
-      ` 可以先写：${formulaOrStep}。你照这个关系再讲一遍。`,
-      ` 你可以先把${formulaOrStep}写下来，再用自己的话说一次。`,
-      ` 先试着写出${formulaOrStep}，然后接着讲这一步就行了。`
-    ]);
+    // Silence guidance is not allowed to degrade into a generic prompt. If
+    // the model omitted the concrete relation or returned a stale answer-check
+    // phrase, replace it with the locally assembled, question-specific step.
+    if (vagueSilenceSpeech || !hasConcreteModelStep) {
+      speech = buildConcreteSilenceFallback(silenceStage || 1);
+    }
+
+    if (modelFormula && !speech.includes(modelFormula.slice(0, 8))) {
+      speech += ` 先写出：${modelFormula}。`;
+    }
   }
 
   if (lectureUnlocked && result?.askStudentToRepeat && !/讲一遍|说一遍|写到黑板|复述|接着讲|继续讲|讲这一步/.test(speech)) {

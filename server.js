@@ -8070,41 +8070,60 @@ function ensureConcreteSilenceGuide(result, body = {}) {
   const eventType = String(body.eventType || "");
   const silenceStage = Math.max(0, Math.min(4, Number(body.silenceStage) || 0));
   const contextualStep = String(body.silenceContextStep || "").replace(/\s+/g, " ").trim();
+  const modelStep = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
+  const concreteStep = contextualStep || (
+    /[A-Za-z0-9].*(?:=|:|：).*[A-Za-z0-9]/.test(modelStep) ? modelStep : ""
+  );
 
-  // Stages 1-3 must never fall back to a generic "write the formula" prompt
-  // when the entered Question Memory already supplied the next concrete step.
-  if (!/silence/.test(eventType) || silenceStage < 1 || silenceStage > 3 || !contextualStep) {
+  if (!/silence/.test(eventType) || silenceStage < 1 || silenceStage > 3) {
     return output;
   }
   if (body.boardPendingRecognition === true) {
     return output;
   }
 
-  const stageSpeech = {
-    1: `先根据题目给出的条件写出：${contextualStep}。`,
-    2: `下一步直接用这个关系计算：${contextualStep}。算完后把结果写在黑板上。`,
-    3: `关键式是：${contextualStep}。请把它写在黑板上，再继续算。`
-  }[silenceStage];
-
-  const currentFormula = String(output.formulaOrStep || "").trim();
-  const currentSpeech = String(output.speech || "").trim();
-  const hasContextInResponse = currentFormula === contextualStep
-    || currentSpeech.includes(contextualStep);
-  if (hasContextInResponse) {
-    return { ...output, formulaOrStep: contextualStep };
+  // Do not let a model response such as “write the next relation” or “I will
+  // check the answer” reach the student. When neither the question memory nor
+  // the structured model field contains a concrete relation, expose the
+  // loading problem honestly instead of inventing mathematics.
+  if (!concreteStep) {
+    return {
+      ...output,
+      shouldSpeak: true,
+      speech: "当前题目的具体步骤还没有加载完成，我暂时不猜式子，以免误导你。步骤加载后我会直接给出对应关系式。",
+      hintLevel: "light",
+      formulaOrStep: "",
+      askStudentToRepeat: false,
+      studentAction: "等待题目步骤加载后再继续。",
+      lectureComplete: false
+    };
   }
 
-  console.warn(`[silence-guide] restored concrete step stage=${silenceStage}: ${contextualStep}`);
+  const stageSpeech = {
+    1: `先根据题目给出的条件写出：${concreteStep}。`,
+    2: `下一步直接用这个关系计算：${concreteStep}。算完后把结果写在黑板上。`,
+    3: `关键式是：${concreteStep}。请把它写在黑板上，再继续算。`
+  }[silenceStage];
+
+  const currentSpeech = String(output.speech || "").trim();
+  const hasConcreteStepInResponse = currentSpeech.includes(concreteStep)
+    || modelStep === concreteStep;
+  const vagueSpeech = /下一步关系(?:式)?写出来|把对应的式子写|继续往下算|我来核对答案|核对服务.*没有返回|把最后答案再讲一次|卡在哪里/i.test(currentSpeech);
+  if (hasConcreteStepInResponse && !vagueSpeech) {
+    return { ...output, formulaOrStep: concreteStep };
+  }
+
+  console.warn(`[silence-guide] restored concrete step stage=${silenceStage}: ${concreteStep}`);
   return {
     ...output,
     shouldSpeak: true,
     speech: stageSpeech,
     hintLevel: silenceStage >= 3 ? "worked_step" : "light",
-    formulaOrStep: contextualStep,
+    formulaOrStep: concreteStep,
     askStudentToRepeat: silenceStage >= 3,
     studentAction: silenceStage >= 3
-      ? `请把${contextualStep}写在黑板上，或用自己的话复述。`
-      : `请先写出${contextualStep}。`,
+      ? `请把${concreteStep}写在黑板上，或用自己的话复述。`
+      : `请先写出${concreteStep}。`,
     lectureComplete: false
   };
 }
