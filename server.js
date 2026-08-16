@@ -8305,11 +8305,20 @@ async function handleGuide(req, res) {
         trusted: Boolean(answerKey?.trusted)
       });
     } else {
-      console.info("[guide] answer-key source=lookup", {
+      // Do not serialize a second multimodal answer-key request in front of
+      // every guide request. On a cold question that created a 45s + 45s
+      // chain, while the browser gives the guide request only ~52s. The guide
+      // model already receives the question image and can produce the next
+      // concrete step directly; a verified key is reused only when the frozen
+      // Question Memory is ready.
+      console.info("[guide] answer-key lookup skipped for single-pass guide", {
         questionId: body.questionId || "",
-        hasQuestionMemory: Boolean(body.questionMemory)
+        hasQuestionMemory: Boolean(body.questionMemory),
+        reason: "avoid-serial-multimodal-request"
       });
-      answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+      answerKey = makeUnavailableAnswerKey(
+        new Error("guide-single-pass-no-ready-question-memory")
+      );
     }
   } catch (error) {
     console.warn(`[guide] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
