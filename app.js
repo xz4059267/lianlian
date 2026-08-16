@@ -138,6 +138,9 @@ const GUIDE_STATE_LABELS = {
 
 const SILENCE_CARE_MS = 60000;
 const SILENCE_AFTER_CARE_MS = 60000;
+const GUIDE_REQUEST_TIMEOUT_MS = 52000;
+const LIAN_TTS_REQUEST_TIMEOUT_MS = 9000;
+const LIAN_TEXT_PUBLISH_WATCHDOG_MS = 10000;
 // Each additional full idle interval moves the guide closer to a concrete
 // equation and the verified answer. Student input resets the level.
 const MAX_SILENCE_GUIDE_STAGE = 4;
@@ -958,6 +961,23 @@ function stopLianSpeechOutput() {
   if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 }
 
+function createBoundedAbortController(parentSignal, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) abortFromParent();
+    else parentSignal.addEventListener("abort", abortFromParent, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+    }
+  };
+}
+
 function getLianAudioElement() {
   if (state.lianAudioElement) return state.lianAudioElement;
   const audio = new Audio();
@@ -997,11 +1017,13 @@ function primeLianCloudSpeech(text) {
   if (state.lianTtsPrefetchPromise?.text === speechText) return state.lianTtsPrefetchPromise.promise;
 
   const promise = (async () => {
+    const requestControl = createBoundedAbortController(null, LIAN_TTS_REQUEST_TIMEOUT_MS);
     try {
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: speechText, responseId: "lian-prefetch" })
+        body: JSON.stringify({ text: speechText, responseId: "lian-prefetch" }),
+        signal: requestControl.signal
       });
       if (!response.ok) return null;
       const blob = await response.blob();
@@ -1012,6 +1034,7 @@ function primeLianCloudSpeech(text) {
       console.warn("[tts] cloud prefetch failed:", error?.message || error);
       return null;
     } finally {
+      requestControl.cleanup();
       if (state.lianTtsPrefetchPromise?.text === speechText) state.lianTtsPrefetchPromise = null;
     }
   })();
@@ -6060,21 +6083,40 @@ function buildThoughtPauseFallback(text, meta = {}) {
 }
 
 async function requestSmartGuide(eventType, latestStudentSpeech = "", options = {}) {
-  if (state.teachSessionPaused) return false;
-  if (state.currentQuestionCompleted) return false;
+  if (state.teachSessionPaused) {
+    console.info("[guide] skipped", { eventType, reason: "session-paused" });
+    return false;
+  }
+  if (state.currentQuestionCompleted) {
+    console.info("[guide] skipped", { eventType, reason: "question-completed" });
+    return false;
+  }
   if (state.openingSpeechInProgress && options.allowDuringOpening !== true) {
     console.info("[guide] skipped while opening speech is active", { eventType });
     return false;
   }
   const now = Date.now();
   const cooldown = options.cooldown ?? 15000;
-  if (!options.force && cooldown && now - state.lastGuideAt < cooldown) return false;
+  if (!options.force && cooldown && now - state.lastGuideAt < cooldown) {
+    console.info("[guide] skipped", {
+      eventType,
+      reason: "cooldown",
+      remainingMs: cooldown - (now - state.lastGuideAt)
+    });
+    return false;
+  }
   const targetGuideState = options.guideState || state.guideState;
   const isSilenceGuide = /silence/.test(eventType);
-  if (isSilenceGuide && state.silenceGuidePending) return false;
+  if (isSilenceGuide && state.silenceGuidePending) {
+    console.info("[guide] skipped", { eventType, reason: "silence-request-pending" });
+    return false;
+  }
 
   const question = currentPageQuestion();
-  if (!question) return false;
+  if (!question) {
+    console.warn("[guide] skipped", { eventType, reason: "no-current-question" });
+    return false;
+  }
   const activeRequest = state.guideRequestInFlight;
   const activeRequestIsCurrent = Boolean(
     activeRequest && activeRequest.requestId === state.activeGuideRequestId
@@ -6118,9 +6160,17 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       currentPageQuestion()?.id !== questionId ||
       !isCurrentInteraction(responseToken)
     ) {
+      console.info("[guide] result-discarded", {
+        eventType,
+        requestId,
+        reason: "stale-interaction-or-question"
+      });
       return false;
     }
-    if (skipStaleHandwritingFeedback("guide-result", guideInputSnapshot)) return false;
+    if (skipStaleHandwritingFeedback("guide-result", guideInputSnapshot)) {
+      console.info("[guide] result-discarded", { eventType, requestId, reason: "new-student-input" });
+      return false;
+    }
     const lectureComplete = shouldCompleteCurrentLecture(result, latestStudentSpeech);
     // Only Qwen may provide guide speech. Local formula/generic fallbacks are disabled.
     const speech = formatGuideSpeech(result);
@@ -6137,6 +6187,10 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
         provider: result?.provider || "qwen-structured-answer-guidance"
       });
       dom.lianState.textContent = "大模型没有返回引导";
+      lianSilentNotice("这次引导没有拿到可用回复，请继续说或写下当前步骤。", {
+        key: `guide-empty:${questionId}:${eventType}`,
+        cooldownMs: 10000
+      });
       return false;
     }
 
@@ -6188,6 +6242,10 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       return false;
     }
     dom.lianState.textContent = "大模型引导请求失败";
+    lianSilentNotice("引导请求暂时没有返回，请稍后再试。", {
+      key: `guide-failed:${questionId}:${eventType}`,
+      cooldownMs: 10000
+    });
     return false;
   } finally {
     if (isSilenceGuide) state.silenceGuidePending = false;
@@ -6213,9 +6271,20 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
   const trustedProblemText = memory?.ready && memory.problemText
     ? memory.problemText
     : question.problemText || "";
-  const response = await fetch("/api/guide", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+  const requestControl = createBoundedAbortController(null, GUIDE_REQUEST_TIMEOUT_MS);
+  const requestStartedAt = Date.now();
+  console.info("[guide] request-start", {
+    eventType,
+    questionId: question.id || "",
+    silenceStage: Number(options.silenceStage || state.silenceGuideStage || 0),
+    hasQuestionMemory: Boolean(memory?.ready),
+    timeoutMs: GUIDE_REQUEST_TIMEOUT_MS
+  });
+  let response;
+  try {
+    response = await fetch("/api/guide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
       questionImage: question.image,
       questionId: question.id,
@@ -6232,10 +6301,29 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       latestHandwritingResult: state.latestHandwritingResult || null,
       silenceContextStep: /silence/.test(eventType) ? (trustedContextStep || getSilenceContextStep()) : "",
       verifiedGuideSteps: trustedSteps,
-      questionMemory: memory?.ready ? {
+      // Reuse the frozen Question Memory created when this question was
+      // entered. The guide endpoint must not solve the same image again just
+      // to recover the answer key that is already available in the browser.
+      questionMemory: memory ? {
+        version: memory.version,
+        memoryId: memory.memoryId,
+        sessionId: memory.sessionId,
+        questionId: memory.questionId,
+        ready: memory.ready,
+        status: memory.status,
+        confidence: memory.confidence,
+        canonicalAnswer: memory.canonicalAnswer,
+        acceptedAnswers: memory.acceptedAnswers || [],
+        choiceAnalysis: memory.choiceAnalysis || null,
         problemText: memory.problemText,
+        questionType: memory.questionType,
+        knowledge: memory.knowledge,
         solutionOutline: trustedSteps,
-        verificationChecks: memory.verificationChecks || []
+        verificationChecks: memory.verificationChecks || [],
+        studentTrace: memory.studentTrace || null,
+        reason: memory.reason || "",
+        provider: memory.provider || "",
+        elapsedMs: memory.elapsedMs || 0
       } : null,
       boardPendingRecognition: Boolean(
         state.lastBoardWriteAt &&
@@ -6263,7 +6351,26 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       boardCompletionVerified: state.boardCompletionVerified,
       inputSnapshot: options.inputSnapshot || getStudentInputSnapshot(),
       responseId: options.responseId || ""
-    })
+      }),
+      signal: requestControl.signal
+    });
+  } catch (error) {
+    console.error("[guide] request-failed", {
+      eventType,
+      questionId: question.id || "",
+      elapsedMs: Date.now() - requestStartedAt,
+      reason: error?.name === "AbortError" ? "timeout-or-cancel" : "network",
+      message: error?.message || String(error)
+    });
+    throw error;
+  } finally {
+    requestControl.cleanup();
+  }
+  console.info("[guide] response-received", {
+    eventType,
+    questionId: question.id || "",
+    status: response.status,
+    elapsedMs: Date.now() - requestStartedAt
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(result.error || "讲解引导失败");
@@ -6644,7 +6751,10 @@ async function playCloudLianSpeech(
     audioBlob = state.lianTtsPrefetch.blob;
     state.lianTtsPrefetch = null;
   } else if (state.lianTtsPrefetchPromise?.text === speechText) {
-    audioBlob = await state.lianTtsPrefetchPromise.promise;
+    audioBlob = await Promise.race([
+      state.lianTtsPrefetchPromise.promise,
+      new Promise((resolve) => setTimeout(() => resolve(null), LIAN_TTS_REQUEST_TIMEOUT_MS))
+    ]);
     if (state.lianTtsPrefetch?.text === speechText) {
       audioBlob = state.lianTtsPrefetch.blob;
       state.lianTtsPrefetch = null;
@@ -6653,12 +6763,16 @@ async function playCloudLianSpeech(
 
   // 首句可能遇到云端令牌刚建立、网络瞬时抖动等情况，云端请求最多重试一次。
   for (let attempt = 0; !audioBlob && attempt < 2; attempt += 1) {
+    const requestControl = createBoundedAbortController(
+      abortController?.signal,
+      LIAN_TTS_REQUEST_TIMEOUT_MS
+    );
     try {
       const response = await fetch("/api/tts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: speechText, responseId }),
-        signal: abortController?.signal
+        signal: requestControl.signal
       });
       if (response.ok) {
         audioBlob = await response.blob();
@@ -6668,6 +6782,8 @@ async function playCloudLianSpeech(
       }
     } catch (error) {
       console.warn(`[tts] cloud request attempt=${attempt + 1} failed:`, error?.message || error);
+    } finally {
+      requestControl.cleanup();
     }
     if (!audioBlob?.size && attempt === 0) await new Promise((resolve) => setTimeout(resolve, 180));
   }
@@ -6787,9 +6903,26 @@ function lianSpeak(text, options = {}) {
   return new Promise((resolve) => {
     let finished = false;
     let fallbackTimer = null;
+    const textWatchdog = setTimeout(() => {
+      if (
+        finished ||
+        textPublished ||
+        speechRequestId !== state.lianSpeechRequestId ||
+        !isCurrentInteraction(responseToken) ||
+        !isCurrentGuide()
+      ) return;
+      console.warn("[tts] text publish watchdog fired", {
+        responseId,
+        speechRequestId,
+        timeoutMs: LIAN_TEXT_PUBLISH_WATCHDOG_MS
+      });
+      publishText();
+      dom.lianState.textContent = "语音准备中";
+    }, LIAN_TEXT_PUBLISH_WATCHDOG_MS);
     const finishSpeaking = () => {
       if (finished) return;
       finished = true;
+      clearTimeout(textWatchdog);
       if (fallbackTimer) clearTimeout(fallbackTimer);
       const isCurrent = speechRequestId === state.lianSpeechRequestId && isCurrentInteraction(responseToken) && isCurrentGuide();
       if (isCurrent) publishText();

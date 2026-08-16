@@ -8291,12 +8291,38 @@ async function handleGuide(req, res) {
   const lectureUnlocked = Boolean(body.lectureUnlocked || silencePolicy.guideState === "interactive_teaching");
   const allowUnverifiedFinalAnswer = body.allowUnverifiedFinalAnswer === true || silencePolicy.allowUnverifiedFinalAnswer;
   let answerKey;
+  const memoryId = String(body.memoryId || body.questionMemory?.memoryId || "").trim();
   try {
-    answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+    if (body.questionMemory?.ready === true) {
+      answerKey = questionMemoryToAnswerKey(
+        body.questionMemory,
+        String(body.questionId || "").trim(),
+        memoryId
+      );
+      console.info("[guide] answer-key source=question-memory", {
+        questionId: body.questionId || "",
+        memoryId,
+        trusted: Boolean(answerKey?.trusted)
+      });
+    } else {
+      console.info("[guide] answer-key source=lookup", {
+        questionId: body.questionId || "",
+        hasQuestionMemory: Boolean(body.questionMemory)
+      });
+      answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+    }
   } catch (error) {
     console.warn(`[guide] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
     answerKey = makeUnavailableAnswerKey(error);
   }
+
+  console.info("[guide] qwen request-start", {
+    eventType: body.eventType || "normal",
+    questionId: body.questionId || "",
+    model: QWEN_GUIDE_MODEL,
+    silenceStage,
+    answerKeyTrusted: Boolean(answerKey?.trusted)
+  });
 
   const answerReference = !answerKey?.trusted && allowUnverifiedFinalAnswer
     ? {
@@ -8328,6 +8354,7 @@ async function handleGuide(req, res) {
     verifiedGuideSteps
   };
 
+  const guideRequestStartedAt = Date.now();
   let guideResult = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
@@ -8421,7 +8448,10 @@ async function handleGuide(req, res) {
     eventType: body.eventType || "",
     silenceStage: Number(body.silenceStage) || 0,
     hasSpeech: Boolean(String(guideResult?.speech || "").trim()),
-    hasFormula: Boolean(String(guideResult?.formulaOrStep || "").trim())
+    hasFormula: Boolean(String(guideResult?.formulaOrStep || "").trim()),
+    shouldSpeak: guideResult?.shouldSpeak !== false,
+    lectureComplete: guideResult?.lectureComplete === true,
+    elapsedMs: Date.now() - guideRequestStartedAt
   });
   sendJson(res, 200, {
     ...guideResult,
