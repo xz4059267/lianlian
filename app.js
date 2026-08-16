@@ -5550,6 +5550,16 @@ function resetSilenceTimer(updateSpeechAt = true) {
   });
 }
 
+function isGuideRequestRetryable(error) {
+  if (!error || error.name === "AbortError") return false;
+  if (["qwen_timeout", "request_aborted", "stale_request"].includes(error.code)) return false;
+  if (error.retryable === true) return true;
+  if (error.code === "network_error" || error.code === "http_408" || error.code === "http_429") {
+    return true;
+  }
+  return Number(error.status) >= 500 || error instanceof TypeError;
+}
+
 function handleSilenceTimeout() {
   console.info("[silence-timer] fired", {
     questionId: currentPageQuestion()?.id || "",
@@ -6316,6 +6326,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
     : question.problemText || "";
   const requestControl = createBoundedAbortController(null, GUIDE_REQUEST_TIMEOUT_MS);
   const requestStartedAt = Date.now();
+  let requestAttempt = 0;
   console.info("[guide] request-start", {
     eventType,
     questionId: question.id || "",
@@ -6337,10 +6348,13 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       boardImageChars: boardImage.length,
       totalImageChars: questionImage.length + boardImage.length
     });
-    response = await fetch("/api/guide", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
+    while (true) {
+      requestAttempt += 1;
+      try {
+        response = await fetch("/api/guide", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
       questionImage,
       questionId: question.id,
       questionTitle: question.title || "",
@@ -6405,10 +6419,39 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       answerVerified: state.finalAnswerVerified,
       boardCompletionVerified: state.boardCompletionVerified,
       inputSnapshot: options.inputSnapshot || getStudentInputSnapshot(),
-      responseId: options.responseId || ""
-      }),
-      signal: requestControl.signal
-    });
+            responseId: options.responseId || ""
+          }),
+          signal: requestControl.signal
+        });
+        if (response.ok || requestAttempt >= 2) break;
+        const retryBody = await response.clone().json().catch(() => ({}));
+        const retryError = new Error(
+          retryBody.error || `讲解引导失败（HTTP ${response.status}）`
+        );
+        retryError.code = retryBody.code || `http_${response.status}`;
+        retryError.status = response.status;
+        retryError.retryable = retryBody.retryable === true;
+        if (!isGuideRequestRetryable(retryError)) break;
+        console.warn("[guide] retrying transient response", {
+          eventType,
+          questionId: question.id || "",
+          attempt: requestAttempt,
+          status: response.status,
+          code: retryError.code
+        });
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      } catch (error) {
+        if (requestAttempt >= 2 || !isGuideRequestRetryable(error)) throw error;
+        console.warn("[guide] retrying transient network failure", {
+          eventType,
+          questionId: question.id || "",
+          attempt: requestAttempt,
+          code: error?.code || "network_error",
+          message: error?.message || String(error)
+        });
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
   } catch (error) {
     console.error("[guide] request-failed", {
       eventType,
@@ -6425,6 +6468,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
     eventType,
     questionId: question.id || "",
     status: response.status,
+    attempts: requestAttempt,
     elapsedMs: Date.now() - requestStartedAt
   });
   const result = await response.json().catch(() => ({}));
