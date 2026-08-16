@@ -2674,6 +2674,45 @@ async function callQwenMultimodalJson({ model, content, schema, instructions, ma
   return parsed;
 }
 
+async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
+  let lastError = null;
+  const maxAttempts = 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await callQwenMultimodalJson(options);
+      if (attempt > 1) {
+        console.info("[guide] transient retry succeeded", {
+          questionId: diagnostics.questionId || "",
+          eventType: diagnostics.eventType || "",
+          attempt,
+          model: options.model || ""
+        });
+      }
+      return result;
+    } catch (error) {
+      lastError = error;
+      // A timeout already consumed the full guide request budget. Retrying it
+      // here would queue another 45-second call while the browser has already
+      // moved on, so only retry failures that are likely to recover quickly.
+      const retryable = isTransientQwenError(error) && error?.code !== "qwen_timeout";
+      console.warn("[guide] qwen request failed", {
+        questionId: diagnostics.questionId || "",
+        eventType: diagnostics.eventType || "",
+        attempt,
+        retryable,
+        willRetry: attempt < maxAttempts && retryable,
+        code: error?.code || "",
+        status: error?.statusCode || error?.status || 0,
+        model: options.model || "",
+        message: error?.message || String(error)
+      });
+      if (attempt >= maxAttempts || !retryable) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+  throw lastError;
+}
+
 function summarizeHandwritingDiagnostics(diagnostics = {}) {
   return {
     requestId: Number(diagnostics.requestId || 0),
@@ -8364,7 +8403,13 @@ async function handleGuide(req, res) {
   };
 
   const guideRequestStartedAt = Date.now();
-  let guideResult = await callQwenMultimodalJson({
+  console.info("[guide] payload-images", {
+    questionId: body.questionId || "",
+    questionImageChars: String(body.questionImage || "").length,
+    boardImageChars: String(body.boardImage || "").length,
+    totalImageChars: String(body.questionImage || "").length + String(body.boardImage || "").length
+  });
+  let guideResult = await callGuideQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: guideSchema,
     instructions: [
@@ -8448,6 +8493,9 @@ async function handleGuide(req, res) {
       ...(body.boardImage ? [{ type: "input_image", label: "当前黑板截图", image_url: body.boardImage, detail: "high" }] : [])
     ],
     maxOutputTokens: 1200
+  }, {
+    questionId: body.questionId || "",
+    eventType: body.eventType || ""
   });
 
   // Model-only guide mode: return Qwen's structured response unchanged.
@@ -9082,6 +9130,15 @@ async function handleRequest(req, res) {
     if (req.method === "GET") return serveStatic(req, res);
     sendJson(res, 405, { error: "Method not allowed" });
   } catch (error) {
+    console.error("[api] request-failed", {
+      method: req.method,
+      path: pathname,
+      status: error.statusCode || 500,
+      code: error.code || "server_error",
+      model: error.model || "",
+      questionId: error.questionId || "",
+      message: error.message || "服务器错误"
+    });
     sendJson(res, error.statusCode || 500, {
       error: error.message || "服务器错误",
       code: error.code || "server_error",

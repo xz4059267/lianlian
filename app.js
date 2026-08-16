@@ -161,6 +161,11 @@ const REPEATED_GUIDANCE_COOLDOWN_MS = 90000;
 const LIAN_VOICE_RATE = 0.92;
 const LIAN_VOICE_PITCH = 1.01;
 const LIAN_VOICE_VOLUME = 0.82;
+const GUIDE_IMAGE_MAX_SIDE = 1600;
+const GUIDE_BOARD_MAX_SIDE = 1400;
+const GUIDE_IMAGE_JPEG_QUALITY = 0.84;
+const GUIDE_IMAGE_CACHE_LIMIT = 6;
+const guideImageCache = new Map();
 const ACTIVE_HELP_PATTERN = /为什么|不懂|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下|怎么(?:来|来的|求|算|做|解|得到|列|消元|化简)|如何(?:求|算|做|解|得到|列|消元|化简)|该(?:怎么|如何)|能不能(?:提示|讲|告诉)|可以怎么/;
 const EXPLICIT_STUCK_PATTERN = /不会(?:了|做|算|求|解|列|写|弄|往下|继续|下一步)|不太会|不懂|没(?:有)?思路|不知道(?:了|该|要|怎么|咋|从哪|下一步|往下)|卡住|卡在|看不懂|没看懂|做不下去|不会$/;
 
@@ -1176,6 +1181,44 @@ function loadImage(src) {
     image.onerror = reject;
     image.src = src;
   });
+}
+
+async function prepareGuideImage(dataUrl, { maxSide = GUIDE_IMAGE_MAX_SIDE, quality = GUIDE_IMAGE_JPEG_QUALITY } = {}) {
+  if (!dataUrl || typeof dataUrl !== "string") return "";
+  if (!dataUrl.startsWith("data:image/")) return dataUrl;
+
+  const cacheKey = `${maxSide}:${quality}:${dataUrl.length}:${dataUrl.slice(0, 24)}:${dataUrl.slice(-24)}`;
+  const cached = guideImageCache.get(cacheKey);
+  if (cached) return cached;
+
+  const image = await loadImage(dataUrl);
+  const sourceWidth = image.naturalWidth || image.width || 0;
+  const sourceHeight = image.naturalHeight || image.height || 0;
+  if (!sourceWidth || !sourceHeight) return dataUrl;
+
+  const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
+  const width = Math.max(1, Math.round(sourceWidth * scale));
+  const height = Math.max(1, Math.round(sourceHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  context.drawImage(image, 0, 0, width, height);
+  const prepared = canvas.toDataURL("image/jpeg", quality);
+
+  guideImageCache.set(cacheKey, prepared);
+  while (guideImageCache.size > GUIDE_IMAGE_CACHE_LIMIT) {
+    guideImageCache.delete(guideImageCache.keys().next().value);
+  }
+  console.info("[guide] image-prepared", {
+    sourceWidth,
+    sourceHeight,
+    width,
+    height,
+    sourceChars: dataUrl.length,
+    preparedChars: prepared.length
+  });
+  return prepared;
 }
 
 dom.dropZone.addEventListener("dragover", (event) => {
@@ -6282,11 +6325,23 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
   });
   let response;
   try {
+    const rawQuestionImage = question.image;
+    const rawBoardImage = getBoardImageForGuide();
+    const [questionImage, boardImage] = await Promise.all([
+      prepareGuideImage(rawQuestionImage, { maxSide: GUIDE_IMAGE_MAX_SIDE }),
+      prepareGuideImage(rawBoardImage, { maxSide: GUIDE_BOARD_MAX_SIDE, quality: 0.78 })
+    ]);
+    console.info("[guide] request-payload", {
+      questionId: question.id || "",
+      questionImageChars: questionImage.length,
+      boardImageChars: boardImage.length,
+      totalImageChars: questionImage.length + boardImage.length
+    });
     response = await fetch("/api/guide", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
-      questionImage: question.image,
+      questionImage,
       questionId: question.id,
       questionTitle: question.title || "",
       eventType,
@@ -6296,7 +6351,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       problemText: trustedProblemText,
       questionType: question.problemType || question.questionType || question.type || "",
       knowledgePoints: question.knowledgePoints || [],
-      boardImage: getBoardImageForGuide(),
+      boardImage,
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
       latestHandwritingResult: state.latestHandwritingResult || null,
       silenceContextStep: /silence/.test(eventType) ? (trustedContextStep || getSilenceContextStep()) : "",
@@ -6373,7 +6428,21 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
     elapsedMs: Date.now() - requestStartedAt
   });
   const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || "讲解引导失败");
+  if (!response.ok) {
+    const error = new Error(result.error || `讲解引导失败（HTTP ${response.status}）`);
+    error.code = result.code || `http_${response.status}`;
+    error.status = response.status;
+    error.retryable = result.retryable === true;
+    console.error("[guide] response-failed", {
+      eventType,
+      questionId: question.id || "",
+      status: response.status,
+      code: error.code,
+      retryable: error.retryable,
+      message: error.message
+    });
+    throw error;
+  }
   return result;
 }
 
