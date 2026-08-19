@@ -147,6 +147,11 @@ const ALIYUN_OCR_ENABLED = !["0", "false", "off"].includes(
 const SEGMENT_ALIYUN_ONLY = !["0", "false", "off"].includes(
   String(process.env.SEGMENT_ALIYUN_ONLY || "0").toLowerCase()
 );
+// The education paper-cut service already returns question-level boxes. Keep the
+// normal path short and reserve local/Qwen analysis for empty or unusable results.
+const SEGMENT_ALIYUN_FAST_PATH = !["0", "false", "off"].includes(
+  String(process.env.SEGMENT_ALIYUN_FAST_PATH || "1").toLowerCase()
+);
 const SUPABASE_URL = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_SERVICE_ROLE_KEY =
   process.env.SUPABASE_SERVICE_ROLE_KEY ||
@@ -1792,6 +1797,10 @@ async function extractAliyunPaperCutResult(imageDataUrl, options = {}) {
       );
       if (questions.length) return { blocks, questions, provider: "aliyun-market-paper-cut" };
       firstError = new Error(`Aliyun market paper-cut returned no question boxes, blocks=${blocks.length}`);
+      if (SEGMENT_ALIYUN_ONLY) {
+        console.warn("[segment] aliyun-only: market paper-cut returned no question boxes; skipping official/text OCR fallbacks");
+        return { blocks, questions: [], provider: "aliyun-market-paper-cut-empty" };
+      }
     } catch (error) {
       firstError = error;
       console.warn("[segment] Aliyun market paper-cut failed:", error.message || error);
@@ -1880,7 +1889,7 @@ function getSegmentCacheKey(imageDataUrl, width, height, mode) {
   return crypto
     .createHash("sha256")
     .update(String(imageDataUrl || ""))
-    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|aliyunPaperCutFirst:${ALIYUN_OCR_ENABLED}|official:${Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET)}|aliyunOnly:${SEGMENT_ALIYUN_ONLY}|officialEndpoint:${ALIYUN_OCR_OFFICIAL_ENDPOINT}|marketUrl:${ALIYUN_OCR_URL}|cutType:${process.env.ALIYUN_OCR_CUT_TYPE || "question"}|imageType:${process.env.ALIYUN_OCR_IMAGE_TYPE || "photo"}|subject:${process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math"}|segment:v51`)
+    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|aliyunPaperCutFirst:${ALIYUN_OCR_ENABLED}|aliyunFastPath:${SEGMENT_ALIYUN_FAST_PATH}|official:${Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET)}|aliyunOnly:${SEGMENT_ALIYUN_ONLY}|officialEndpoint:${ALIYUN_OCR_OFFICIAL_ENDPOINT}|marketUrl:${ALIYUN_OCR_URL}|cutType:${process.env.ALIYUN_OCR_CUT_TYPE || "question"}|imageType:${process.env.ALIYUN_OCR_IMAGE_TYPE || "photo"}|subject:${process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math"}|segment:v52`)
     .digest("hex");
 }
 
@@ -6132,6 +6141,57 @@ async function handleSegmentV2(req, res) {
     timings.aliyunPaperCutMs = Date.now() - paperCutStartedAt;
     aliyunPaperCutError = error.message || String(error);
     console.warn("[segment-v2] Aliyun paper-cut OCR failed, trying local/Qwen fallback:", error.message || error);
+  }
+
+  // A successful education paper-cut response is already the desired final
+  // segmentation. Avoid paying for the slower OCR/layout/vision verification
+  // pipeline in the common case; only fall through when every returned block is
+  // unusable after the existing local filters.
+  if (SEGMENT_ALIYUN_FAST_PATH && ocrPayload.paperCutQuestions.length) {
+    const directStartedAt = Date.now();
+    const directQuestions = buildDirectAliyunQuestions(ocrPayload.paperCutQuestions, width, height);
+    if (directQuestions.length) {
+      timings.directAliyunMs = Date.now() - directStartedAt;
+      timings.parallelRecognitionMs = Date.now() - recognitionStartedAt;
+      timings.recognitionStrategy = "aliyun-edu-paper-cut-fast-path-v1";
+      timings.ocrMaxSide = ocrMaxSide;
+      timings.fastPath = "aliyun-paper-cut-direct";
+      timings.backendTotalMs = Date.now() - requestStartedAt;
+      timings.cacheHit = false;
+      console.log(
+        `[segment-v2] fast path: paperCutQuestions=${ocrPayload.paperCutQuestions.length}, ` +
+        `direct=${directQuestions.length}, elapsed=${timings.backendTotalMs}ms`
+      );
+      console.log(`[render] final question numbers=[${directQuestions.map((question) => question.sourceQuestionNumber).filter(Boolean).join(",")}]`);
+      const fastPayload = {
+        questions: directQuestions,
+        fallbackToWholePage: false,
+        allowStrictRetry: false,
+        note: "已使用阿里云教育版试卷切题 OCR 直接生成题目。",
+        model: "Aliyun RecognizeEduPaperCut",
+        provider: "aliyun-education-paper-cut-fast-path",
+        recognitionStrategy: "aliyun-edu-paper-cut-fast-path-v1",
+        ocrBlockCount: ocrPayload.textBlocks.length,
+        layoutRegionCount: 0,
+        localConfidence: null,
+        visionUsed: false,
+        timings,
+        debug: {
+          rawModelBoxes: normalizeVisualQuestionRegions(ocrPayload.paperCutQuestions, width, height).flatMap((question) => question.rawModelBoxes),
+          ocrLineBoxes: ocrPayload.textBlocks.map((block, index) => ({ index, ...block })),
+          layoutBoxes: [],
+          finalBoxes: directQuestions.map((question) => ({
+            sourceQuestionNumber: question.sourceQuestionNumber,
+            needsReview: question.needsReview,
+            ...question.finalBox
+          })),
+          boundaryLines: [],
+          deduplicatedBoxes: []
+        }
+      };
+      return sendSegmentResult(res, cacheKey, fastPayload);
+    }
+    console.warn("[segment-v2] fast path skipped: Aliyun paper-cut blocks were all filtered as non-question content");
   }
 
   if (SEGMENT_ALIYUN_ONLY) {
