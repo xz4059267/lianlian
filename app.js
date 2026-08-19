@@ -3795,7 +3795,7 @@ async function verifyCurrentBoardForCompletion(question) {
     return {
       verified: false,
       result: null,
-      guidance: "黑板上还没有可核验的步骤。请写下一个关键关系式、公式或计算步骤，再点一次我讲完了。"
+      guidance: "黑板上还没有可核验的步骤。请写下一个关键关系式、公式或计算步骤，再点击保存至错题本。"
     };
   }
 
@@ -4397,16 +4397,16 @@ async function maybePromptSaveFromHandwriting(result) {
 }
 
 function getBoardCompletionGuidance(result) {
-  if (!result) return "我还没能确认板书步骤。请在黑板上写下一个关键关系式、公式或计算步骤，再点一次我讲完了。";
+  if (!result) return "我还没能确认板书步骤。请在黑板上写下一个关键关系式、公式或计算步骤，再点击保存至错题本。";
   if (isHandwritingCalculationWrong(result)) {
     return result.guidance || result.issueSummary || "你的口头答案已经核对过了，但板书里还有一步需要检查。先把板书中的计算和最终结论改一致。";
   }
   if (result.calculationStatus === "unclear") {
-    return "答案已经核对过了，不过板书里的关键步骤我还没看清。请把其中一个关系式或计算步骤写清楚，再点一次我讲完了。";
+    return "答案已经核对过了，不过板书里的关键步骤我还没看清。请把其中一个关系式或计算步骤写清楚，再点击保存至错题本。";
   }
   const missing = String(result.missingBoardContent || result.expectedNextStep || "").trim();
   return missing
-    ? `答案已经核对正确，板书还需要一个可核验的步骤：${missing}。补上后再点一次我讲完了。`
+    ? `答案已经核对正确，板书还需要一个可核验的步骤：${missing}。补上后再点击保存至错题本。`
     : "答案已经核对正确，黑板上再留下一个可核验的正确步骤，就可以结束这道题。";
 }
 
@@ -7322,7 +7322,7 @@ async function verifyBoardAndCompleteQuestion(options = {}) {
     state.boardCompletionVerified = false;
     state.currentQuestionCompleted = false;
     dom.finishQuestionBtn.disabled = false;
-    await lianSpeak("答案已经核对过了，但这次还没能确认板书中的关键步骤。请保留板书，稍后再点一次我讲完了。");
+    await lianSpeak("答案已经核对过了，但这次还没能确认板书中的关键步骤。请保留板书，稍后再点击保存至错题本。");
     return false;
   } finally {
     state.completionCheckInProgress = false;
@@ -7374,7 +7374,7 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
       await lianSpeak(
         `${
           feedback || "最后答案正确。"
-        } 点击右上角“我讲完了”，我会核对板书，并提醒你保存到错题本。`,
+        } 点击右上角“保存至错题本”，我会核对板书，并提醒你保存到错题本。`,
         {
           dedupeKey: `final-answer-correct:${question.id}:${normalizedAnswer}`,
           cooldownMs: 0,
@@ -7409,7 +7409,7 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
     dom.finishQuestionBtn.disabled = false;
     dom.recognitionPill.classList.add("hidden");
     await lianSpeak(
-      "核对服务暂时没有响应，我先保留你刚才的答案。点击右上角“我讲完了”可以重试核对。",
+      "核对服务暂时没有响应，我先保留你刚才的答案。点击右上角“保存至错题本”可以重试核对。",
       {
         dedupeKey: `final-answer-service-failed:${question.id}:${normalizedAnswer}`,
         cooldownMs: 0,
@@ -7467,7 +7467,7 @@ async function saveCurrentQuestionAndContinue(options = {}) {
     if (record) state.completedThisSession = state.completedThisSession.filter((item) => item.id !== record.id);
     if (record) state.notebook = state.notebook.filter((item) => item.id !== record.id);
     dom.finishQuestionBtn.disabled = false;
-    await lianSpeak("保存错题时遇到问题，页面没有继续跳转。你可以先返回错题本清理一下空间，再点我讲完了重试。");
+    await lianSpeak("保存错题时遇到问题，页面没有继续跳转。你可以先返回错题本清理一下空间，再点击保存至错题本重试。");
     return;
   }
 
