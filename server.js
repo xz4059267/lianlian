@@ -2676,7 +2676,9 @@ async function callQwenMultimodalJson({ model, content, schema, instructions, ma
 
 async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
   let lastError = null;
-  const maxAttempts = 2;
+  // The browser owns the single retry for guide requests. Retrying here as
+  // well used to turn one transient failure into up to four Qwen calls.
+  const maxAttempts = 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
       const result = await callQwenMultimodalJson(options);
@@ -7880,6 +7882,9 @@ const FINAL_ANSWER_PROMPT = [
 ].join("\n");
 
 async function handleFinalAnswerCheck(req, res) {
+  const requestId = String(req.headers?.["x-lian-request-id"] || `final-answer-${Date.now()}`);
+  const startedAt = Date.now();
+  console.info("[final-answer] request-start", { requestId });
   const body = await readJsonBody(req);
   if (!body.questionImage || !String(body.answer || "").trim()) {
     sendJson(res, 400, { error: "缺少 questionImage 或 answer" });
@@ -7901,32 +7906,33 @@ async function handleFinalAnswerCheck(req, res) {
         code: error.code || "qwen_unavailable",
         stage: "final-answer-answer-key",
         retryable: true,
-        model: error.model || QWEN_GUIDE_MODEL
+        model: error.model || QWEN_GUIDE_MODEL,
+        requestId
+      });
+      console.warn("[final-answer] request-failed", {
+        requestId,
+        stage: "answer-key",
+        code: error.code || "qwen_unavailable",
+        elapsedMs: Date.now() - startedAt
       });
       return;
     }
-    sendJson(
-      res,
-      200,
-      await safeDirectFinalAnswerCheck(body, {
-        reason: error.message || "answer-key request failed",
-        status: error.code || "answer-key-error"
-      })
-    );
+    const fallback = await safeDirectFinalAnswerCheck(body, {
+      reason: error.message || "answer-key request failed",
+      status: error.code || "answer-key-error"
+    });
+    sendJson(res, fallback.serviceUnavailable ? 503 : 200, { ...fallback, requestId });
     return;
   }
   if (!answerKey.trusted) {
     console.warn(
       `[final-answer] answer-key not trusted, using direct fallback status=${answerKey.status} confidence=${answerKey.confidence}`
     );
-    sendJson(
-      res,
-      200,
-      await safeDirectFinalAnswerCheck(body, {
-        reason: answerKey.reason || "answer key not trusted",
-        status: answerKey.status || "answer-key-untrusted"
-      })
-    );
+    const fallback = await safeDirectFinalAnswerCheck(body, {
+      reason: answerKey.reason || "answer key not trusted",
+      status: answerKey.status || "answer-key-untrusted"
+    });
+    sendJson(res, fallback.serviceUnavailable ? 503 : 200, { ...fallback, requestId });
     return;
   }
   if (!answerKey.trusted) {
@@ -7998,7 +8004,13 @@ async function handleFinalAnswerCheck(req, res) {
     confidence: correct ? Math.min(Number(result.confidence) || 0, answerKey.confidence) : Number(result.confidence) || 0,
     verificationStatus: "double-verified",
     model: QWEN_GUIDE_MODEL,
-    provider: "qwen-double-verified-final-answer"
+    provider: "qwen-double-verified-final-answer",
+    requestId
+  });
+  console.info("[final-answer] request-complete", {
+    requestId,
+    correct,
+    elapsedMs: Date.now() - startedAt
   });
 }
 
@@ -8058,6 +8070,9 @@ async function safeDirectFinalAnswerCheck(body, fallbackInfo = {}) {
       hint:
         "核对服务现在连接失败，可能是 API key、额度或模型权限问题。你刚才的答案已经收到，请先不要保存，稍后重试一次核对。",
       confidence: 0,
+      serviceUnavailable: true,
+      retryable: true,
+      code: error.code || fallbackInfo.status || "qwen_error",
       verificationStatus: `service-unavailable:${error.code || fallbackInfo.status || "qwen-error"}`,
       model: QWEN_GUIDE_MODEL,
       provider: "qwen-direct-final-answer-fallback"

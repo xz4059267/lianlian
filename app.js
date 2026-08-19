@@ -4303,7 +4303,9 @@ function handleSpokenFinalAnswer(answerText) {
 
   if (hasCurrentRecognizedBoardStep(question)) {
     state.waitingForBoardBeforeFinalAnswer = false;
-    state.pendingFinalAnswerText = "";
+    // Keep the answer until the service confirms it. A transport failure must
+    // never force the student to repeat an answer that was already captured.
+    state.pendingFinalAnswerText = answer;
     void handleFinalAnswerSubmission(answer);
     return;
   }
@@ -7229,9 +7231,13 @@ async function requestFinalAnswerCheck(answer) {
   const question = currentPageQuestion();
   if (!question) throw new Error("没有当前题目");
   saveCurrentPage();
+  const requestId = `final-answer:${question.id || "question"}:${Date.now()}`;
   const response = await fetch("/api/final-answer", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Lian-Request-Id": requestId
+    },
     body: JSON.stringify({
       questionImage: question.image,
       boardImage: getBoardImageForGuide(),
@@ -7242,8 +7248,40 @@ async function requestFinalAnswerCheck(answer) {
     })
   });
   const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || "最后答案核对失败");
+  if (!response.ok || result.serviceUnavailable === true || String(result.verificationStatus || "").startsWith("service-unavailable:")) {
+    const error = new Error(result.error || "最后答案核对服务暂时没有返回");
+    error.code = result.code || (response.status >= 500 ? "upstream_5xx" : `http_${response.status}`);
+    error.status = response.status;
+    error.retryable = result.retryable === true || response.status >= 500 || response.status === 429;
+    error.requestId = result.requestId || requestId;
+    throw error;
+  }
   return result;
+}
+
+function isFinalAnswerCheckRetryable(error) {
+  if (!error || error.code === "qwen_timeout") return false;
+  return Boolean(
+    error.retryable === true ||
+      error.code === "network_error" ||
+      error.code === "rate_limited" ||
+      error.code === "http_408" ||
+      error.code === "http_429" ||
+      Number(error.status) >= 500
+  );
+}
+
+async function requestFinalAnswerCheckWithRetry(answer) {
+  try {
+    return await requestFinalAnswerCheck(answer);
+  } catch (error) {
+    // Do not retry a 45-second timeout automatically. The answer is retained
+    // and the user can retry with the completion button without another
+    // forced re-speech.
+    if (!isFinalAnswerCheckRetryable(error)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return requestFinalAnswerCheck(answer);
+  }
 }
 
 async function verifyBoardAndCompleteQuestion(options = {}) {
@@ -7294,10 +7332,11 @@ async function verifyBoardAndCompleteQuestion(options = {}) {
 
 async function handleFinalAnswerSubmission(answer, options = {}) {
   const question = currentPageQuestion();
-  if (!question || !answer.trim()) return;
+  const normalizedAnswer = String(answer || "").trim();
+  if (!question || !normalizedAnswer) return;
   const requestId = ++state.finalAnswerRequestId;
   state.awaitingFinalAnswer = false;
-  state.pendingFinalAnswerText = "";
+  state.pendingFinalAnswerText = normalizedAnswer;
   state.finalAnswerVerified = false;
   state.verifiedFinalAnswerText = "";
   state.boardCompletionVerified = false;
@@ -7305,16 +7344,17 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
   dom.finishQuestionBtn.disabled = true;
   dom.recognitionPill.textContent = "正在核对最后答案";
   dom.recognitionPill.classList.remove("hidden");
-  if (!options.silentLog) addLog("我", answer);
+  if (!options.silentLog) addLog("我", normalizedAnswer);
 
   try {
-    const result = await requestFinalAnswerCheck(answer);
+    const result = await requestFinalAnswerCheckWithRetry(normalizedAnswer);
     if (requestId !== state.finalAnswerRequestId || currentPageQuestion()?.id !== question.id) return;
 
     if (result.correct) {
       state.finalAnswerVerified = true;
-      state.verifiedFinalAnswerText = answer.trim();
+      state.verifiedFinalAnswerText = normalizedAnswer;
       state.awaitingFinalAnswer = false;
+      state.pendingFinalAnswerText = "";
       state.boardCompletionVerified = Boolean(options.boardAlreadyVerified);
       state.currentQuestionCompleted = false;
       dom.finishQuestionBtn.disabled = false;
@@ -7323,7 +7363,7 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
       if (state.boardCompletionVerified) {
         if (markCurrentQuestionComplete()) {
           await lianSpeak(feedback || "答案和板书都核对好了。", {
-            dedupeKey: `final-answer-board-correct:${question.id}:${answer.trim()}`,
+            dedupeKey: `final-answer-board-correct:${question.id}:${normalizedAnswer}`,
             cooldownMs: 0,
             allowRepeat: true
           });
@@ -7336,7 +7376,7 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
           feedback || "最后答案正确。"
         } 点击右上角“我讲完了”，我会核对板书，并提醒你保存到错题本。`,
         {
-          dedupeKey: `final-answer-correct:${question.id}:${answer.trim()}`,
+          dedupeKey: `final-answer-correct:${question.id}:${normalizedAnswer}`,
           cooldownMs: 0,
           allowRepeat: true
         }
@@ -7348,6 +7388,7 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
     state.verifiedFinalAnswerText = "";
     state.boardCompletionVerified = false;
     state.awaitingFinalAnswer = true;
+    state.pendingFinalAnswerText = "";
     dom.finishQuestionBtn.disabled = false;
     setGuideState(GUIDE_STATES.INTERACTIVE);
     await lianSpeak(
@@ -7368,11 +7409,12 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
     dom.finishQuestionBtn.disabled = false;
     dom.recognitionPill.classList.add("hidden");
     await lianSpeak(
-      pickPrompt("final-answer-unavailable", [
-        "我这次还没核准最后答案，你再把结果和单位说清楚一些。",
-        "最后答案我暂时没看完整，再说一遍最终结果，我继续帮你核对。",
-        "核对服务刚才没有返回，你先把最后答案再讲一次。"
-      ])
+      "核对服务暂时没有响应，我先保留你刚才的答案。点击右上角“我讲完了”可以重试核对。",
+      {
+        dedupeKey: `final-answer-service-failed:${question.id}:${normalizedAnswer}`,
+        cooldownMs: 0,
+        allowRepeat: true
+      }
     );
   } finally {
     setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
@@ -7525,7 +7567,15 @@ dom.finishQuestionBtn.addEventListener("click", () => {
     handleSpokenFinalAnswer(answerCandidate);
     return;
   }
-  if (state.awaitingFinalAnswer) return;
+  if (state.awaitingFinalAnswer) {
+    const pendingAnswer = String(state.pendingFinalAnswerText || "").trim();
+    if (pendingAnswer) {
+      void handleFinalAnswerSubmission(pendingAnswer, { silentLog: true });
+    } else {
+      askForFinalAnswer();
+    }
+    return;
+  }
   askForFinalAnswer();
 });
 
