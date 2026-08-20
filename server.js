@@ -42,13 +42,47 @@ const QWEN_VL_MODEL =
   "qwen3.7-plus";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
+function parseQwenModelList(value) {
+  return [...new Set(String(value || "")
+    .split(/[\s,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean))];
+}
+
+const QWEN_FALLBACK_MODELS = parseQwenModelList(
+  process.env.QWEN_FALLBACK_MODELS ||
+    "qwen3.8-max,qwen3.5-omni-flash-2026-03-15,qwen3-omni-flash,qwen3-omni-flash-2025-12-01"
+);
+const QWEN_GUIDE_MODEL_CANDIDATES = [...new Set([
+  QWEN_GUIDE_MODEL,
+  ...parseQwenModelList(process.env.QWEN_GUIDE_FALLBACK_MODELS || ""),
+  ...QWEN_FALLBACK_MODELS
+])];
+const QWEN_HANDWRITING_MODEL_CANDIDATES = [...new Set([
+  QWEN_HANDWRITING_MODEL,
+  ...parseQwenModelList(process.env.QWEN_HANDWRITING_FALLBACK_MODELS || ""),
+  ...QWEN_FALLBACK_MODELS
+])];
+const QWEN_VL_MODEL_CANDIDATES = [...new Set([
+  QWEN_VL_MODEL,
+  ...parseQwenModelList(process.env.QWEN_VL_FALLBACK_MODELS || ""),
+  ...QWEN_FALLBACK_MODELS
+])];
+const QWEN_MODEL_COOLDOWN_MS = Math.max(
+  30_000,
+  Math.min(10 * 60_000, Number(process.env.QWEN_MODEL_COOLDOWN_MS || 120_000))
+);
+const qwenModelCooldownUntil = new Map();
 const QWEN_REQUEST_TIMEOUT_MS = Math.max(
   8000,
   Math.min(55000, Number(process.env.QWEN_REQUEST_TIMEOUT_MS || 45000))
 );
 const QWEN_HANDWRITING_RETRY_COUNT = Math.max(
   0,
-  Math.min(2, Number(process.env.QWEN_HANDWRITING_RETRY_COUNT || 1))
+  // The browser owns the delayed retry. Retrying here as well makes one
+  // handwriting pause wait through two serial model calls before the client
+  // can show a result.
+  Math.min(2, Number(process.env.QWEN_HANDWRITING_RETRY_COUNT || 0))
 );
 // A second multimodal audit doubles latency and creates a second failure point.
 // Keep it opt-in; the primary structured result and local safety rules remain authoritative.
@@ -2539,7 +2573,7 @@ function isQwenJsonFormatUnsupported(error) {
   return /response_format|json_object|not support|unsupported|不支持/i.test(`${code} ${message}`);
 }
 
-async function requestQwenChatCompletion(payload, useJsonFormat = true) {
+async function requestQwenChatCompletionOnce(payload, useJsonFormat = true) {
   let response;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), QWEN_REQUEST_TIMEOUT_MS);
@@ -2623,6 +2657,87 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function getQwenModelCandidates(model, explicitCandidates = []) {
+  const configured = String(model || "").trim();
+  const explicit = Array.isArray(explicitCandidates) ? explicitCandidates : [];
+  const byPurpose = configured === QWEN_HANDWRITING_MODEL
+    ? QWEN_HANDWRITING_MODEL_CANDIDATES
+    : configured === QWEN_VL_MODEL
+      ? QWEN_VL_MODEL_CANDIDATES
+      : QWEN_GUIDE_MODEL_CANDIDATES;
+  return [...new Set([
+    configured,
+    ...explicit.map((item) => String(item || "").trim()),
+    ...byPurpose
+  ])].filter(Boolean);
+}
+
+function isQwenModelQuotaOrAvailabilityError(error) {
+  const code = String(error?.code || "").toLowerCase();
+  const status = Number(error?.statusCode || error?.status || 0);
+  const message = String(error?.message || "").toLowerCase();
+  const combined = `${code} ${message}`;
+  if (/invalid_api_key|authentication|api key|鉴权|认证/.test(combined)) return false;
+  if (/response_format|json_object|unsupported|不支持/.test(combined) && status < 500) return false;
+  return (
+    status === 402 ||
+    status === 404 ||
+    status === 408 ||
+    status === 429 ||
+    status >= 500 ||
+    (status === 403 && /access|permission|model|权限|模型/.test(combined)) ||
+    /quota|insufficient|rate.?limit|throttl|resource.?exhausted|model.?not.?found|model.?unavailable|limit|额度|限额|余额|限流|模型.*(?:不存在|不可用|无权限)/i.test(combined)
+  );
+}
+
+function qwenModelIsCoolingDown(model) {
+  return Number(qwenModelCooldownUntil.get(model) || 0) > Date.now();
+}
+
+async function requestQwenChatCompletion(payload, useJsonFormat = true) {
+  const modelCandidates = getQwenModelCandidates(payload?.model, payload?.modelCandidates);
+  const requestPayload = { ...(payload || {}) };
+  delete requestPayload.modelCandidates;
+
+  const availableCandidates = modelCandidates.filter((model) => !qwenModelIsCoolingDown(model));
+  const candidates = availableCandidates.length ? availableCandidates : modelCandidates;
+  let lastError = null;
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const model = candidates[index];
+    try {
+      const data = await requestQwenChatCompletionOnce(
+        { ...requestPayload, model },
+        useJsonFormat
+      );
+      if (index > 0) {
+        console.info("[qwen-fallback] switched model successfully", {
+          from: candidates[0],
+          to: model,
+          attempted: index + 1
+        });
+      }
+      return data;
+    } catch (error) {
+      lastError = error;
+      const canSwitch = index < candidates.length - 1 && isQwenModelQuotaOrAvailabilityError(error);
+      console.warn("[qwen-fallback] model attempt failed", {
+        model,
+        attempted: index + 1,
+        candidates,
+        canSwitch,
+        code: error?.code || "",
+        status: error?.statusCode || error?.status || 0,
+        message: error?.message || String(error)
+      });
+      if (!canSwitch) break;
+      qwenModelCooldownUntil.set(model, Date.now() + QWEN_MODEL_COOLDOWN_MS);
+    }
+  }
+
+  throw lastError || new Error("Qwen 多模态 API 请求失败");
 }
 
 async function callQwenMultimodalJson({ model, content, schema, instructions, maxOutputTokens = 1200 }) {
@@ -8680,7 +8795,7 @@ async function handleHandwriting(req, res) {
       },
       { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
     ],
-    maxOutputTokens: 1000
+    maxOutputTokens: 700
   }, diagnostics);
   console.log(`[handwriting-timing] initial=${Date.now() - requestStartedAt}ms`);
 
@@ -8759,10 +8874,15 @@ function shouldAuditHandwritingResult(result, answerKey, body = {}) {
   if (!answerKey?.trusted) return false;
   const status = String(result?.calculationStatus || "");
   if (!["correct", "wrong"].includes(status)) return false;
-  if (status === "wrong") return true;
-  if (/完成讲解前检查/.test(String(body.reason || ""))) return true;
-  if (looksLikeStatementEvaluationQuestion(answerKey)) return true;
-  return Number(result?.confidence) < HANDWRITING_FAST_CONFIDENCE;
+  const confidence = Number(result?.confidence) || 0;
+  const hasConcreteWrongEvidence = Boolean(
+    String(result?.errorLocation || "").trim() &&
+    String(result?.errorEvidence || result?.issueSummary || result?.calculationCheck || "").trim()
+  );
+  // Only unstable judgments need a second model call. Stable results return
+  // after the primary multimodal request so each board pause stays fast.
+  if (status === "wrong") return confidence < 0.86 || !hasConcreteWrongEvidence;
+  return confidence < HANDWRITING_FAST_CONFIDENCE || result?.boardComplete !== true;
 }
 
 function makeHandwritingUncertain(result, reason = "板书判断还需要再核对") {
@@ -8953,7 +9073,7 @@ async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
         },
         { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
       ],
-      maxOutputTokens: 700
+      maxOutputTokens: 500
     });
     const audited = applyHandwritingAudit(result, audit);
     console.log(
@@ -9166,8 +9286,12 @@ async function handleRequest(req, res) {
         runtime: IS_VERCEL ? "vercel" : "local",
         qwenConfigured: Boolean(QWEN_API_KEY),
         qwenModel: QWEN_VL_MODEL,
+        qwenModels: QWEN_VL_MODEL_CANDIDATES,
         qwenGuideModel: QWEN_GUIDE_MODEL,
+        qwenGuideModels: QWEN_GUIDE_MODEL_CANDIDATES,
         qwenHandwritingModel: QWEN_HANDWRITING_MODEL,
+        qwenHandwritingModels: QWEN_HANDWRITING_MODEL_CANDIDATES,
+        qwenModelCooldownMs: QWEN_MODEL_COOLDOWN_MS,
         qwenRequestTimeoutMs: QWEN_REQUEST_TIMEOUT_MS,
         qwenHandwritingRetryCount: QWEN_HANDWRITING_RETRY_COUNT,
         handwritingAuditEnabled: HANDWRITING_AUDIT_ENABLED,

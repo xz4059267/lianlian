@@ -139,6 +139,9 @@ const GUIDE_STATE_LABELS = {
 const SILENCE_CARE_MS = 60000;
 const SILENCE_AFTER_CARE_MS = 60000;
 const GUIDE_REQUEST_TIMEOUT_MS = 52000;
+// The server allows Qwen up to 45s. Keep the browser alive slightly longer so
+// a valid response is not turned into a duplicate retry by the client.
+const HANDWRITING_REQUEST_TIMEOUT_MS = 50000;
 const LIAN_TTS_REQUEST_TIMEOUT_MS = 9000;
 const LIAN_TEXT_PUBLISH_WATCHDOG_MS = 10000;
 // Each additional full idle interval moves the guide closer to a concrete
@@ -218,6 +221,7 @@ const state = {
   lastPoint: null,
   recognitionTimer: null,
   handwritingRetryTimer: null,
+  handwritingRetryPending: false,
   handwritingRetryCountByKey: {},
   handwritingRequestId: 0,
   handwritingRequestInFlight: false,
@@ -870,6 +874,7 @@ function finishHandwritingRequest(meta, status = "completed") {
 function clearHandwritingRetryTimer() {
   clearTimeout(state.handwritingRetryTimer);
   state.handwritingRetryTimer = null;
+  state.handwritingRetryPending = false;
 }
 
 function scheduleTransientHandwritingRetry(meta, reason) {
@@ -882,14 +887,21 @@ function scheduleTransientHandwritingRetry(meta, reason) {
     state.currentQuestionCompleted ||
     state.teachSessionPaused ||
     !hasCurrentBoardInk(question)
-  ) return;
+  ) {
+    state.handwritingRetryPending = false;
+    return;
+  }
 
   const key = `${meta.sessionId}:${meta.questionId}:${meta.boardVersion}`;
   const attempt = Number(state.handwritingRetryCountByKey[key] || 0);
-  if (attempt >= 2) return;
+  if (attempt >= 2) {
+    state.handwritingRetryPending = false;
+    return;
+  }
   state.handwritingRetryCountByKey[key] = attempt + 1;
   const delay = attempt === 0 ? 1200 : 3500;
   clearHandwritingRetryTimer();
+  state.handwritingRetryPending = true;
   console.log("[handwriting] schedule transient retry", {
     key,
     attempt: attempt + 1,
@@ -905,7 +917,11 @@ function scheduleTransientHandwritingRetry(meta, reason) {
       getBoardVersion(current) !== Number(meta.boardVersion) ||
       state.currentQuestionCompleted ||
       !hasCurrentBoardInk(current)
-    ) return;
+    ) {
+      state.handwritingRetryPending = false;
+      return;
+    }
+    state.handwritingRetryPending = false;
     scheduleHandwritingRecognition(`${reason}：临时故障自动重试`);
   }, delay);
 }
@@ -2701,6 +2717,8 @@ function hasCurrentBoardInk(question = currentPageQuestion()) {
 
 function markCurrentBoardInk(question = currentPageQuestion()) {
   if (question) {
+    // A new stroke supersedes any retry scheduled for an older snapshot.
+    clearHandwritingRetryTimer();
     state.boardInkByQuestion[question.id] = true;
     state.boardCompletionVerified = false;
     state.currentQuestionCompleted = false;
@@ -3316,6 +3334,10 @@ function scheduleHandwritingRecognition(reason) {
     paused: state.teachSessionPaused
   });
   if (!hasInk) return;
+  if (state.handwritingRetryPending && !String(reason || "").includes("临时故障自动重试")) {
+    console.info("[handwriting] schedule skipped while retry is pending", { reason });
+    return;
+  }
   if (state.handwritingRequestInFlight) {
     state.handwritingQueuedReason = reason;
     state.handwritingQueuedMeta = {
@@ -3505,6 +3527,7 @@ async function runHandwritingRecognition(reason) {
       rememberHandwritingRequestStatus(requestId, "stale");
       return;
     }
+    state.handwritingRetryPending = false;
     // Speech arriving while the board request is in flight does not invalidate
     // the board observation. Only a newer board stroke can make this result
     // stale; otherwise a spoken answer could erase a valid board response.
@@ -3707,7 +3730,7 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
   };
   console.log("[handwriting] request snapshot", diagnostics);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 35000);
+  const timeout = setTimeout(() => controller.abort(), HANDWRITING_REQUEST_TIMEOUT_MS);
   let response;
   try {
     response = await fetch("/api/handwriting", {
@@ -6170,6 +6193,20 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   const question = currentPageQuestion();
   if (!question) {
     console.warn("[guide] skipped", { eventType, reason: "no-current-question" });
+    return false;
+  }
+  const handwritingPending = Boolean(
+    state.handwritingRequestInFlight ||
+    state.handwritingRetryPending ||
+    state.handwritingRetryTimer
+  );
+  if (handwritingPending && !String(latestStudentSpeech || "").trim()) {
+    console.info("[guide] skipped while handwriting is pending", {
+      eventType,
+      inFlight: state.handwritingRequestInFlight,
+      retryPending: state.handwritingRetryPending,
+      hasRetryTimer: Boolean(state.handwritingRetryTimer)
+    });
     return false;
   }
   const activeRequest = state.guideRequestInFlight;
