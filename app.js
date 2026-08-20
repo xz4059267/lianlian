@@ -300,6 +300,8 @@ const state = {
   lianSpeechRequestId: 0,
   guideGeneration: 0,
   guideRequestInFlight: null,
+  guideUnavailableAt: 0,
+  guideUnavailableQuestionId: "",
   openingSpeechInProgress: false,
   lectureSessionId: 0,
   answerSessionId: 0,
@@ -391,6 +393,8 @@ function pauseTeachSessionForNavigation() {
   state.silenceGuidePending = false;
   state.guideGeneration += 1;
   state.guideRequestInFlight = null;
+  state.guideUnavailableAt = 0;
+  state.guideUnavailableQuestionId = "";
   state.activeGuideRequestId += 1;
   state.handwritingRequestId += 1;
   if (state.handwritingActiveRequest) {
@@ -2541,6 +2545,8 @@ function initCurrentQuestion() {
   state.activeGuideRequestId += 1;
   state.guideGeneration += 1;
   state.guideRequestInFlight = null;
+  state.guideUnavailableAt = 0;
+  state.guideUnavailableQuestionId = "";
   state.openingSpeechInProgress = true;
   const openingQuestionId = question.id;
   const openingStartedAt = state.lastUserInputAt;
@@ -6333,8 +6339,10 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     ) {
       return false;
     }
-    dom.lianState.textContent = "大模型引导请求失败";
-    lianSilentNotice("引导请求暂时没有返回，请稍后再试。", {
+    dom.lianState.textContent = "自动引导暂时不可用，但仍可继续核对和保存";
+    state.guideUnavailableAt = Date.now();
+    state.guideUnavailableQuestionId = questionId;
+    lianSilentNotice("自动引导暂时没有返回，但不影响继续核对。若已经说出答案，请点击保存至错题本继续。", {
       key: `guide-failed:${questionId}:${eventType}`,
       cooldownMs: 10000
     });
@@ -7359,6 +7367,19 @@ async function verifyBoardAndCompleteQuestion(options = {}) {
     state.boardCompletionVerified = false;
     state.currentQuestionCompleted = false;
     dom.finishQuestionBtn.disabled = false;
+    // A transient board-service failure must not strand a verified answer.
+    // Preserve the visible board image and let the explicit save action finish.
+    if (state.finalAnswerVerified && hasCurrentBoardInk(question)) {
+      state.boardCompletionVerified = true;
+      console.warn("[completion] board verification unavailable; preserving visible board content");
+      await lianSpeak("答案已经核对正确。板书识别服务暂时没有返回，但黑板内容会一并保存。", {
+        dedupeKey: `board-verification-unavailable:${question.id}`,
+        cooldownMs: 0,
+        allowRepeat: true
+      });
+      await saveCurrentQuestionAndContinue({ feedback: "答案已经核对正确。" });
+      return true;
+    }
     await lianSpeak("答案已经核对过了，但这次还没能确认板书中的关键步骤。请保留板书，稍后再点击保存至错题本。");
     return false;
   } finally {
@@ -7406,6 +7427,12 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
           });
           await saveCurrentQuestionAndContinue({ feedback });
         }
+        return;
+      }
+      if (options.continueAfterAnswer) {
+        await verifyBoardAndCompleteQuestion({
+          feedback: feedback || "答案已经核对正确。"
+        });
         return;
       }
       await lianSpeak(
@@ -7461,6 +7488,23 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
 async function saveCurrentQuestionAndContinue(options = {}) {
   const question = currentPageQuestion();
   if (!question) return;
+  // A failed optional guide must never strand an answer that the student has
+  // already said. The next click can resume the answer-check path directly;
+  // board verification remains a separate gate after the answer is confirmed.
+  if (!state.finalAnswerVerified) {
+    const pendingAnswer = String(
+      state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
+    ).trim();
+    if (pendingAnswer) {
+      dom.finishQuestionBtn.disabled = true;
+      await handleFinalAnswerSubmission(pendingAnswer, {
+        silentLog: true,
+        source: "save-button-recovery",
+        continueAfterAnswer: true
+      });
+      return;
+    }
+  }
   if (!state.finalAnswerVerified || !state.boardCompletionVerified) {
     state.currentQuestionCompleted = false;
     dom.finishQuestionBtn.disabled = false;
@@ -7597,6 +7641,20 @@ dom.finishQuestionBtn.addEventListener("click", () => {
   }
   if (state.finalAnswerVerified) {
     void verifyBoardAndCompleteQuestion();
+    return;
+  }
+  // The answer may have been captured successfully while an automatic guide
+  // request timed out. Treat the save button as an explicit recovery action
+  // instead of asking the student to repeat the answer or wait indefinitely.
+  const pendingAnswer = String(
+    state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
+  ).trim();
+  if (pendingAnswer) {
+    void handleFinalAnswerSubmission(pendingAnswer, {
+      silentLog: true,
+      source: "save-button-recovery",
+      continueAfterAnswer: true
+    });
     return;
   }
   const answerCandidate = extractFinalAnswerCandidate(dom.transcriptInput.value);
