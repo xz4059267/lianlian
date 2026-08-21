@@ -244,7 +244,29 @@ const answerKeyInflight = new Map();
 const questionMemoryIdentityRegistry = new Map();
 const handwritingRequestRegistry = new Map();
 const guideRequestRegistry = new Map();
+const activeHandwritingTasks = new Map();
+const activeHandwritingVersions = new Map();
 const REQUEST_REGISTRY_LIMIT = 2048;
+
+const QWEN_CONNECT_TIMEOUT_MS = Math.max(
+  3000,
+  Math.min(20000, Number(process.env.QWEN_CONNECT_TIMEOUT_MS || 12000))
+);
+const QWEN_RESPONSE_TIMEOUT_MS = Math.max(
+  3000,
+  Math.min(20000, Number(process.env.QWEN_RESPONSE_TIMEOUT_MS || 15000))
+);
+const QWEN_PARSE_TIMEOUT_MS = Math.max(
+  500,
+  Math.min(5000, Number(process.env.QWEN_PARSE_TIMEOUT_MS || 3000))
+);
+const QWEN_MAX_RESPONSE_BYTES = Math.max(
+  64 * 1024,
+  Math.min(8 * 1024 * 1024, Number(process.env.QWEN_MAX_RESPONSE_BYTES || 2 * 1024 * 1024))
+);
+const QWEN_DEBUG_LOGS = ["1", "true", "on"].includes(
+  String(process.env.QWEN_DEBUG_LOGS || "").toLowerCase()
+);
 let paddleOcrService = null;
 let paddleOcrRequestId = 0;
 let paddleLayoutService = null;
@@ -840,8 +862,88 @@ function loadEnvFile(filePath) {
 }
 
 function sendJson(res, status, data) {
+  if (res.writableEnded || res.destroyed) return false;
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data));
+  return true;
+}
+
+function createAbortError(message = "Qwen 请求已取消", code = "qwen_aborted") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  error.code = code;
+  error.statusCode = code === "qwen_client_disconnected" ? 499 : 504;
+  return error;
+}
+
+function getAbortReasonCode(reason, fallback = "qwen_aborted") {
+  return typeof reason?.code === "string" && reason.code.trim()
+    ? reason.code
+    : fallback;
+}
+
+async function awaitWithTimeout(promise, timeoutMs, onTimeout, createError) {
+  const boundedTimeoutMs = Math.max(1, Number(timeoutMs) || 1);
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve, reject) => {
+        timer = setTimeout(() => {
+          try {
+            onTimeout?.();
+          } catch (error) {
+            reject(error);
+            return;
+          }
+          reject(createError?.() || new Error("operation timeout"));
+        }, boundedTimeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function handwritingVersionKey(sessionId, questionId, boardVersion) {
+  return [String(sessionId || ""), String(questionId || ""), String(boardVersion ?? "")].join(":");
+}
+
+function createHandwritingTask(taskId = "") {
+  return {
+    taskId: String(taskId || `hw_${Date.now()}_${crypto.randomUUID()}`),
+    requestStartTime: new Date().toISOString(),
+    clientConnected: true,
+    qwenStartTime: "",
+    qwenResponseTime: "",
+    finishTime: "",
+    finalStatus: "RUNNING",
+    abortController: new AbortController(),
+    disconnectHandled: false,
+    versionKey: ""
+  };
+}
+
+function finishHandwritingTask(task, status, extra = {}) {
+  if (!task || task.finalStatus !== "RUNNING") return;
+  task.finalStatus = String(status || "FINISHED");
+  task.finishTime = new Date().toISOString();
+  Object.assign(task, extra);
+  activeHandwritingTasks.delete(task.taskId);
+  if (task.versionKey && activeHandwritingVersions.get(task.versionKey) === task.taskId) {
+    activeHandwritingVersions.delete(task.versionKey);
+  }
+  console.info("[handwriting-task] finish", {
+    task_id: task.taskId,
+    final_status: task.finalStatus,
+    request_start_time: task.requestStartTime,
+    qwen_start_time: task.qwenStartTime,
+    qwen_response_time: task.qwenResponseTime,
+    finish_time: task.finishTime,
+    client_connected: task.clientConnected,
+    abort_success: Boolean(task.abortSuccess),
+    error: task.errorCode || ""
+  });
 }
 
 function escapeSsmlText(value) {
@@ -970,28 +1072,57 @@ async function handleSpeechRecognition(req, res) {
   }
 }
 
-function readJsonBody(req, limit = 24 * 1024 * 1024) {
+function readJsonBody(req, limit = 24 * 1024 * 1024, signal = null) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
-    req.on("data", (chunk) => {
+    let settled = false;
+    const cleanup = () => {
+      signal?.removeEventListener?.("abort", onAbort);
+      req.removeListener("data", onData);
+      req.removeListener("end", onEnd);
+      req.removeListener("error", onError);
+    };
+    const finishReject = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const finishResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const onAbort = () => finishReject(createAbortError("请求体读取已取消", getAbortReasonCode(signal?.reason, "request_aborted")));
+    const onData = (chunk) => {
+      if (settled) return;
       size += chunk.length;
       if (size > limit) {
-        reject(new Error("请求体过大，请换更小或更清晰的图片"));
+        finishReject(new Error("请求体过大，请换更小或更清晰的图片"));
         req.destroy();
         return;
       }
       chunks.push(chunk);
-    });
-    req.on("end", () => {
+    };
+    const onEnd = () => {
+      if (settled) return;
       try {
         const raw = Buffer.concat(chunks).toString("utf8");
-        resolve(raw ? JSON.parse(raw) : {});
+        finishResolve(raw ? JSON.parse(raw) : {});
       } catch {
-        reject(new Error("请求格式不是有效 JSON"));
+        finishReject(new Error("请求格式不是有效 JSON"));
       }
-    });
-    req.on("error", reject);
+    };
+    const onError = (error) => finishReject(error);
+    req.on("data", onData);
+    req.on("end", onEnd);
+    req.on("error", onError);
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
 }
 
@@ -2605,19 +2736,63 @@ async function requestQwenChatCompletionOnce(
   payload,
   useJsonFormat = true,
   timeoutMs = QWEN_REQUEST_TIMEOUT_MS,
-  externalSignal = null
+  externalSignal = null,
+  diagnostics = {}
 ) {
-  let response;
   const controller = new AbortController();
   const boundedTimeoutMs = Math.max(1000, Number(timeoutMs) || QWEN_REQUEST_TIMEOUT_MS);
-  const timeout = setTimeout(() => controller.abort(), boundedTimeoutMs);
+  const model = String(payload?.model || "");
+  const trace = diagnostics.qwenModels && typeof diagnostics.qwenModels === "object"
+    ? (diagnostics.qwenModels[model] ||= {})
+    : {};
+  const startedAt = Date.now();
+  let globalTimeout = null;
+  let abortReason = "";
+  let timedOutStage = "";
   const abortFromExternal = () => controller.abort();
+
+  const mark = (key, value = new Date().toISOString()) => {
+    trace[key] = value;
+    diagnostics[key] = value;
+  };
+  const makeStageTimeout = (stage, stageTimeoutMs) => {
+    const error = new Error(`Qwen ${stage} 阶段超过 ${Math.round(stageTimeoutMs / 1000)} 秒未返回`);
+    error.name = "TimeoutError";
+    error.statusCode = 504;
+    error.code = `qwen_${stage}_timeout`;
+    error.stage = stage;
+    error.model = model;
+    return error;
+  };
+  const runStage = (promise, stage, stageTimeoutMs) => awaitWithTimeout(
+    promise,
+    Math.max(1, Math.min(boundedTimeoutMs, Number(stageTimeoutMs) || boundedTimeoutMs)),
+    () => {
+      timedOutStage = stage;
+      abortReason = `timeout:${stage}`;
+      controller.abort();
+    },
+    () => makeStageTimeout(stage, Math.max(1, Number(stageTimeoutMs) || boundedTimeoutMs))
+  );
+
+  mark("qwen_request_start");
+  trace.timeout_ms = boundedTimeoutMs;
+  trace.model = model;
+  diagnostics.model_name = model;
+  globalTimeout = setTimeout(() => {
+    timedOutStage = timedOutStage || "total";
+    abortReason = abortReason || "timeout:total";
+    controller.abort();
+  }, boundedTimeoutMs);
   if (externalSignal) {
-    if (externalSignal.aborted) controller.abort();
+    if (externalSignal.aborted) {
+      abortReason = "external";
+      controller.abort();
+    }
     else externalSignal.addEventListener("abort", abortFromExternal, { once: true });
   }
   try {
-    response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
+    const response = await runStage(fetch(`${QWEN_BASE_URL}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -2628,16 +2803,46 @@ async function requestQwenChatCompletionOnce(
         ...(useJsonFormat ? { response_format: { type: "json_object" } } : {})
       }),
       signal: controller.signal
-    });
+    }), "connect", QWEN_CONNECT_TIMEOUT_MS);
+    mark("first_response_time");
+    trace.http_status = response.status;
 
-    let data;
+    const responseStartedAt = Date.now();
+    const rawBody = await runStage(
+      response.text(),
+      "response",
+      Math.min(QWEN_RESPONSE_TIMEOUT_MS, Math.max(1000, boundedTimeoutMs - (Date.now() - startedAt)))
+    );
+    mark("response_complete_time");
+    trace.response_bytes = Buffer.byteLength(rawBody || "", "utf8");
+    trace.response_duration_ms = Date.now() - responseStartedAt;
+    trace.token_count_estimate = Math.ceil(String(rawBody || "").length / 4);
+    if (trace.response_bytes > QWEN_MAX_RESPONSE_BYTES) {
+      abortReason = "response_too_large";
+      controller.abort();
+      const error = new Error(`Qwen 响应超过 ${QWEN_MAX_RESPONSE_BYTES} 字节上限`);
+      error.statusCode = 502;
+      error.code = "qwen_response_too_large";
+      error.model = model;
+      throw error;
+    }
+
+    let data = null;
     try {
-      data = await response.json();
-    } catch {
+      data = await runStage(
+        Promise.resolve().then(() => JSON.parse(String(rawBody || ""))),
+        "parse",
+        Math.min(QWEN_PARSE_TIMEOUT_MS, Math.max(500, boundedTimeoutMs - (Date.now() - startedAt)))
+      );
+      mark("json_parse_time");
+    } catch (parseError) {
+      if (parseError?.code === "qwen_parse_timeout") throw parseError;
       const error = new Error("Qwen 多模态 API 返回了无法解析的响应");
       error.statusCode = 502;
       error.code = "upstream_invalid_response";
-      error.model = payload.model;
+      error.model = model;
+      error.responseBytes = trace.response_bytes;
+      if (QWEN_DEBUG_LOGS) error.responsePreview = String(rawBody || "").slice(0, 1200);
       throw error;
     }
 
@@ -2656,7 +2861,7 @@ async function requestQwenChatCompletionOnce(
         code: normalizedCode,
         upstreamCode: rawCode,
         message: rawMessage,
-        model: payload.model,
+        model,
         useJsonFormat
       });
       const friendlyMessage =
@@ -2669,36 +2874,51 @@ async function requestQwenChatCompletionOnce(
       error.statusCode = response.status;
       error.status = response.status;
       error.code = normalizedCode;
-      error.model = payload.model;
+      error.model = model;
       throw error;
     }
 
+    trace.raw_response_preview = QWEN_DEBUG_LOGS ? String(rawBody || "").slice(0, 1200) : "";
     return data;
   } catch (fetchError) {
+    if (externalSignal?.aborted) {
+      const code = getAbortReasonCode(externalSignal.reason, "qwen_aborted");
+      abortReason = abortReason || "external";
+      const error = createAbortError("Qwen 请求已取消", code);
+      error.model = model;
+      throw error;
+    }
     if (fetchError?.code === "upstream_invalid_response" || fetchError?.statusCode) {
       throw fetchError;
     }
     const causeCode = fetchError?.cause?.code || fetchError?.code || "";
-    const timedOut = fetchError?.name === "AbortError";
+    const timedOut = fetchError?.name === "AbortError" || abortReason.startsWith("timeout:");
+    const timeoutCode = timedOutStage === "connect"
+      ? "qwen_connect_timeout"
+      : timedOutStage === "response"
+        ? "qwen_response_timeout"
+        : timedOutStage === "parse"
+          ? "qwen_parse_timeout"
+          : "qwen_total_timeout";
     const error = new Error(
       timedOut
-        ? `Qwen 多模态 API 请求超过 ${Math.round(boundedTimeoutMs / 1000)} 秒未返回`
+        ? `Qwen 多模态 API ${timedOutStage || "total"} 阶段超过 ${Math.round(boundedTimeoutMs / 1000)} 秒未返回`
         : "Qwen 多模态 API 网络连接失败"
     );
-    error.statusCode = 502;
-    error.code = timedOut && boundedTimeoutMs < QWEN_REQUEST_TIMEOUT_MS
-      ? "qwen_total_timeout"
-      : timedOut
-        ? "qwen_timeout"
-        : "network_error";
+    error.statusCode = timedOut ? 504 : 502;
+    error.code = timedOut ? timeoutCode : "network_error";
     error.causeCode = causeCode;
-    error.model = payload.model;
+    error.model = model;
     console.warn(
-      `[qwen] ${timedOut ? "timeout" : "network"} failed model=${payload.model || ""} timeoutMs=${boundedTimeoutMs} code=${causeCode || "unknown"} message=${fetchError?.message || ""}`
+      `[qwen] ${timedOut ? "timeout" : "network"} failed model=${model} timeoutMs=${boundedTimeoutMs} stage=${timedOutStage || ""} code=${causeCode || "unknown"} message=${fetchError?.message || ""}`
     );
     throw error;
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(globalTimeout);
+    mark("finish_time");
+    trace.duration_ms = Date.now() - startedAt;
+    trace.abort_reason = abortReason;
+    trace.timed_out_stage = timedOutStage;
     externalSignal?.removeEventListener?.("abort", abortFromExternal);
   }
 }
@@ -2770,7 +2990,7 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true, options 
   const candidates = availableCandidates.length ? availableCandidates : modelCandidates;
   const deadlineAt = Number(options.deadlineAt) > 0
     ? Number(options.deadlineAt)
-    : Date.now() + QWEN_TOTAL_TIMEOUT_MS;
+    : Date.now() + Math.max(1000, Number(options.timeoutMs) || QWEN_TOTAL_TIMEOUT_MS);
   let lastError = null;
 
   for (let index = 0; index < candidates.length; index += 1) {
@@ -2788,7 +3008,8 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true, options 
         { ...requestPayload, model },
         useJsonFormat,
         Math.min(QWEN_REQUEST_TIMEOUT_MS, remainingMs),
-        options.signal || null
+        options.signal || null,
+        options.diagnostics || {}
       );
       if (index > 0) {
         console.info("[qwen-fallback] switched model successfully", {
@@ -2830,7 +3051,9 @@ async function callQwenMultimodalJson({
   instructions,
   maxOutputTokens = 1200,
   deadlineAt: requestedDeadlineAt,
+  timeoutMs = QWEN_TOTAL_TIMEOUT_MS,
   signal,
+  diagnostics = {},
   disableModelFallback = false,
   allowTextFallback = false,
   plainTextMode = false
@@ -2874,20 +3097,24 @@ async function callQwenMultimodalJson({
   let data;
   const deadlineAt = Number(requestedDeadlineAt) > 0
     ? Number(requestedDeadlineAt)
-    : Date.now() + QWEN_TOTAL_TIMEOUT_MS;
+    : Date.now() + Math.max(1000, Number(timeoutMs) || QWEN_TOTAL_TIMEOUT_MS);
   try {
     data = await requestQwenChatCompletion(payload, !plainTextMode, {
       deadlineAt,
+      timeoutMs,
       signal,
-      disableModelFallback
+      disableModelFallback,
+      diagnostics
     });
   } catch (error) {
     if (plainTextMode) throw error;
     if (!isQwenJsonFormatUnsupported(error)) throw error;
     data = await requestQwenChatCompletion(payload, false, {
       deadlineAt,
+      timeoutMs,
       signal,
-      disableModelFallback
+      disableModelFallback,
+      diagnostics
     });
   }
 
@@ -3007,7 +3234,19 @@ function isValidHandwritingResult(result) {
   return hasVisibleContent || hasStructuredStatus;
 }
 
-async function raceQwenStructuredModels({ options, models, isValid, diagnostics = {}, label, invokeModel }) {
+function abortSignalPromise(signal) {
+  if (!signal) return null;
+  let cleanup = () => {};
+  const promise = new Promise((resolve) => {
+    const onAbort = () => resolve({ kind: "aborted", reason: signal.reason });
+    cleanup = () => signal.removeEventListener("abort", onAbort);
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  return { promise, cleanup };
+}
+
+async function raceQwenStructuredModels({ options = {}, models, isValid, diagnostics = {}, label, invokeModel }) {
   const candidates = [...new Set((Array.isArray(models) ? models : [])
     .map((model) => String(model || "").trim())
     .filter(Boolean))].slice(0, QWEN_MAX_MODEL_CANDIDATES);
@@ -3015,88 +3254,162 @@ async function raceQwenStructuredModels({ options, models, isValid, diagnostics 
     candidates,
     maxCandidates: QWEN_MAX_MODEL_CANDIDATES
   });
-  if (!candidates.length) return callQwenMultimodalJson(options);
-  const deadlineAt = Date.now() + (
-    label === "guide"
-      ? QWEN_GUIDE_TOTAL_TIMEOUT_MS
-      : label === "handwriting"
-        ? QWEN_HANDWRITING_TOTAL_TIMEOUT_MS
-        : QWEN_TOTAL_TIMEOUT_MS
-  );
+  if (!candidates.length) return callQwenMultimodalJson({ ...options, diagnostics });
+  const deadlineAt = Number(options.deadlineAt) > 0
+    ? Number(options.deadlineAt)
+    : Date.now() + Math.max(1000, Number(options.timeoutMs) || (
+      label === "guide"
+        ? QWEN_GUIDE_TOTAL_TIMEOUT_MS
+        : label === "handwriting"
+          ? QWEN_HANDWRITING_TOTAL_TIMEOUT_MS
+          : QWEN_TOTAL_TIMEOUT_MS
+    ));
   let lastError = null;
 
   for (let offset = 0; offset < candidates.length; offset += 2) {
     const batch = candidates.slice(offset, offset + 2);
     const controllers = batch.map(() => new AbortController());
     const startedAt = Date.now();
-    let settled = 0;
-    let winner = null;
-    const batchResult = await new Promise((resolve) => {
-      const finish = (value) => {
-        if (winner) return;
-        if (value?.result && isValid(value.result, diagnostics)) {
-          winner = value;
-          controllers.forEach((controller) => controller.abort());
-          resolve(value);
-          return;
+    const entries = batch.map((model, index) => {
+      const parentAbort = abortSignalPromise(options.signal);
+      const controller = controllers[index];
+      const abortParent = () => controller.abort();
+      if (options.signal && !options.signal.aborted) {
+        options.signal.addEventListener("abort", abortParent, { once: true });
+      }
+      const invoke = () => invokeModel
+        ? invokeModel(model, controller.signal, deadlineAt)
+        : callQwenMultimodalJson({
+          ...options,
+          model,
+          deadlineAt,
+          timeoutMs: Math.max(1000, deadlineAt - Date.now()),
+          signal: controller.signal,
+          diagnostics,
+          disableModelFallback: true
+        });
+      const outcome = Promise.resolve()
+        .then(invoke)
+        .then((result) => ({ kind: "result", result, model, index }))
+        .catch((error) => ({ kind: "error", error, model, index }));
+      return {
+        model,
+        index,
+        controller,
+        outcome,
+        parentAbort,
+        cleanup: () => {
+          parentAbort?.cleanup?.();
+          options.signal?.removeEventListener?.("abort", abortParent);
         }
-        settled += 1;
-        if (settled >= batch.length) resolve(null);
       };
-
-      batch.forEach((model, index) => {
-        (invokeModel
-          ? invokeModel(model, controllers[index].signal, deadlineAt)
-          : callQwenMultimodalJson({
-            ...options,
-            model,
-            deadlineAt,
-            signal: controllers[index].signal,
-            disableModelFallback: true
-          }))
-          .then((result) => {
-            const accepted = Boolean(result && isValid(result, diagnostics));
-            console.info(`[${label}] parallel model result`, {
-              model,
-              elapsedMs: Date.now() - startedAt,
-              accepted,
-              resultType: typeof result,
-              textLength: String(result?.detectedWriting || result?.speech || "").length
-            });
-            finish({ result, model });
-          })
-          .catch((error) => {
-            // The winning model aborts its sibling. That is expected cleanup,
-            // not another upstream failure and must not add noisy failure state.
-            if (winner || error?.name === "AbortError") {
-              return;
-            }
-            lastError = error;
-            settled += 1;
-            console.warn(`[${label}] parallel model failed`, {
-              model,
-              elapsedMs: Date.now() - startedAt,
-              code: error?.code || "",
-              status: error?.statusCode || error?.status || 0,
-              message: error?.message || String(error)
-            });
-            if (settled >= batch.length && !winner) resolve(null);
-          });
-      });
     });
 
-    if (batchResult?.result) {
-      console.info(`[${label}] parallel winner`, {
-        model: batchResult.model,
-        candidates: batch,
-        elapsedMs: Date.now() - startedAt,
-        questionId: diagnostics.questionId || "",
-        requestId: diagnostics.requestId || ""
+    while (entries.length) {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        entries.forEach((entry) => entry.controller.abort());
+        entries.forEach((entry) => entry.cleanup());
+        const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
+        timeoutError.statusCode = 504;
+        timeoutError.code = "qwen_total_timeout";
+        timeoutError.stage = label;
+        throw timeoutError;
+      }
+      const abortWait = abortSignalPromise(options.signal);
+      let deadlineTimer;
+      const deadlinePromise = new Promise((resolve) => {
+        deadlineTimer = setTimeout(() => resolve({ kind: "deadline" }), remainingMs);
       });
-      diagnostics.winnerModel = batchResult.model;
-      return batchResult.result;
+      let outcome;
+      try {
+        outcome = await Promise.race([
+          ...entries.map((entry) => entry.outcome),
+          deadlinePromise,
+          ...(abortWait ? [abortWait.promise] : [])
+        ]);
+      } finally {
+        clearTimeout(deadlineTimer);
+        abortWait?.cleanup?.();
+      }
+
+      if (outcome?.kind === "deadline") {
+        entries.forEach((entry) => entry.controller.abort());
+        entries.forEach((entry) => entry.cleanup());
+        const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
+        timeoutError.statusCode = 504;
+        timeoutError.code = "qwen_total_timeout";
+        timeoutError.stage = label;
+        throw timeoutError;
+      }
+      if (outcome?.kind === "aborted") {
+        entries.forEach((entry) => entry.controller.abort());
+        entries.forEach((entry) => entry.cleanup());
+        throw createAbortError(
+          "Qwen 请求已取消",
+          getAbortReasonCode(options.signal?.reason, "qwen_aborted")
+        );
+      }
+
+      const entryIndex = entries.findIndex((entry) => entry.index === outcome?.index);
+      if (entryIndex < 0) continue;
+      const [entry] = entries.splice(entryIndex, 1);
+      entry.cleanup();
+      if (outcome.kind === "result") {
+        const accepted = Boolean(outcome.result && isValid(outcome.result, diagnostics));
+        console.info(`[${label}] parallel model result`, {
+          model: outcome.model,
+          elapsedMs: Date.now() - startedAt,
+          accepted,
+          resultType: typeof outcome.result,
+          textLength: String(outcome.result?.detectedWriting || outcome.result?.speech || "").length
+        });
+        if (accepted) {
+          entries.forEach((item) => item.controller.abort());
+          entries.forEach((item) => item.cleanup());
+          diagnostics.winnerModel = outcome.model;
+          console.info(`[${label}] parallel winner`, {
+            model: outcome.model,
+            candidates: batch,
+            elapsedMs: Date.now() - startedAt,
+            questionId: diagnostics.questionId || "",
+            requestId: diagnostics.requestId || ""
+          });
+          return outcome.result;
+        }
+        lastError = Object.assign(new Error(`Qwen ${label} 返回了不可用结果`), {
+          statusCode: 502,
+          code: "invalid_model_output",
+          model: outcome.model
+        });
+        continue;
+      }
+
+      lastError = outcome.error;
+      console.warn(`[${label}] parallel model failed`, {
+        model: outcome.model,
+        elapsedMs: Date.now() - startedAt,
+        code: outcome.error?.code || "",
+        status: outcome.error?.statusCode || outcome.error?.status || 0,
+        message: outcome.error?.message || String(outcome.error)
+      });
+      if (outcome.error?.name === "AbortError" && options.signal?.aborted) {
+        entries.forEach((item) => item.controller.abort());
+        entries.forEach((item) => item.cleanup());
+        throw outcome.error;
+      }
     }
-    if (Date.now() >= deadlineAt) break;
+
+    if (Date.now() >= deadlineAt) {
+      const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
+      timeoutError.statusCode = 504;
+      timeoutError.code = "qwen_total_timeout";
+      timeoutError.stage = label;
+      throw timeoutError;
+    }
+    if (lastError?.code === "qwen_total_timeout") throw lastError;
+    if (lastError?.code === "qwen_client_disconnected") throw lastError;
+    if (lastError && !isTransientQwenError(lastError)) throw lastError;
   }
 
   throw lastError || Object.assign(new Error(`Qwen ${label} 没有返回有效结构化结果`), {
@@ -9041,8 +9354,88 @@ async function handleGuide(req, res) {
 }
 
 async function handleHandwriting(req, res) {
+  const task = createHandwritingTask();
+  const listeners = [];
+  const markClientDisconnected = (reason) => {
+    if (task.disconnectHandled || res.writableEnded) return;
+    task.clientConnected = false;
+    task.disconnectHandled = true;
+    task.disconnectReason = reason;
+    let abortSuccess = false;
+    try {
+      task.abortController.abort(createAbortError("客户端已断开", "qwen_client_disconnected"));
+      abortSuccess = task.abortController.signal.aborted;
+    } catch (error) {
+      task.abortError = error?.message || String(error);
+    }
+    task.abortSuccess = abortSuccess;
+    console.warn("[handwriting-task] client_disconnected", {
+      task_id: task.taskId,
+      reason,
+      abort_success: abortSuccess,
+      request_start_time: task.requestStartTime
+    });
+  };
+  const onRequestAborted = () => markClientDisconnected("req.aborted");
+  const onRequestClose = () => {
+    if (req.aborted || !req.complete) markClientDisconnected("req.close");
+  };
+  const onResponseClose = () => {
+    if (!res.writableEnded) markClientDisconnected("res.close");
+  };
+  req.on("aborted", onRequestAborted);
+  req.on("close", onRequestClose);
+  res.on("close", onResponseClose);
+  listeners.push(
+    [req, "aborted", onRequestAborted],
+    [req, "close", onRequestClose],
+    [res, "close", onResponseClose]
+  );
+
+  try {
+    await handleHandwritingInternal(req, res, task);
+    if (task.finalStatus === "RUNNING" && !task.disconnectHandled) {
+      finishHandwritingTask(task, "SUCCEEDED");
+    }
+  } catch (error) {
+    task.errorCode = error?.code || error?.name || "handwriting_failed";
+    task.errorStage = error?.stage || "handwriting";
+    if (task.disconnectHandled || task.errorCode === "qwen_client_disconnected") {
+      finishHandwritingTask(task, "CLIENT_DISCONNECTED", {
+        errorMessage: error?.message || "client disconnected"
+      });
+      return;
+    }
+    console.error("[handwriting-task] failed", {
+      task_id: task.taskId,
+      stage: task.errorStage,
+      code: task.errorCode,
+      message: error?.message || String(error)
+    });
+    if (!res.writableEnded && !res.destroyed) {
+      sendJson(res, error?.statusCode || 502, {
+        error: error?.message || "板书识别失败",
+        code: task.errorCode,
+        stage: task.errorStage,
+        task_id: task.taskId
+      });
+    }
+    finishHandwritingTask(task, "FAILED", {
+      errorMessage: error?.message || String(error)
+    });
+  } finally {
+    for (const [emitter, eventName, listener] of listeners) {
+      emitter.removeListener(eventName, listener);
+    }
+    if (task.finalStatus === "RUNNING") {
+      finishHandwritingTask(task, task.disconnectHandled ? "CLIENT_DISCONNECTED" : "FINISHED");
+    }
+  }
+}
+
+async function handleHandwritingInternal(req, res, task) {
   const requestStartedAt = Date.now();
-  const body = await readJsonBody(req);
+  const body = await readJsonBody(req, 24 * 1024 * 1024, task.abortController.signal);
   const sessionId = String(body.sessionId || "").trim();
   const questionId = String(body.questionId || "").trim();
   const memoryId = String(body.memoryId || body.questionMemory?.memoryId || "").trim();
@@ -9061,6 +9454,16 @@ async function handleHandwriting(req, res) {
 
   const boardForOcr = body.boardOnlyImage;
   const diagnostics = summarizeHandwritingDiagnostics(body.handwritingDiagnostics);
+  task.taskId = String(body.taskId || body.handwritingDiagnostics?.taskId || task.taskId);
+  task.boardVersion = Number(diagnostics.boardVersion || 0);
+  task.sessionId = sessionId;
+  task.questionId = questionId;
+  task.memoryId = memoryId;
+  task.versionKey = handwritingVersionKey(sessionId, questionId, task.boardVersion);
+  diagnostics.taskId = task.taskId;
+  diagnostics.task_id = task.taskId;
+  diagnostics.request_start_time = task.requestStartTime;
+  diagnostics.client_connected = true;
   if (
     (diagnostics.sessionId && diagnostics.sessionId !== Number(sessionId)) ||
     (diagnostics.requestId && diagnostics.requestId !== Number(body.requestId || 0)) ||
@@ -9092,6 +9495,30 @@ async function handleHandwriting(req, res) {
     sendJson(res, 409, { error: "Question Memory session mismatch", code: "question_memory_conflict", stage: "question-memory" });
     return;
   }
+  const existingTaskId = activeHandwritingVersions.get(task.versionKey);
+  if (existingTaskId && activeHandwritingTasks.has(existingTaskId)) {
+    sendJson(res, 409, {
+      error: "已有相同板书版本正在识别，请等待当前任务结束",
+      code: "handwriting_task_running",
+      stage: "handwriting-task",
+      task_id: task.taskId,
+      existing_task_id: existingTaskId
+    });
+    finishHandwritingTask(task, "DUPLICATE_SUPPRESSED", {
+      errorCode: "handwriting_task_running"
+    });
+    return;
+  }
+  activeHandwritingTasks.set(task.taskId, task);
+  activeHandwritingVersions.set(task.versionKey, task.taskId);
+  console.info("[handwriting-task] create", {
+    task_id: task.taskId,
+    request_start_time: task.requestStartTime,
+    client_connected: task.clientConnected,
+    session_id: sessionId,
+    question_id: questionId,
+    board_version: task.boardVersion
+  });
   console.log("[handwriting] request", diagnostics);
   if (String(boardForOcr || "").length < 100) {
     sendJson(res, 400, {
@@ -9108,6 +9535,14 @@ async function handleHandwriting(req, res) {
     `[handwriting-timing] question-memory=${Date.now() - requestStartedAt}ms trusted=${answerKey.trusted} q=${diagnostics.questionId} v=${diagnostics.boardVersion}`
   );
 
+  task.qwenStartTime = new Date().toISOString();
+  diagnostics.qwen_start_time = task.qwenStartTime;
+  console.info("[handwriting-task] qwen_start", {
+    task_id: task.taskId,
+    stage: "handwriting-model",
+    model_name: QWEN_HANDWRITING_MODEL,
+    start_time: task.qwenStartTime
+  });
   let result = await callHandwritingQwenJson({
     model: diagnostics.winnerModel || QWEN_HANDWRITING_MODEL,
     schema: handwritingSchema,
@@ -9125,11 +9560,24 @@ async function handleHandwriting(req, res) {
       },
       { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
     ],
-    maxOutputTokens: 700
+    maxOutputTokens: 700,
+    signal: task.abortController.signal,
+    timeoutMs: QWEN_HANDWRITING_TOTAL_TIMEOUT_MS
   }, diagnostics);
+  task.qwenResponseTime = new Date().toISOString();
+  diagnostics.qwen_response_time = task.qwenResponseTime;
+  console.info("[handwriting-task] qwen_response", {
+    task_id: task.taskId,
+    stage: "handwriting-model",
+    response_time: task.qwenResponseTime
+  });
   console.log(`[handwriting-timing] initial=${Date.now() - requestStartedAt}ms`);
 
-  result = await auditHandwritingResult(result, answerKey, body, boardForOcr);
+  result = await auditHandwritingResult(result, answerKey, body, boardForOcr, {
+    signal: task.abortController.signal,
+    timeoutMs: QWEN_HANDWRITING_TOTAL_TIMEOUT_MS,
+    diagnostics
+  });
   result = applyStatementEvaluationSafety(result, answerKey);
   result = buildHandwritingProcessFeedback(result, answerKey, body);
 
@@ -9182,6 +9630,8 @@ async function handleHandwriting(req, res) {
     answerVerification: answerKey.trusted ? "question-memory" : answerKey.status,
     model: QWEN_HANDWRITING_MODEL,
     provider: "qwen-structured-answer-handwriting",
+    task_id: task.taskId,
+    task_status: "SUCCEEDED",
     timingMs,
     handwritingDiagnostics: diagnostics
   });
@@ -9377,7 +9827,7 @@ function applyHandwritingAudit(result, audit) {
   };
 }
 
-async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
+async function auditHandwritingResult(result, answerKey, body, boardForOcr, control = {}) {
   if (!shouldAuditHandwritingResult(result, answerKey, body)) {
     console.log(
       `[handwriting-audit] skipped status=${result?.calculationStatus || ""} confidence=${result?.confidence || 0}`
@@ -9403,7 +9853,10 @@ async function auditHandwritingResult(result, answerKey, body, boardForOcr) {
         },
         { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
       ],
-      maxOutputTokens: 500
+      maxOutputTokens: 500,
+      signal: control.signal || null,
+      timeoutMs: control.timeoutMs || QWEN_HANDWRITING_TOTAL_TIMEOUT_MS,
+      diagnostics: control.diagnostics || {}
     });
     const audited = applyHandwritingAudit(result, audit);
     console.log(
@@ -9744,6 +10197,7 @@ module.exports = {
   isTransientQwenError,
   isConcreteGuideResult,
   isValidHandwritingResult,
+  requestQwenChatCompletionOnce,
   raceQwenStructuredModels,
   registerQuestionMemoryIdentity,
   registerHandwritingRequest,

@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   isConcreteGuideResult,
   isValidHandwritingResult,
+  requestQwenChatCompletionOnce,
   raceQwenStructuredModels
 } = require("../server.js");
 
@@ -90,4 +91,68 @@ test("an invalid fast guide result cannot suppress a slower valid result", async
   });
 
   assert.deepEqual(result, { valid: true, model: "slow-valid" });
+});
+
+test("a hung model is closed by the race deadline", async () => {
+  const deadlineAt = Date.now() + 35;
+  await assert.rejects(
+    raceQwenStructuredModels({
+      options: { deadlineAt },
+      models: ["hung-model"],
+      label: "test-timeout",
+      isValid: () => true,
+      invokeModel: () => new Promise(() => {})
+    }),
+    (error) => error?.code === "qwen_total_timeout" && error?.stage === "test-timeout"
+  );
+});
+
+test("an external abort closes all model work", async () => {
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), 15);
+  await assert.rejects(
+    raceQwenStructuredModels({
+      options: { signal: controller.signal, deadlineAt: Date.now() + 1000 },
+      models: ["hung-model-a", "hung-model-b"],
+      label: "test-abort",
+      isValid: () => true,
+      invokeModel: () => new Promise(() => {})
+    }),
+    (error) => error?.name === "AbortError" && error?.code === "qwen_aborted"
+  );
+  clearTimeout(abortTimer);
+});
+
+test("external cancellation reaches the underlying fetch", async () => {
+  const originalFetch = global.fetch;
+  let observedSignal = null;
+  const controller = new AbortController();
+  global.fetch = (_url, options) => {
+    observedSignal = options.signal;
+    return new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => {
+        const error = new Error("aborted by transport timeout");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  };
+
+  try {
+    const abortTimer = setTimeout(() => controller.abort(), 20);
+    await assert.rejects(
+      requestQwenChatCompletionOnce(
+        { model: "test-model", messages: [] },
+        false,
+        1000,
+        controller.signal
+      ),
+      (error) => error?.name === "AbortError" && error?.code === "qwen_aborted"
+    );
+    clearTimeout(abortTimer);
+    assert.ok(observedSignal instanceof AbortSignal);
+    assert.equal(observedSignal.aborted, true);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
