@@ -90,6 +90,13 @@ const QWEN_GUIDE_TOTAL_TIMEOUT_MS = Math.max(
   10000,
   Math.min(35000, Number(process.env.QWEN_GUIDE_TIMEOUT_MS || 25000))
 );
+// Handwriting is an observation request, not a structured answer request.
+// Keep its wall-clock budget separate from answer/guidance calls so one slow
+// board observation cannot hold the lecture state indefinitely.
+const QWEN_HANDWRITING_TOTAL_TIMEOUT_MS = Math.max(
+  12000,
+  Math.min(35000, Number(process.env.QWEN_HANDWRITING_TIMEOUT_MS || 30000))
+);
 // Keep failover bounded: one primary model and one fallback model run in the
 // same race. A longer candidate list turns a single board pause into several
 // rounds of model calls and makes the student wait without a useful result.
@@ -2825,7 +2832,8 @@ async function callQwenMultimodalJson({
   deadlineAt: requestedDeadlineAt,
   signal,
   disableModelFallback = false,
-  allowTextFallback = false
+  allowTextFallback = false,
+  plainTextMode = false
 }) {
   if (!QWEN_API_KEY) {
     const error = new Error("Qwen API key 未配置");
@@ -2834,19 +2842,25 @@ async function callQwenMultimodalJson({
     throw error;
   }
 
-  const schemaText = JSON.stringify(schema.schema, null, 2);
+  const schemaText = JSON.stringify(schema?.schema || {}, null, 2);
   const payload = {
     model,
     messages: [
       {
         role: "system",
-        content: [
-          instructions,
-          "你必须只输出一个合法 JSON 对象，不要输出 Markdown，不要输出解释。",
-          `JSON schema 名称：${schema.name}`,
-          "JSON schema：",
-          schemaText
-        ].join("\n\n")
+        content: plainTextMode
+          ? [
+            instructions,
+            "这是板书观察请求。请只返回你从当前黑板中实际看见的数学文字、公式和步骤，使用普通文本即可。",
+            "不要等待完整解题，不要猜测没有写出的内容；如果看不清或没有可识别内容，只返回‘无法识别’。"
+          ].join("\n\n")
+          : [
+            instructions,
+            "你必须只输出一个合法 JSON 对象，不要输出 Markdown，不要输出解释。",
+            `JSON schema 名称：${schema?.name || "unknown"}`,
+            "JSON schema：",
+            schemaText
+          ].join("\n\n")
       },
       {
         role: "user",
@@ -2862,12 +2876,13 @@ async function callQwenMultimodalJson({
     ? Number(requestedDeadlineAt)
     : Date.now() + QWEN_TOTAL_TIMEOUT_MS;
   try {
-    data = await requestQwenChatCompletion(payload, true, {
+    data = await requestQwenChatCompletion(payload, !plainTextMode, {
       deadlineAt,
       signal,
       disableModelFallback
     });
   } catch (error) {
+    if (plainTextMode) throw error;
     if (!isQwenJsonFormatUnsupported(error)) throw error;
     data = await requestQwenChatCompletion(payload, false, {
       deadlineAt,
@@ -2877,6 +2892,34 @@ async function callQwenMultimodalJson({
   }
 
   const rawText = extractDeepSeekText(data);
+  if (plainTextMode) {
+    const handwritingText = String(rawText || "")
+      .replace(/```(?:text|markdown)?/gi, "")
+      .replace(/```/g, "")
+      .trim();
+    if (!handwritingText || /无法识别|看不清|没有可识别|无法判断|请求失败|接口|网络错误|超时/i.test(handwritingText)) {
+      const error = new Error("Qwen 没有返回可识别的板书内容");
+      error.statusCode = 502;
+      error.code = "invalid_model_output";
+      throw error;
+    }
+    console.info("[qwen] handwriting plain text accepted", {
+      model,
+      textLength: handwritingText.length
+    });
+    return {
+      detectedWriting: handwritingText,
+      recognizedText: handwritingText,
+      mathExpression: handwritingText,
+      completedSteps: [handwritingText],
+      writingState: "in_progress",
+      calculationStatus: "incomplete",
+      isRelevant: true,
+      boardComplete: false,
+      confidence: 0.5,
+      plainTextResult: true
+    };
+  }
   const parsed = parseModelJson(rawText);
   if (!parsed && allowTextFallback) {
     const speech = rawText
@@ -2974,7 +3017,11 @@ async function raceQwenStructuredModels({ options, models, isValid, diagnostics 
   });
   if (!candidates.length) return callQwenMultimodalJson(options);
   const deadlineAt = Date.now() + (
-    label === "guide" ? QWEN_GUIDE_TOTAL_TIMEOUT_MS : QWEN_TOTAL_TIMEOUT_MS
+    label === "guide"
+      ? QWEN_GUIDE_TOTAL_TIMEOUT_MS
+      : label === "handwriting"
+        ? QWEN_HANDWRITING_TOTAL_TIMEOUT_MS
+        : QWEN_TOTAL_TIMEOUT_MS
   );
   let lastError = null;
 
@@ -3007,8 +3054,23 @@ async function raceQwenStructuredModels({ options, models, isValid, diagnostics 
             signal: controllers[index].signal,
             disableModelFallback: true
           }))
-          .then((result) => finish({ result, model }))
+          .then((result) => {
+            const accepted = Boolean(result && isValid(result, diagnostics));
+            console.info(`[${label}] parallel model result`, {
+              model,
+              elapsedMs: Date.now() - startedAt,
+              accepted,
+              resultType: typeof result,
+              textLength: String(result?.detectedWriting || result?.speech || "").length
+            });
+            finish({ result, model });
+          })
           .catch((error) => {
+            // The winning model aborts its sibling. That is expected cleanup,
+            // not another upstream failure and must not add noisy failure state.
+            if (winner || error?.name === "AbortError") {
+              return;
+            }
             lastError = error;
             settled += 1;
             console.warn(`[${label}] parallel model failed`, {
@@ -3101,7 +3163,12 @@ function isTransientQwenError(error) {
 async function callHandwritingQwenJson(options, diagnostics = {}) {
   try {
     return await raceQwenStructuredModels({
-      options,
+      options: {
+        ...options,
+        // Handwriting is intentionally plain text. Requiring JSON here made
+        // useful fast responses look invalid and forced the race to wait.
+        plainTextMode: true
+      },
       models: getQwenModelCandidates(options.model || QWEN_HANDWRITING_MODEL, options.modelCandidates),
       isValid: isValidHandwritingResult,
       diagnostics,

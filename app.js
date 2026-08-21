@@ -143,7 +143,9 @@ const SILENCE_AFTER_CARE_MS = 60000;
 const GUIDE_REQUEST_TIMEOUT_MS = 30000;
 // The server allows Qwen up to 45s. Keep the browser alive slightly longer so
 // a valid response is not turned into a duplicate retry by the client.
-const HANDWRITING_REQUEST_TIMEOUT_MS = 50000;
+// The server owns the handwriting race budget. Keep the browser timeout a
+// little longer so it receives the real server error instead of aborting first.
+const HANDWRITING_REQUEST_TIMEOUT_MS = 35000;
 const LIAN_TTS_REQUEST_TIMEOUT_MS = 9000;
 const LIAN_TEXT_PUBLISH_WATCHDOG_MS = 10000;
 // Each additional full idle interval moves the guide closer to a concrete
@@ -3705,8 +3707,8 @@ async function runHandwritingRecognition(reason) {
     state.lastHandwritingServiceError = info.pill;
     if (info.pauseMs) state.handwritingDisabledUntil = Date.now() + info.pauseMs;
     shouldRetryTransiently = [
-      "qwen_timeout",
-      "qwen_total_timeout",
+      // A timeout means the server already cancelled and released the model
+      // race. Retrying the same board version only recreates the waiting loop.
       "network_error",
       "rate_limited",
       "upstream_5xx",
