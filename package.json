@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check app.js",
-    "test": "node --test tests/segmentation-postprocess.test.js"
+    "test": "node --test tests/segmentation-postprocess.test.js tests/qwen-race.test.js"
   },
   "engines": {
     "node": ">=20"

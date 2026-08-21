@@ -54,7 +54,7 @@ test("classifies only retryable Qwen transport failures as transient", () => {
   assert.equal(isTransientQwenError({ code: "missing_qwen_api_key", statusCode: 503 }), false);
 });
 
-test("keeps answer-check failures retryable instead of converting them into a wrong answer", () => {
+test("keeps answer-check failures recoverable without converting them into a wrong answer", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const finalAnswerClient = appSource.slice(
@@ -73,19 +73,23 @@ test("keeps answer-check failures retryable instead of converting them into a wr
   assert.match(finalAnswerClient, /serviceUnavailable/);
   assert.match(finalAnswerClient, /X-Lian-Request-Id/);
   assert.match(finalAnswerSubmission, /state\.pendingFinalAnswerText = normalizedAnswer/);
-  assert.match(finalAnswerSubmission, /保留你刚才的答案/);
+  assert.match(finalAnswerSubmission, /保留你的答案和板书/);
+  assert.match(finalAnswerSubmission, /allowUnverified: true/);
+  assert.match(appSource, /answerVerificationStatus = "service-unavailable"/);
   assert.match(finalAnswerSubmission, /requestFinalAnswerCheckWithRetry/);
   assert.match(directFallback, /serviceUnavailable: true/);
   assert.match(directFallback, /retryable: true/);
 });
 
-test("uses one retry owner for guide requests", () => {
+test("uses parallel model racing for guide requests", () => {
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const guideSource = serverSource.slice(
     serverSource.indexOf("async function callGuideQwenMultimodalJson"),
     serverSource.indexOf("function summarizeHandwritingDiagnostics")
   );
-  assert.match(guideSource, /const maxAttempts = 1/);
+  assert.match(guideSource, /raceQwenStructuredModels/);
+  assert.match(guideSource, /isValid: isConcreteGuideResult/);
+  assert.doesNotMatch(guideSource, /const maxAttempts = 1/);
 });
 
 test("escalates silence guidance from a concrete entry point to a complete answer", () => {

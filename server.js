@@ -77,6 +77,13 @@ const QWEN_REQUEST_TIMEOUT_MS = Math.max(
   8000,
   Math.min(55000, Number(process.env.QWEN_REQUEST_TIMEOUT_MS || 45000))
 );
+// One logical Qwen request may try several configured models. Keep a single
+// wall-clock budget for the whole chain so fallback routing cannot turn one
+// request into several minutes of serial waiting.
+const QWEN_TOTAL_TIMEOUT_MS = Math.max(
+  12000,
+  Math.min(55000, Number(process.env.QWEN_TOTAL_TIMEOUT_MS || 45000))
+);
 const QWEN_HANDWRITING_RETRY_COUNT = Math.max(
   0,
   // The browser owns the delayed retry. Retrying here as well makes one
@@ -88,6 +95,9 @@ const QWEN_HANDWRITING_RETRY_COUNT = Math.max(
 // Keep it opt-in; the primary structured result and local safety rules remain authoritative.
 const HANDWRITING_AUDIT_ENABLED = !["0", "false", "off"].includes(
   String(process.env.HANDWRITING_AUDIT_ENABLED || "0").toLowerCase()
+);
+const GUIDE_MODEL_AUDIT_ENABLED = !["0", "false", "off"].includes(
+  String(process.env.GUIDE_MODEL_AUDIT_ENABLED || "0").toLowerCase()
 );
 const HANDWRITING_FAST_CONFIDENCE = Number(process.env.HANDWRITING_FAST_CONFIDENCE || 0.94);
 const AZURE_TTS_KEY =
@@ -216,6 +226,7 @@ const answerKeyCache = new Map();
 const answerKeyInflight = new Map();
 const questionMemoryIdentityRegistry = new Map();
 const handwritingRequestRegistry = new Map();
+const guideRequestRegistry = new Map();
 const REQUEST_REGISTRY_LIMIT = 2048;
 let paddleOcrService = null;
 let paddleOcrRequestId = 0;
@@ -2573,10 +2584,21 @@ function isQwenJsonFormatUnsupported(error) {
   return /response_format|json_object|not support|unsupported|不支持/i.test(`${code} ${message}`);
 }
 
-async function requestQwenChatCompletionOnce(payload, useJsonFormat = true) {
+async function requestQwenChatCompletionOnce(
+  payload,
+  useJsonFormat = true,
+  timeoutMs = QWEN_REQUEST_TIMEOUT_MS,
+  externalSignal = null
+) {
   let response;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), QWEN_REQUEST_TIMEOUT_MS);
+  const boundedTimeoutMs = Math.max(1000, Number(timeoutMs) || QWEN_REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), boundedTimeoutMs);
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", abortFromExternal, { once: true });
+  }
   try {
     response = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
       method: "POST",
@@ -2643,19 +2665,24 @@ async function requestQwenChatCompletionOnce(payload, useJsonFormat = true) {
     const timedOut = fetchError?.name === "AbortError";
     const error = new Error(
       timedOut
-        ? `Qwen 多模态 API 请求超过 ${Math.round(QWEN_REQUEST_TIMEOUT_MS / 1000)} 秒未返回`
+        ? `Qwen 多模态 API 请求超过 ${Math.round(boundedTimeoutMs / 1000)} 秒未返回`
         : "Qwen 多模态 API 网络连接失败"
     );
     error.statusCode = 502;
-    error.code = timedOut ? "qwen_timeout" : "network_error";
+    error.code = timedOut && boundedTimeoutMs < QWEN_REQUEST_TIMEOUT_MS
+      ? "qwen_total_timeout"
+      : timedOut
+        ? "qwen_timeout"
+        : "network_error";
     error.causeCode = causeCode;
     error.model = payload.model;
     console.warn(
-      `[qwen] ${timedOut ? "timeout" : "network"} failed model=${payload.model || ""} timeoutMs=${QWEN_REQUEST_TIMEOUT_MS} code=${causeCode || "unknown"} message=${fetchError?.message || ""}`
+      `[qwen] ${timedOut ? "timeout" : "network"} failed model=${payload.model || ""} timeoutMs=${boundedTimeoutMs} code=${causeCode || "unknown"} message=${fetchError?.message || ""}`
     );
     throw error;
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener?.("abort", abortFromExternal);
   }
 }
 
@@ -2679,6 +2706,7 @@ function isQwenModelQuotaOrAvailabilityError(error) {
   const status = Number(error?.statusCode || error?.status || 0);
   const message = String(error?.message || "").toLowerCase();
   const combined = `${code} ${message}`;
+  if (code === "qwen_total_timeout") return false;
   if (/invalid_api_key|authentication|api key|鉴权|认证/.test(combined)) return false;
   if (/response_format|json_object|unsupported|不支持/.test(combined) && status < 500) return false;
   return (
@@ -2692,25 +2720,58 @@ function isQwenModelQuotaOrAvailabilityError(error) {
   );
 }
 
+function isQwenNetworkError(error) {
+  const code = String(error?.code || "").toLowerCase();
+  const causeCode = String(error?.causeCode || "").toLowerCase();
+  const message = String(error?.message || "").toLowerCase();
+  const combined = `${code} ${causeCode} ${message}`;
+  return [
+    "network_error",
+    "eacces",
+    "econnreset",
+    "econnrefused",
+    "enetunreach",
+    "ehostunreach",
+    "eai_again",
+    "enotfound",
+    "etimedout"
+  ].some((token) => combined.includes(token)) || /fetch failed|network request failed|连接失败|网络错误/.test(combined);
+}
+
 function qwenModelIsCoolingDown(model) {
   return Number(qwenModelCooldownUntil.get(model) || 0) > Date.now();
 }
 
-async function requestQwenChatCompletion(payload, useJsonFormat = true) {
-  const modelCandidates = getQwenModelCandidates(payload?.model, payload?.modelCandidates);
+async function requestQwenChatCompletion(payload, useJsonFormat = true, options = {}) {
+  const modelCandidates = options.disableModelFallback
+    ? [String(payload?.model || "").trim()].filter(Boolean)
+    : getQwenModelCandidates(payload?.model, payload?.modelCandidates);
   const requestPayload = { ...(payload || {}) };
   delete requestPayload.modelCandidates;
 
   const availableCandidates = modelCandidates.filter((model) => !qwenModelIsCoolingDown(model));
   const candidates = availableCandidates.length ? availableCandidates : modelCandidates;
+  const deadlineAt = Number(options.deadlineAt) > 0
+    ? Number(options.deadlineAt)
+    : Date.now() + QWEN_TOTAL_TIMEOUT_MS;
   let lastError = null;
 
   for (let index = 0; index < candidates.length; index += 1) {
     const model = candidates[index];
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      const timeoutError = new Error("Qwen 多模态 API 总请求时间已用尽");
+      timeoutError.statusCode = 504;
+      timeoutError.code = "qwen_total_timeout";
+      timeoutError.model = model;
+      throw timeoutError;
+    }
     try {
       const data = await requestQwenChatCompletionOnce(
         { ...requestPayload, model },
-        useJsonFormat
+        useJsonFormat,
+        Math.min(QWEN_REQUEST_TIMEOUT_MS, remainingMs),
+        options.signal || null
       );
       if (index > 0) {
         console.info("[qwen-fallback] switched model successfully", {
@@ -2722,13 +2783,18 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true) {
       return data;
     } catch (error) {
       lastError = error;
-      const canSwitch = index < candidates.length - 1 && isQwenModelQuotaOrAvailabilityError(error);
+      const canSwitch =
+        index < candidates.length - 1 &&
+        error?.code !== "qwen_total_timeout" &&
+        !isQwenNetworkError(error) &&
+        isQwenModelQuotaOrAvailabilityError(error);
       console.warn("[qwen-fallback] model attempt failed", {
         model,
         attempted: index + 1,
         candidates,
         canSwitch,
         code: error?.code || "",
+        causeCode: error?.causeCode || "",
         status: error?.statusCode || error?.status || 0,
         message: error?.message || String(error)
       });
@@ -2740,7 +2806,16 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true) {
   throw lastError || new Error("Qwen 多模态 API 请求失败");
 }
 
-async function callQwenMultimodalJson({ model, content, schema, instructions, maxOutputTokens = 1200 }) {
+async function callQwenMultimodalJson({
+  model,
+  content,
+  schema,
+  instructions,
+  maxOutputTokens = 1200,
+  deadlineAt: requestedDeadlineAt,
+  signal,
+  disableModelFallback = false
+}) {
   if (!QWEN_API_KEY) {
     const error = new Error("Qwen API key 未配置");
     error.statusCode = 503;
@@ -2772,11 +2847,22 @@ async function callQwenMultimodalJson({ model, content, schema, instructions, ma
   };
 
   let data;
+  const deadlineAt = Number(requestedDeadlineAt) > 0
+    ? Number(requestedDeadlineAt)
+    : Date.now() + QWEN_TOTAL_TIMEOUT_MS;
   try {
-    data = await requestQwenChatCompletion(payload, true);
+    data = await requestQwenChatCompletion(payload, true, {
+      deadlineAt,
+      signal,
+      disableModelFallback
+    });
   } catch (error) {
     if (!isQwenJsonFormatUnsupported(error)) throw error;
-    data = await requestQwenChatCompletion(payload, false);
+    data = await requestQwenChatCompletion(payload, false, {
+      deadlineAt,
+      signal,
+      disableModelFallback
+    });
   }
 
   const rawText = extractDeepSeekText(data);
@@ -2798,45 +2884,129 @@ async function callQwenMultimodalJson({ model, content, schema, instructions, ma
   return parsed;
 }
 
-async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
-  let lastError = null;
-  // The browser owns the single retry for guide requests. Retrying here as
-  // well used to turn one transient failure into up to four Qwen calls.
-  const maxAttempts = 1;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const result = await callQwenMultimodalJson(options);
-      if (attempt > 1) {
-        console.info("[guide] transient retry succeeded", {
-          questionId: diagnostics.questionId || "",
-          eventType: diagnostics.eventType || "",
-          attempt,
-          model: options.model || ""
-        });
-      }
-      return result;
-    } catch (error) {
-      lastError = error;
-      // A timeout already consumed the full guide request budget. Retrying it
-      // here would queue another 45-second call while the browser has already
-      // moved on, so only retry failures that are likely to recover quickly.
-      const retryable = isTransientQwenError(error) && error?.code !== "qwen_timeout";
-      console.warn("[guide] qwen request failed", {
-        questionId: diagnostics.questionId || "",
-        eventType: diagnostics.eventType || "",
-        attempt,
-        retryable,
-        willRetry: attempt < maxAttempts && retryable,
-        code: error?.code || "",
-        status: error?.statusCode || error?.status || 0,
-        model: options.model || "",
-        message: error?.message || String(error)
-      });
-      if (attempt >= maxAttempts || !retryable) break;
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
+function isConcreteGuideResult(result, diagnostics = {}) {
+  if (!result || typeof result !== "object") return false;
+  const eventType = String(diagnostics.eventType || "");
+  if (result.shouldSpeak === false) {
+    // A silent normal/thought-complete result is valid. A silence, help, or
+    // answer-response event must produce an actual response before it wins a
+    // parallel race; otherwise a fast empty result can suppress a useful one.
+    return !/(?:silence|stuck|active_help|answer_to_lian_question|next_step)/.test(eventType);
   }
-  throw lastError;
+  const speech = String(result.speech || "").trim();
+  if (!speech || /请求失败|接口|稍后再试|没有返回|无法识别|不确定|网络错误|超时/i.test(speech)) {
+    return false;
+  }
+  const formula = String(result.formulaOrStep || "").trim();
+  const action = String(result.studentAction || "").trim();
+  if (/silence|stuck|active_help|answer_to_lian_question/.test(eventType)) {
+    return Boolean(formula || action || speech.length >= 12);
+  }
+  return true;
+}
+
+function isValidHandwritingResult(result) {
+  if (!result || typeof result !== "object") return false;
+  const writingState = String(result.writingState || "").trim().toLowerCase();
+  const calculationStatus = String(result.calculationStatus || "").trim().toLowerCase();
+  const status = String(result.status || "").trim().toLowerCase();
+  const uncertainStates = new Set(["unclear", "uncertain", "unknown", "不确定", "无法判断"]);
+  // An explicit uncertain response is not a winner in a parallel race. It
+  // must leave room for the other model to return an actually usable board
+  // interpretation.
+  if ([writingState, calculationStatus, status].some((value) => uncertainStates.has(value))) {
+    return false;
+  }
+  const confidence = Number(result.confidence);
+  if (Number.isFinite(confidence) && confidence < 0.35) return false;
+  const hasVisibleContent = Boolean(
+    String(result.detectedWriting || "").trim() ||
+    String(result.mathExpression || "").trim() ||
+    (Array.isArray(result.completedSteps) && result.completedSteps.some((step) => String(step || "").trim()))
+  );
+  const hasStructuredStatus = Boolean(writingState || calculationStatus || result.isRelevant != null || result.boardComplete != null);
+  return hasVisibleContent || hasStructuredStatus;
+}
+
+async function raceQwenStructuredModels({ options, models, isValid, diagnostics = {}, label, invokeModel }) {
+  const candidates = [...new Set((Array.isArray(models) ? models : []).map((model) => String(model || "").trim()).filter(Boolean))];
+  if (!candidates.length) return callQwenMultimodalJson(options);
+  const deadlineAt = Date.now() + QWEN_TOTAL_TIMEOUT_MS;
+  let lastError = null;
+
+  for (let offset = 0; offset < candidates.length; offset += 2) {
+    const batch = candidates.slice(offset, offset + 2);
+    const controllers = batch.map(() => new AbortController());
+    const startedAt = Date.now();
+    let settled = 0;
+    let winner = null;
+    const batchResult = await new Promise((resolve) => {
+      const finish = (value) => {
+        if (winner) return;
+        if (value?.result && isValid(value.result, diagnostics)) {
+          winner = value;
+          controllers.forEach((controller) => controller.abort());
+          resolve(value);
+          return;
+        }
+        settled += 1;
+        if (settled >= batch.length) resolve(null);
+      };
+
+      batch.forEach((model, index) => {
+        (invokeModel
+          ? invokeModel(model, controllers[index].signal, deadlineAt)
+          : callQwenMultimodalJson({
+            ...options,
+            model,
+            deadlineAt,
+            signal: controllers[index].signal,
+            disableModelFallback: true
+          }))
+          .then((result) => finish({ result, model }))
+          .catch((error) => {
+            lastError = error;
+            settled += 1;
+            console.warn(`[${label}] parallel model failed`, {
+              model,
+              elapsedMs: Date.now() - startedAt,
+              code: error?.code || "",
+              status: error?.statusCode || error?.status || 0,
+              message: error?.message || String(error)
+            });
+            if (settled >= batch.length && !winner) resolve(null);
+          });
+      });
+    });
+
+    if (batchResult?.result) {
+      console.info(`[${label}] parallel winner`, {
+        model: batchResult.model,
+        candidates: batch,
+        elapsedMs: Date.now() - startedAt,
+        questionId: diagnostics.questionId || "",
+        requestId: diagnostics.requestId || ""
+      });
+      diagnostics.winnerModel = batchResult.model;
+      return batchResult.result;
+    }
+    if (Date.now() >= deadlineAt) break;
+  }
+
+  throw lastError || Object.assign(new Error(`Qwen ${label} 没有返回有效结构化结果`), {
+    statusCode: 502,
+    code: "invalid_model_output"
+  });
+}
+
+async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
+  return raceQwenStructuredModels({
+    options,
+    models: getQwenModelCandidates(options.model || QWEN_GUIDE_MODEL, options.modelCandidates),
+    isValid: isConcreteGuideResult,
+    diagnostics,
+    label: "guide"
+  });
 }
 
 function summarizeHandwritingDiagnostics(diagnostics = {}) {
@@ -2870,6 +3040,7 @@ function isTransientQwenError(error) {
   return (
     code === "network_error" ||
     code === "qwen_timeout" ||
+    code === "qwen_total_timeout" ||
     code === "rate_limited" ||
     code === "upstream_5xx" ||
     status === 408 ||
@@ -2879,36 +3050,22 @@ function isTransientQwenError(error) {
 }
 
 async function callHandwritingQwenJson(options, diagnostics = {}) {
-  let lastError = null;
-  for (let attempt = 0; attempt <= QWEN_HANDWRITING_RETRY_COUNT; attempt += 1) {
-    try {
-      const result = await callQwenMultimodalJson(options);
-      if (attempt > 0) {
-        console.log(`[handwriting] retry succeeded attempt=${attempt + 1} model=${options.model || ""}`);
-      }
-      return result;
-    } catch (error) {
-      lastError = error;
-      error.stage = error.stage || "handwriting-model";
-      error.requestId = diagnostics.requestId || 0;
-      error.sessionId = diagnostics.sessionId || 0;
-      error.questionId = diagnostics.questionId || "";
-      error.model = error.model || options.model || "";
-      console.warn("[handwriting] model request failed", {
-        ...summarizeHandwritingDiagnostics(diagnostics),
-        attempt: attempt + 1,
-        retryable: isTransientQwenError(error),
-        stage: error.stage,
-        code: error.code || "",
-        status: error.statusCode || error.status || 0,
-        model: error.model,
-        message: error.message || String(error)
-      });
-      if (attempt >= QWEN_HANDWRITING_RETRY_COUNT || !isTransientQwenError(error)) break;
-      await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
-    }
+  try {
+    return await raceQwenStructuredModels({
+      options,
+      models: getQwenModelCandidates(options.model || QWEN_HANDWRITING_MODEL, options.modelCandidates),
+      isValid: isValidHandwritingResult,
+      diagnostics,
+      label: "handwriting"
+    });
+  } catch (error) {
+    error.stage = error.stage || "handwriting-model";
+    error.requestId = diagnostics.requestId || 0;
+    error.sessionId = diagnostics.sessionId || 0;
+    error.questionId = diagnostics.questionId || "";
+    error.model = error.model || options.model || "";
+    throw error;
   }
-  throw lastError;
 }
 
 function sanitizeKnowledge(value) {
@@ -7730,6 +7887,23 @@ function isLatestHandwritingRequest(sessionId, questionId, requestId) {
   return Number(handwritingRequestRegistry.get(requestRegistryKey(sessionId, questionId)) || 0) === Number(requestId || 0);
 }
 
+function registerGuideRequest(sessionId, questionId, requestId) {
+  const normalizedRequestId = String(requestId || "").trim();
+  if (!normalizedRequestId) return "";
+  const key = requestRegistryKey(sessionId, questionId);
+  guideRequestRegistry.set(key, normalizedRequestId);
+  while (guideRequestRegistry.size > REQUEST_REGISTRY_LIMIT) {
+    guideRequestRegistry.delete(guideRequestRegistry.keys().next().value);
+  }
+  return normalizedRequestId;
+}
+
+function isLatestGuideRequest(sessionId, questionId, requestId) {
+  const normalizedRequestId = String(requestId || "").trim();
+  if (!normalizedRequestId) return true;
+  return String(guideRequestRegistry.get(requestRegistryKey(sessionId, questionId)) || "") === normalizedRequestId;
+}
+
 function buildQuestionMemory(questionId, answerKey = {}, memoryId = "", sessionId = 0) {
   const ready = Boolean(answerKey.trusted);
   return {
@@ -7999,8 +8173,10 @@ async function auditGuideMath(result, answerKey, body) {
   }
   // The answer-key solver already supplied the trusted solution outline and
   // arithmetic checks. A second model audit here only adds latency and can
-  // replace a concrete, correct step with a vague fail-closed message.
-  if (body?.skipGuideModelAudit === true) return result;
+  // replace a concrete, correct step with a vague fail-closed message. Keep
+  // it explicitly opt-in for diagnostics instead of making every guide wait
+  // for a second multimodal request.
+  if (!GUIDE_MODEL_AUDIT_ENABLED || body?.skipGuideModelAudit === true) return result;
   try {
     const audit = await callQwenMultimodalJson({
       model: QWEN_GUIDE_MODEL,
@@ -8068,7 +8244,23 @@ async function handleFinalAnswerCheck(req, res) {
 
   let answerKey = null;
   try {
-    answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+    // Reuse the frozen Question Memory created when the question opened. A
+    // final-answer click must not trigger another multimodal answer solve when
+    // the browser already has a trusted answer key.
+    if (body.questionMemory?.ready === true) {
+      answerKey = questionMemoryToAnswerKey(
+        body.questionMemory,
+        String(body.questionId || "").trim(),
+        String(body.memoryId || body.questionMemory.memoryId || "").trim()
+      );
+      console.info("[final-answer] answer-key source=question-memory", {
+        requestId,
+        questionId: body.questionId || "",
+        trusted: Boolean(answerKey?.trusted)
+      });
+    } else {
+      answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+    }
   } catch (error) {
     console.warn(`[final-answer] answer-key unavailable code=${error.code || "unknown"}: ${error.message || error}`);
     // A timeout is a transient upstream failure. Do not immediately send the
@@ -8496,6 +8688,11 @@ async function handleGuide(req, res) {
     return;
   }
 
+  const guideSessionId = String(body.sessionId || "").trim();
+  const guideQuestionId = String(body.questionId || "").trim();
+  const guideRequestId = String(body.requestId || body.responseId || "").trim();
+  registerGuideRequest(guideSessionId, guideQuestionId, guideRequestId);
+
   const eventText = {
     answer_to_lian_question: "学生正在回答恋恋刚才主动提出的问题。请及时回应这个回答，不要沉默，也不要当作普通连续讲解忽略。",
     active_help: "学生主动求助、提问或明确表示不会。",
@@ -8684,9 +8881,23 @@ async function handleGuide(req, res) {
     ],
     maxOutputTokens: 1200
   }, {
-    questionId: body.questionId || "",
-    eventType: body.eventType || ""
+    questionId: guideQuestionId,
+    eventType: body.eventType || "",
+    requestId: guideRequestId,
+    sessionId: guideSessionId
   });
+
+  if (!isLatestGuideRequest(guideSessionId, guideQuestionId, guideRequestId)) {
+    sendJson(res, 409, {
+      error: "stale guide request",
+      code: "stale_request",
+      stage: "response-order",
+      requestId: guideRequestId,
+      sessionId: guideSessionId,
+      questionId: guideQuestionId
+    });
+    return;
+  }
 
   // Model-only guide mode: return Qwen's structured response unchanged.
   // Local formula builders and speech rewriters are intentionally bypassed so
@@ -8702,7 +8913,10 @@ async function handleGuide(req, res) {
   });
   sendJson(res, 200, {
     ...guideResult,
-    model: QWEN_GUIDE_MODEL,
+    model: guideResult?.model || guideResult?.qwenModel || QWEN_GUIDE_MODEL,
+    requestId: guideRequestId,
+    sessionId: guideSessionId,
+    questionId: guideQuestionId,
     answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
     provider: "qwen-structured-answer-guidance",
     fallbackFrom: "",
@@ -8779,7 +8993,7 @@ async function handleHandwriting(req, res) {
   );
 
   let result = await callHandwritingQwenJson({
-    model: QWEN_HANDWRITING_MODEL,
+    model: diagnostics.winnerModel || QWEN_HANDWRITING_MODEL,
     schema: handwritingSchema,
     instructions: HANDWRITING_PROMPT,
     content: [
@@ -9412,6 +9626,9 @@ module.exports = {
   questionMemoryToAnswerKey,
   buildHandwritingProcessFeedback,
   isTransientQwenError,
+  isConcreteGuideResult,
+  isValidHandwritingResult,
+  raceQwenStructuredModels,
   registerQuestionMemoryIdentity,
   registerHandwritingRequest,
   isLatestHandwritingRequest,

@@ -270,6 +270,9 @@ const state = {
   waitingForBoardBeforeFinalAnswer: false,
   finalAnswerVerified: false,
   verifiedFinalAnswerText: "",
+  finalAnswerVerificationUnavailableQuestionId: "",
+  finalAnswerVerificationUnavailableAnswer: "",
+  finalAnswerVerificationUnavailableAt: 0,
   boardCompletionVerified: false,
   completionCheckInProgress: false,
   autoSavePromptedQuestionId: "",
@@ -300,8 +303,10 @@ const state = {
   lianSpeechRequestId: 0,
   guideGeneration: 0,
   guideRequestInFlight: null,
+  guideAbortController: null,
   guideUnavailableAt: 0,
   guideUnavailableQuestionId: "",
+  guideUnavailableUntil: 0,
   openingSpeechInProgress: false,
   lectureSessionId: 0,
   answerSessionId: 0,
@@ -395,6 +400,7 @@ function pauseTeachSessionForNavigation() {
   state.guideRequestInFlight = null;
   state.guideUnavailableAt = 0;
   state.guideUnavailableQuestionId = "";
+  state.guideUnavailableUntil = 0;
   state.activeGuideRequestId += 1;
   state.handwritingRequestId += 1;
   if (state.handwritingActiveRequest) {
@@ -405,6 +411,9 @@ function pauseTeachSessionForNavigation() {
   state.handwritingQueuedReason = "";
   state.handwritingQueuedMeta = null;
   state.finalAnswerRequestId += 1;
+  state.finalAnswerVerificationUnavailableQuestionId = "";
+  state.finalAnswerVerificationUnavailableAnswer = "";
+  state.finalAnswerVerificationUnavailableAt = 0;
 
   if (state.resumeSpeechAfterNavigation) window.speechSynthesis.pause();
   if (state.resumeListeningAfterNavigation && state.speechRecognition) {
@@ -790,7 +799,14 @@ function markUserInput(type) {
   // from writing an answer after the student has already continued.
   state.activeGuideRequestId += 1;
   state.guideGeneration += 1;
+  state.guideAbortController?.abort(`new-student-${type}`);
+  state.guideAbortController = null;
   state.guideRequestInFlight = null;
+  // A failed guide request must not keep retriggering from silence timers.
+  // New speech/board input below clears this circuit and permits a fresh try.
+  state.guideUnavailableAt = 0;
+  state.guideUnavailableQuestionId = "";
+  state.guideUnavailableUntil = 0;
   state.lianSpeechRequestId += 1;
   state.openingSpeechInProgress = false;
   state.finalAnswerRequestId += 1;
@@ -898,12 +914,14 @@ function scheduleTransientHandwritingRetry(meta, reason) {
 
   const key = `${meta.sessionId}:${meta.questionId}:${meta.boardVersion}`;
   const attempt = Number(state.handwritingRetryCountByKey[key] || 0);
-  if (attempt >= 2) {
+  // One automatic retry is enough. Further retries for the same board
+  // version create a visible failure loop and block the save flow.
+  if (attempt >= 1) {
     state.handwritingRetryPending = false;
     return;
   }
   state.handwritingRetryCountByKey[key] = attempt + 1;
-  const delay = attempt === 0 ? 1200 : 3500;
+  const delay = 1200;
   clearHandwritingRetryTimer();
   state.handwritingRetryPending = true;
   console.log("[handwriting] schedule transient retry", {
@@ -953,6 +971,9 @@ function interruptGuideForStudentSpeech() {
   clearTimeout(state.pendingThoughtTimer);
   state.pendingThoughtTimer = null;
   state.activeGuideRequestId += 1;
+  state.guideAbortController?.abort("new-student-speech");
+  state.guideAbortController = null;
+  state.guideRequestInFlight = null;
   state.lianSpeechRequestId += 1;
   state.lianSpeechPausedRecognition = false;
   stopLianSpeechOutput();
@@ -996,6 +1017,9 @@ function createBoundedAbortController(parentSignal, timeoutMs) {
   }
   return {
     signal: controller.signal,
+    abort(reason = "cancelled") {
+      if (!controller.signal.aborted) controller.abort(reason);
+    },
     cleanup() {
       clearTimeout(timeout);
       parentSignal?.removeEventListener("abort", abortFromParent);
@@ -2478,6 +2502,9 @@ function startLecture(queue) {
   state.boardCompletionVerified = false;
   state.completionCheckInProgress = false;
   state.finalAnswerRequestId = 0;
+  state.finalAnswerVerificationUnavailableQuestionId = "";
+  state.finalAnswerVerificationUnavailableAnswer = "";
+  state.finalAnswerVerificationUnavailableAt = 0;
   state.currentQuestionCompleted = false;
   state.hasExplicitFinalAnswer = false;
   state.pendingLianQuestion = null;
@@ -2547,6 +2574,7 @@ function initCurrentQuestion() {
   state.guideRequestInFlight = null;
   state.guideUnavailableAt = 0;
   state.guideUnavailableQuestionId = "";
+  state.guideUnavailableUntil = 0;
   state.openingSpeechInProgress = true;
   const openingQuestionId = question.id;
   const openingStartedAt = state.lastUserInputAt;
@@ -3287,6 +3315,9 @@ function resetQuestionGuideState(options = {}) {
   state.completionCheckInProgress = false;
   state.autoSavePromptedQuestionId = "";
   state.finalAnswerRequestId += 1;
+  state.finalAnswerVerificationUnavailableQuestionId = "";
+  state.finalAnswerVerificationUnavailableAnswer = "";
+  state.finalAnswerVerificationUnavailableAt = 0;
   state.silenceGuidePending = false;
   state.openingSpeechInProgress = options.speak !== false;
   state.latestHandwritingResult = null;
@@ -3430,6 +3461,13 @@ function explainHandwritingError(error) {
     return {
       pill: "识别请求超时",
       log: `Qwen 在${stage ? `${stage}阶段` : "板书识别"}超过规定时间没有返回。板书已保留，稍后会用同一份最新板书重试。`,
+      pauseMs: 0
+    };
+  }
+  if (code === "qwen_total_timeout") {
+    return {
+      pill: "识别请求超时",
+      log: `Qwen 在${stage ? `${stage}阶段` : "板书识别"}的总等待时间已用尽。板书已保留，本次不会继续循环重试；请继续写新内容或稍后手动再试。`,
       pauseMs: 0
     };
   }
@@ -3666,6 +3704,7 @@ async function runHandwritingRecognition(reason) {
     if (info.pauseMs) state.handwritingDisabledUntil = Date.now() + info.pauseMs;
     shouldRetryTransiently = [
       "qwen_timeout",
+      "qwen_total_timeout",
       "network_error",
       "rate_limited",
       "upstream_5xx",
@@ -5584,8 +5623,12 @@ function resetSilenceTimer(updateSpeechAt = true) {
 function isGuideRequestRetryable(error) {
   if (!error || error.name === "AbortError") return false;
   if (["qwen_timeout", "request_aborted", "stale_request"].includes(error.code)) return false;
+  // A network failure has already failed before a usable response exists.
+  // Retrying here duplicated the same expensive guide request and produced
+  // repeated notices while leaving the save action blocked.
+  if (error.code === "network_error" || error.causeCode === "EACCES") return false;
   if (error.retryable === true) return true;
-  if (error.code === "network_error" || error.code === "http_408" || error.code === "http_429") {
+  if (error.code === "http_408" || error.code === "http_429") {
     return true;
   }
   return Number(error.status) >= 500 || error instanceof TypeError;
@@ -6201,6 +6244,21 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     console.warn("[guide] skipped", { eventType, reason: "no-current-question" });
     return false;
   }
+  const hasNewStudentSpeech = Boolean(String(latestStudentSpeech || "").trim());
+  const guideFailureStillCooling =
+    !options.retryAfterFailure &&
+    !hasNewStudentSpeech &&
+    state.guideUnavailableQuestionId === question.id &&
+    Number(state.guideUnavailableUntil || 0) > now;
+  if (guideFailureStillCooling) {
+    console.info("[guide] skipped", {
+      eventType,
+      questionId: question.id,
+      reason: "failure-circuit",
+      remainingMs: Number(state.guideUnavailableUntil) - now
+    });
+    return false;
+  }
   const handwritingPending = Boolean(
     state.handwritingRequestInFlight ||
     state.handwritingRetryPending ||
@@ -6219,7 +6277,13 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   const activeRequestIsCurrent = Boolean(
     activeRequest && activeRequest.requestId === state.activeGuideRequestId
   );
-  if (activeRequestIsCurrent && options.replacePending !== true) {
+  if (activeRequestIsCurrent && (options.replacePending === true || hasNewStudentSpeech)) {
+    state.guideAbortController?.abort(
+      hasNewStudentSpeech ? "new-student-speech" : "replace-pending"
+    );
+    state.guideAbortController = null;
+    state.guideRequestInFlight = null;
+  } else if (activeRequestIsCurrent) {
     console.info("[guide] skipped duplicate in-flight request", {
       eventType,
       requestId: activeRequest.requestId,
@@ -6233,7 +6297,14 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   const guideInputSnapshot = getStudentInputSnapshot();
   const responseToken = getInteractionToken();
   const responseId = `guide:${responseToken.sessionId}:${responseToken.sequenceId}:${requestId}`;
-  const guideOptions = { ...options, inputSnapshot: guideInputSnapshot, responseToken, responseId };
+  const guideOptions = {
+    ...options,
+    inputSnapshot: guideInputSnapshot,
+    responseToken,
+    responseId,
+    requestId,
+    sessionId: responseToken.sessionId
+  };
   state.guideRequestInFlight = {
     requestId,
     guideGeneration,
@@ -6286,9 +6357,12 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       });
       dom.lianState.textContent = "大模型没有返回引导";
       lianSilentNotice("这次引导没有拿到可用回复，请继续说或写下当前步骤。", {
-        key: `guide-empty:${questionId}:${eventType}`,
-        cooldownMs: 10000
+        key: `guide-empty:${questionId}`,
+        cooldownMs: 60000
       });
+      state.guideUnavailableAt = Date.now();
+      state.guideUnavailableQuestionId = questionId;
+      state.guideUnavailableUntil = Date.now() + 60000;
       return false;
     }
 
@@ -6342,9 +6416,10 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     dom.lianState.textContent = "自动引导暂时不可用，但仍可继续核对和保存";
     state.guideUnavailableAt = Date.now();
     state.guideUnavailableQuestionId = questionId;
+    state.guideUnavailableUntil = Date.now() + 60000;
     lianSilentNotice("自动引导暂时没有返回，但不影响继续核对。若已经说出答案，请点击保存至错题本继续。", {
-      key: `guide-failed:${questionId}:${eventType}`,
-      cooldownMs: 10000
+      key: `guide-failed:${questionId}`,
+      cooldownMs: 60000
     });
     return false;
   } finally {
@@ -6372,6 +6447,22 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
     ? memory.problemText
     : question.problemText || "";
   const requestControl = createBoundedAbortController(null, GUIDE_REQUEST_TIMEOUT_MS);
+  const guideRequestId = Number(options.requestId || 0);
+  const guideSessionId = Number(options.sessionId ?? options.responseToken?.sessionId ?? state.lectureSessionId ?? 0);
+  const markGuideRequestActive = () => {
+    if (!guideRequestId || guideRequestId === state.activeGuideRequestId) {
+      state.guideAbortController = requestControl;
+      return true;
+    }
+    requestControl.abort("stale-guide-request");
+    return false;
+  };
+  if (!markGuideRequestActive()) {
+    const staleError = new Error("stale guide request");
+    staleError.name = "AbortError";
+    staleError.code = "stale_request";
+    throw staleError;
+  }
   const requestStartedAt = Date.now();
   let requestAttempt = 0;
   console.info("[guide] request-start", {
@@ -6389,8 +6480,16 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       prepareGuideImage(rawQuestionImage, { maxSide: GUIDE_IMAGE_MAX_SIDE }),
       prepareGuideImage(rawBoardImage, { maxSide: GUIDE_BOARD_MAX_SIDE, quality: 0.78 })
     ]);
+    if (!markGuideRequestActive()) {
+      const staleError = new Error("stale guide request");
+      staleError.name = "AbortError";
+      staleError.code = "stale_request";
+      throw staleError;
+    }
     console.info("[guide] request-payload", {
       questionId: question.id || "",
+      requestId: guideRequestId,
+      sessionId: guideSessionId,
       questionImageChars: questionImage.length,
       boardImageChars: boardImage.length,
       totalImageChars: questionImage.length + boardImage.length
@@ -6404,6 +6503,8 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
           body: JSON.stringify({
       questionImage,
       questionId: question.id,
+      requestId: guideRequestId,
+      sessionId: guideSessionId,
       questionTitle: question.title || "",
       eventType,
       transcript: dom.transcriptInput.value.trim(),
@@ -6509,6 +6610,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
     });
     throw error;
   } finally {
+    if (state.guideAbortController === requestControl) {
+      state.guideAbortController = null;
+    }
     requestControl.cleanup();
   }
   console.info("[guide] response-received", {
@@ -6532,6 +6636,28 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       retryable: error.retryable,
       message: error.message
     });
+    throw error;
+  }
+  const responseRequestId = Number(result?.requestId || 0);
+  const responseSessionId = Number(result?.sessionId || 0);
+  if (
+    guideRequestId &&
+    responseRequestId &&
+    responseRequestId !== guideRequestId
+  ) {
+    const error = new Error("stale guide response");
+    error.code = "stale_request";
+    error.status = 409;
+    throw error;
+  }
+  if (
+    guideSessionId &&
+    responseSessionId &&
+    responseSessionId !== guideSessionId
+  ) {
+    const error = new Error("guide response belongs to another session");
+    error.code = "stale_request";
+    error.status = 409;
     throw error;
   }
   return result;
@@ -7246,15 +7372,19 @@ function lianSilentNotice(text, options = {}) {
   const cooldownMs = Number.isFinite(options.cooldownMs) ? options.cooldownMs : 45000;
   const now = Date.now();
 
+  // Deduplicate before touching the visible bubble. Previously the event log
+  // was deduplicated but the bubble was updated on every retry, making one
+  // upstream failure look like a loop of fresh assistant responses.
+  const lastNoticeAt = state.lastSilentNoticeAtByKey.get(key) || 0;
+  if (shouldLog && now - lastNoticeAt < cooldownMs) return;
+  if (shouldLog) state.lastSilentNoticeAtByKey.set(key, now);
+
   if (shouldUpdateBubble) dom.lianBubble.textContent = text;
   dom.lianState.textContent = guideIdleText();
   dom.lianAvatar.classList.remove("speaking");
   dom.lianAvatar.classList.add("listening");
 
   if (!shouldLog) return;
-  const lastNoticeAt = state.lastSilentNoticeAtByKey.get(key) || 0;
-  if (now - lastNoticeAt < cooldownMs) return;
-  state.lastSilentNoticeAtByKey.set(key, now);
   addLog("提示", text, { key });
 }
 
@@ -7286,6 +7416,9 @@ async function requestFinalAnswerCheck(answer) {
     body: JSON.stringify({
       questionImage: question.image,
       boardImage: getBoardImageForGuide(),
+      questionId: question.id || "",
+      memoryId: state.questionMemoryIdsByQuestion[question.id] || "",
+      questionMemory: state.questionMemoriesByQuestion[question.id] || null,
       answer,
       lectureText: dom.transcriptInput.value.trim(),
       latestHandwritingResult: state.latestHandwritingResult,
@@ -7317,16 +7450,10 @@ function isFinalAnswerCheckRetryable(error) {
 }
 
 async function requestFinalAnswerCheckWithRetry(answer) {
-  try {
-    return await requestFinalAnswerCheck(answer);
-  } catch (error) {
-    // Do not retry a 45-second timeout automatically. The answer is retained
-    // and the user can retry with the completion button without another
-    // forced re-speech.
-    if (!isFinalAnswerCheckRetryable(error)) throw error;
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    return requestFinalAnswerCheck(answer);
-  }
+  // One explicit save action equals one verification request. Automatic
+  // retries made a slow or exhausted provider look like an endless loop and
+  // blocked the only path to saving the student's work.
+  return requestFinalAnswerCheck(answer);
 }
 
 async function verifyBoardAndCompleteQuestion(options = {}) {
@@ -7470,16 +7597,32 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
     state.finalAnswerVerified = false;
     state.verifiedFinalAnswerText = "";
     state.boardCompletionVerified = false;
+    state.finalAnswerVerificationUnavailableQuestionId = question.id;
+    state.finalAnswerVerificationUnavailableAnswer = normalizedAnswer;
+    state.finalAnswerVerificationUnavailableAt = Date.now();
     dom.finishQuestionBtn.disabled = false;
     dom.recognitionPill.classList.add("hidden");
-    await lianSpeak(
-      "核对服务暂时没有响应，我先保留你刚才的答案。点击右上角“保存至错题本”可以重试核对。",
-      {
+    const serviceFailureNotice =
+      "核对服务暂时没有返回，我先保留你的答案和板书。再次点击“保存至错题本”可以先按待核验状态保存，不会继续卡在等待中。";
+    // When this failure came from the explicit save action, finish that same
+    // action immediately as a pending-verification notebook record. Do not
+    // make the student click again or start another model request.
+    if (options.continueAfterAnswer) {
+      // The save button is an explicit user action. Do not wait for TTS or a
+      // second provider request before persisting the answer and board.
+      addLog("提示", serviceFailureNotice, {
+        key: `final-answer-service-failed:${question.id}:${normalizedAnswer}`
+      });
+      await saveCurrentQuestionAndContinue({
+        allowUnverified: true,
+        feedback: "核对服务暂时不可用，答案和板书已按待核验状态保存。"
+      });
+    } else {
+      await lianSpeak(serviceFailureNotice, {
         dedupeKey: `final-answer-service-failed:${question.id}:${normalizedAnswer}`,
-        cooldownMs: 0,
-        allowRepeat: true
-      }
-    );
+        cooldownMs: 60000
+      });
+    }
   } finally {
     setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
   }
@@ -7488,13 +7631,29 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
 async function saveCurrentQuestionAndContinue(options = {}) {
   const question = currentPageQuestion();
   if (!question) return;
+  const pendingAnswer = String(
+    state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
+  ).trim();
+  const allowPendingVerificationSave = Boolean(
+    options.allowUnverified === true &&
+      pendingAnswer &&
+      state.finalAnswerVerificationUnavailableQuestionId === question.id &&
+      state.finalAnswerVerificationUnavailableAnswer === pendingAnswer
+  );
+
+  // A provider outage must not trap the user in a retry loop. This path is
+  // only reachable after an explicit second click and is stored as pending
+  // verification, never as a confirmed-correct answer.
+  if (allowPendingVerificationSave) {
+    state.finalAnswerVerified = false;
+    state.boardCompletionVerified = false;
+    state.currentQuestionCompleted = false;
+  }
+
   // A failed optional guide must never strand an answer that the student has
   // already said. The next click can resume the answer-check path directly;
   // board verification remains a separate gate after the answer is confirmed.
-  if (!state.finalAnswerVerified) {
-    const pendingAnswer = String(
-      state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
-    ).trim();
+  if (!state.finalAnswerVerified && !allowPendingVerificationSave) {
     if (pendingAnswer) {
       dom.finishQuestionBtn.disabled = true;
       await handleFinalAnswerSubmission(pendingAnswer, {
@@ -7505,7 +7664,7 @@ async function saveCurrentQuestionAndContinue(options = {}) {
       return;
     }
   }
-  if (!state.finalAnswerVerified || !state.boardCompletionVerified) {
+  if ((!state.finalAnswerVerified || !state.boardCompletionVerified) && !allowPendingVerificationSave) {
     state.currentQuestionCompleted = false;
     dom.finishQuestionBtn.disabled = false;
     setGuideState(GUIDE_STATES.INTERACTIVE);
@@ -7537,6 +7696,14 @@ async function saveCurrentQuestionAndContinue(options = {}) {
       latestHandwritingResult: state.latestHandwritingResult
     };
     record = buildNotebookRecord(question);
+    if (allowPendingVerificationSave) {
+      record.status = "待核验";
+      record.needsReview = true;
+      record.answerVerificationPending = true;
+      record.answerVerificationStatus = "service-unavailable";
+      record.pendingFinalAnswer = pendingAnswer;
+      record.verifiedAnswer = "";
+    }
     state.notebook.unshift(record);
     state.completedThisSession.push(record);
     state.completedLectureQuestionIds.add(question.id);
@@ -7567,6 +7734,9 @@ async function saveCurrentQuestionAndContinue(options = {}) {
 
   state.finalAnswerVerified = false;
   state.verifiedFinalAnswerText = "";
+  state.finalAnswerVerificationUnavailableQuestionId = "";
+  state.finalAnswerVerificationUnavailableAnswer = "";
+  state.finalAnswerVerificationUnavailableAt = 0;
   state.boardCompletionVerified = false;
   state.currentQuestionCompleted = false;
   dom.finishQuestionBtn.disabled = true;
@@ -7643,12 +7813,23 @@ dom.finishQuestionBtn.addEventListener("click", () => {
     void verifyBoardAndCompleteQuestion();
     return;
   }
-  // The answer may have been captured successfully while an automatic guide
-  // request timed out. Treat the save button as an explicit recovery action
-  // instead of asking the student to repeat the answer or wait indefinitely.
   const pendingAnswer = String(
     state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
   ).trim();
+  if (
+    pendingAnswer &&
+    state.finalAnswerVerificationUnavailableQuestionId === currentPageQuestion()?.id &&
+    state.finalAnswerVerificationUnavailableAnswer === pendingAnswer
+  ) {
+    void saveCurrentQuestionAndContinue({
+      allowUnverified: true,
+      feedback: "答案已保留，待核验状态已保存。"
+    });
+    return;
+  }
+  // The answer may have been captured successfully while an automatic guide
+  // request timed out. Treat the save button as an explicit recovery action
+  // instead of asking the student to repeat the answer or wait indefinitely.
   if (pendingAnswer) {
     void handleFinalAnswerSubmission(pendingAnswer, {
       silentLog: true,
