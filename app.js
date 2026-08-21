@@ -138,7 +138,9 @@ const GUIDE_STATE_LABELS = {
 
 const SILENCE_CARE_MS = 60000;
 const SILENCE_AFTER_CARE_MS = 60000;
-const GUIDE_REQUEST_TIMEOUT_MS = 52000;
+// Keep the browser budget just above the server's dedicated guide budget.
+// A guide turn must fail fast enough that the student can continue writing.
+const GUIDE_REQUEST_TIMEOUT_MS = 30000;
 // The server allows Qwen up to 45s. Keep the browser alive slightly longer so
 // a valid response is not turned into a duplicate retry by the client.
 const HANDWRITING_REQUEST_TIMEOUT_MS = 50000;
@@ -164,9 +166,9 @@ const REPEATED_GUIDANCE_COOLDOWN_MS = 90000;
 const LIAN_VOICE_RATE = 0.92;
 const LIAN_VOICE_PITCH = 1.01;
 const LIAN_VOICE_VOLUME = 0.82;
-const GUIDE_IMAGE_MAX_SIDE = 1600;
-const GUIDE_BOARD_MAX_SIDE = 1400;
-const GUIDE_IMAGE_JPEG_QUALITY = 0.84;
+const GUIDE_IMAGE_MAX_SIDE = 1400;
+const GUIDE_BOARD_MAX_SIDE = 1100;
+const GUIDE_IMAGE_JPEG_QUALITY = 0.76;
 const GUIDE_IMAGE_CACHE_LIMIT = 6;
 const guideImageCache = new Map();
 const ACTIVE_HELP_PATTERN = /为什么|不懂|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下|怎么(?:来|来的|求|算|做|解|得到|列|消元|化简)|如何(?:求|算|做|解|得到|列|消元|化简)|该(?:怎么|如何)|能不能(?:提示|讲|告诉)|可以怎么/;
@@ -3711,8 +3713,11 @@ async function runHandwritingRecognition(reason) {
       "upstream_invalid_response"
     ].includes(String(error?.code || ""));
   } finally {
-    finishHandwritingRequest(requestMeta, isCurrentHandwritingRequest(requestMeta) ? "completed" : "stale");
-    if (shouldRetryTransiently) scheduleTransientHandwritingRetry(requestMeta, reason);
+    const requestWasCurrent = isCurrentHandwritingRequest(requestMeta);
+    finishHandwritingRequest(requestMeta, requestWasCurrent ? "completed" : "stale");
+    if (shouldRetryTransiently && requestWasCurrent) {
+      scheduleTransientHandwritingRetry(requestMeta, reason);
+    }
     setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
     const queuedReason = state.handwritingQueuedReason;
     const queuedMeta = state.handwritingQueuedMeta;
@@ -6264,14 +6269,30 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     state.handwritingRetryPending ||
     state.handwritingRetryTimer
   );
-  if (handwritingPending && !String(latestStudentSpeech || "").trim()) {
+  // Board-first does not mean board-only. A fresh spoken explanation is
+  // valid evidence while the board request is still running; the guide API
+  // receives that speech and can respond from it. What must be blocked is a
+  // board-dependent silence guide with no new speech, because it would be
+  // forced to reason from an unfinished board snapshot.
+  if (handwritingPending && !hasNewStudentSpeech) {
     console.info("[guide] skipped while handwriting is pending", {
       eventType,
       inFlight: state.handwritingRequestInFlight,
       retryPending: state.handwritingRetryPending,
-      hasRetryTimer: Boolean(state.handwritingRetryTimer)
+      hasRetryTimer: Boolean(state.handwritingRetryTimer),
+      hasNewStudentSpeech,
+      evidence: "none"
     });
     return false;
+  }
+  if (handwritingPending && hasNewStudentSpeech) {
+    console.info("[guide] using speech while handwriting is pending", {
+      eventType,
+      inFlight: state.handwritingRequestInFlight,
+      retryPending: state.handwritingRetryPending,
+      hasRetryTimer: Boolean(state.handwritingRetryTimer),
+      evidence: "speech"
+    });
   }
   const activeRequest = state.guideRequestInFlight;
   const activeRequestIsCurrent = Boolean(

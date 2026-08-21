@@ -84,6 +84,16 @@ const QWEN_TOTAL_TIMEOUT_MS = Math.max(
   12000,
   Math.min(55000, Number(process.env.QWEN_TOTAL_TIMEOUT_MS || 45000))
 );
+// Guidance is a short interactive turn. It should not consume the longer
+// handwriting/answer budget while the student is waiting for a response.
+const QWEN_GUIDE_TOTAL_TIMEOUT_MS = Math.max(
+  10000,
+  Math.min(35000, Number(process.env.QWEN_GUIDE_TIMEOUT_MS || 25000))
+);
+// Keep failover bounded: one primary model and one fallback model run in the
+// same race. A longer candidate list turns a single board pause into several
+// rounds of model calls and makes the student wait without a useful result.
+const QWEN_MAX_MODEL_CANDIDATES = 2;
 const QWEN_HANDWRITING_RETRY_COUNT = Math.max(
   0,
   // The browser owns the delayed retry. Retrying here as well makes one
@@ -2698,7 +2708,7 @@ function getQwenModelCandidates(model, explicitCandidates = []) {
     configured,
     ...explicit.map((item) => String(item || "").trim()),
     ...byPurpose
-  ])].filter(Boolean);
+  ])].filter(Boolean).slice(0, QWEN_MAX_MODEL_CANDIDATES);
 }
 
 function isQwenModelQuotaOrAvailabilityError(error) {
@@ -2814,7 +2824,8 @@ async function callQwenMultimodalJson({
   maxOutputTokens = 1200,
   deadlineAt: requestedDeadlineAt,
   signal,
-  disableModelFallback = false
+  disableModelFallback = false,
+  allowTextFallback = false
 }) {
   if (!QWEN_API_KEY) {
     const error = new Error("Qwen API key 未配置");
@@ -2867,6 +2878,31 @@ async function callQwenMultimodalJson({
 
   const rawText = extractDeepSeekText(data);
   const parsed = parseModelJson(rawText);
+  if (!parsed && allowTextFallback) {
+    const speech = rawText
+      .replace(/```(?:json|text)?/gi, "")
+      .replace(/```/g, "")
+      .replace(/^\s*(?:回复|引导|答案)\s*[:：]\s*/i, "")
+      .trim();
+    if (speech && !/请求失败|接口|稍后再试|没有返回|无法识别|网络错误|超时/i.test(speech)) {
+      console.warn("[qwen] guide accepted plain text fallback", {
+        model,
+        textLength: speech.length
+      });
+      return {
+        shouldSpeak: true,
+        speech,
+        guideState: "interactive_teaching",
+        knowledgePoints: [],
+        hintLevel: "worked_step",
+        formulaOrStep: "",
+        askStudentToRepeat: false,
+        studentAction: "",
+        lectureComplete: false,
+        plainTextFallback: true
+      };
+    }
+  }
   if (!parsed) {
     console.warn("[qwen] invalid structured output", {
       model,
@@ -2929,9 +2965,17 @@ function isValidHandwritingResult(result) {
 }
 
 async function raceQwenStructuredModels({ options, models, isValid, diagnostics = {}, label, invokeModel }) {
-  const candidates = [...new Set((Array.isArray(models) ? models : []).map((model) => String(model || "").trim()).filter(Boolean))];
+  const candidates = [...new Set((Array.isArray(models) ? models : [])
+    .map((model) => String(model || "").trim())
+    .filter(Boolean))].slice(0, QWEN_MAX_MODEL_CANDIDATES);
+  console.info(`[${label}] model race`, {
+    candidates,
+    maxCandidates: QWEN_MAX_MODEL_CANDIDATES
+  });
   if (!candidates.length) return callQwenMultimodalJson(options);
-  const deadlineAt = Date.now() + QWEN_TOTAL_TIMEOUT_MS;
+  const deadlineAt = Date.now() + (
+    label === "guide" ? QWEN_GUIDE_TOTAL_TIMEOUT_MS : QWEN_TOTAL_TIMEOUT_MS
+  );
   let lastError = null;
 
   for (let offset = 0; offset < candidates.length; offset += 2) {
@@ -3001,7 +3045,12 @@ async function raceQwenStructuredModels({ options, models, isValid, diagnostics 
 
 async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
   return raceQwenStructuredModels({
-    options,
+    options: {
+      ...options,
+      // A guide is useful as plain text too. Do not discard a usable response
+      // merely because a provider ignored response_format=json_object.
+      allowTextFallback: true
+    },
     models: getQwenModelCandidates(options.model || QWEN_GUIDE_MODEL, options.modelCandidates),
     isValid: isConcreteGuideResult,
     diagnostics,
