@@ -281,6 +281,8 @@ const state = {
   completionCheckInProgress: false,
   autoSavePromptedQuestionId: "",
   finalAnswerRequestId: 0,
+  finalAnswerAbortController: null,
+  finalAnswerActiveRequest: null,
   questionMemoryStatusByQuestion: {},
   questionMemoriesByQuestion: {},
   questionMemoryFetchPromises: {},
@@ -289,6 +291,8 @@ const state = {
   hasExplicitFinalAnswer: false,
   pendingLianQuestion: null,
   pendingLianOpeningText: "",
+  askedConceptsByQuestion: {},
+  resolvedConceptsByQuestion: {},
   logItemsByKey: new Map(),
   lastSilentNoticeAtByKey: new Map(),
   promptVariantLastByKey: new Map(),
@@ -814,6 +818,9 @@ function markUserInput(type) {
   state.lianSpeechRequestId += 1;
   state.openingSpeechInProgress = false;
   state.finalAnswerRequestId += 1;
+  state.finalAnswerAbortController?.abort(`new-student-${type}`);
+  state.finalAnswerAbortController = null;
+  state.finalAnswerActiveRequest = null;
   stopLianSpeechOutput();
   if (type === "speech") {
     state.lastSpeechAt = now;
@@ -6465,7 +6472,10 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
   const completedStepCount = Array.isArray(state.latestHandwritingResult?.completedSteps)
     ? state.latestHandwritingResult.completedSteps.length
     : 0;
-  const trustedContextStep = trustedSteps[completedStepCount] || trustedSteps[0] || "";
+  // Never fall back to the first standard step after the student has already
+  // supplied board evidence. The server recomputes the next unresolved step
+  // from the latest board/speech snapshot.
+  const trustedContextStep = trustedSteps[completedStepCount] || "";
   const trustedProblemText = memory?.ready && memory.problemText
     ? memory.problemText
     : question.problemText || "";
@@ -6539,6 +6549,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       boardImage,
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
       latestHandwritingResult: state.latestHandwritingResult || null,
+      askedConcepts: state.askedConceptsByQuestion[question.id] || [],
+      resolvedConcepts: state.resolvedConceptsByQuestion[question.id] || [],
+      previousGuideQuestion: state.pendingLianQuestion?.text || "",
       silenceContextStep: /silence/.test(eventType) ? (trustedContextStep || getSilenceContextStep()) : "",
       verifiedGuideSteps: trustedSteps,
       // Reuse the frozen Question Memory created when this question was
@@ -6682,6 +6695,11 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
     error.code = "stale_request";
     error.status = 409;
     throw error;
+  }
+  if (result?.progress?.resolvedConcepts && question.id) {
+    state.resolvedConceptsByQuestion[question.id] = Array.from(new Set(
+      result.progress.resolvedConcepts.map((item) => String(item || "")).filter(Boolean)
+    ));
   }
   return result;
 }
@@ -7425,21 +7443,24 @@ function askForFinalAnswer() {
   );
 }
 
-async function requestFinalAnswerCheck(answer) {
+async function requestFinalAnswerCheck(answer, options = {}) {
   const question = currentPageQuestion();
   if (!question) throw new Error("没有当前题目");
   saveCurrentPage();
-  const requestId = `final-answer:${question.id || "question"}:${Date.now()}`;
+  const requestId = options.requestId || `final-answer:${question.id || "question"}:${Date.now()}`;
+  const requestBoardVersion = Number(options.boardVersion ?? getBoardVersion(question));
   const response = await fetch("/api/final-answer", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Lian-Request-Id": requestId
     },
+    signal: options.signal,
     body: JSON.stringify({
       questionImage: question.image,
       boardImage: getBoardImageForGuide(),
       questionId: question.id || "",
+      boardVersion: requestBoardVersion,
       memoryId: state.questionMemoryIdsByQuestion[question.id] || "",
       questionMemory: state.questionMemoriesByQuestion[question.id] || null,
       answer,
@@ -7448,7 +7469,27 @@ async function requestFinalAnswerCheck(answer) {
       problemText: question.problemText || ""
     })
   });
-  const result = await response.json().catch(() => ({}));
+  const rawResponse = await response.text();
+  let result = {};
+  if (rawResponse.trim()) {
+    try {
+      result = JSON.parse(rawResponse);
+    } catch (parseError) {
+      const error = new Error("核对服务返回了无法解析的结果");
+      error.code = "INVALID_JSON";
+      error.parseError = parseError.message;
+      error.rawResponse = rawResponse.slice(0, 1200);
+      error.status = response.status;
+      error.requestId = requestId;
+      throw error;
+    }
+  } else {
+    const error = new Error("核对服务返回为空");
+    error.code = "EMPTY_RESPONSE";
+    error.status = response.status;
+    error.requestId = requestId;
+    throw error;
+  }
   if (!response.ok || result.serviceUnavailable === true || String(result.verificationStatus || "").startsWith("service-unavailable:")) {
     const error = new Error(result.error || "最后答案核对服务暂时没有返回");
     error.code = result.code || (response.status >= 500 ? "upstream_5xx" : `http_${response.status}`);
@@ -7472,11 +7513,11 @@ function isFinalAnswerCheckRetryable(error) {
   );
 }
 
-async function requestFinalAnswerCheckWithRetry(answer) {
+async function requestFinalAnswerCheckWithRetry(answer, options = {}) {
   // One explicit save action equals one verification request. Automatic
   // retries made a slow or exhausted provider look like an endless loop and
   // blocked the only path to saving the student's work.
-  return requestFinalAnswerCheck(answer);
+  return requestFinalAnswerCheck(answer, options);
 }
 
 async function verifyBoardAndCompleteQuestion(options = {}) {
@@ -7542,7 +7583,19 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
   const question = currentPageQuestion();
   const normalizedAnswer = String(answer || "").trim();
   if (!question || !normalizedAnswer) return;
+  state.finalAnswerAbortController?.abort("superseded-final-answer");
   const requestId = ++state.finalAnswerRequestId;
+  const requestBoardVersion = getBoardVersion(question);
+  const requestMeta = {
+    requestId,
+    questionId: question.id || "",
+    boardVersion: requestBoardVersion,
+    answer: normalizedAnswer,
+    timestamp: Date.now()
+  };
+  const requestController = new AbortController();
+  state.finalAnswerAbortController = requestController;
+  state.finalAnswerActiveRequest = requestMeta;
   state.awaitingFinalAnswer = false;
   state.pendingFinalAnswerText = normalizedAnswer;
   state.finalAnswerVerified = false;
@@ -7555,8 +7608,15 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
   if (!options.silentLog) addLog("我", normalizedAnswer);
 
   try {
-    const result = await requestFinalAnswerCheckWithRetry(normalizedAnswer);
-    if (requestId !== state.finalAnswerRequestId || currentPageQuestion()?.id !== question.id) return;
+    const result = await requestFinalAnswerCheckWithRetry(normalizedAnswer, {
+      requestId: `final-answer:${question.id || "question"}:${requestId}`,
+      boardVersion: requestBoardVersion,
+      signal: requestController.signal
+    });
+    if (!isCurrentFinalAnswerRequest(requestMeta)) {
+      console.info("[final-answer] stale response ignored", requestMeta);
+      return;
+    }
 
     if (result.correct) {
       state.finalAnswerVerified = true;
@@ -7615,7 +7675,13 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
     );
   } catch (error) {
     console.warn("Final answer check fallback:", error);
-    if (requestId !== state.finalAnswerRequestId || currentPageQuestion()?.id !== question.id) return;
+    if (!isCurrentFinalAnswerRequest(requestMeta)) {
+      console.info("[final-answer] stale failure ignored", {
+        ...requestMeta,
+        code: error?.code || "unknown"
+      });
+      return;
+    }
     state.awaitingFinalAnswer = true;
     state.finalAnswerVerified = false;
     state.verifiedFinalAnswerText = "";
@@ -7647,8 +7713,23 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
       });
     }
   } finally {
+    if (state.finalAnswerActiveRequest === requestMeta) {
+      state.finalAnswerActiveRequest = null;
+      state.finalAnswerAbortController = null;
+    }
     setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
   }
+}
+
+function isCurrentFinalAnswerRequest(requestMeta) {
+  const question = currentPageQuestion();
+  return Boolean(
+    requestMeta &&
+    state.finalAnswerActiveRequest?.requestId === requestMeta.requestId &&
+    state.finalAnswerRequestId === requestMeta.requestId &&
+    question?.id === requestMeta.questionId &&
+    getBoardVersion(question) === requestMeta.boardVersion
+  );
 }
 
 async function saveCurrentQuestionAndContinue(options = {}) {

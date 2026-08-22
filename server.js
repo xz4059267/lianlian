@@ -2840,9 +2840,12 @@ async function requestQwenChatCompletionOnce(
       const error = new Error("Qwen 多模态 API 返回了无法解析的响应");
       error.statusCode = 502;
       error.code = "upstream_invalid_response";
+      error.errorType = "INVALID_JSON";
+      error.parseError = parseError?.message || String(parseError);
       error.model = model;
       error.responseBytes = trace.response_bytes;
-      if (QWEN_DEBUG_LOGS) error.responsePreview = String(rawBody || "").slice(0, 1200);
+      error.responsePreview = String(rawBody || "").slice(0, 1200);
+      if (QWEN_DEBUG_LOGS) trace.raw_response_preview = error.responsePreview;
       throw error;
     }
 
@@ -3185,6 +3188,8 @@ async function callQwenMultimodalJson({
     const error = new Error("Qwen 多模态模型没有返回可解析的结构化结果");
     error.statusCode = 502;
     error.code = "invalid_model_output";
+    error.errorType = "INVALID_JSON";
+    error.rawResponsePreview = String(rawText || "").slice(0, 1200);
     throw error;
   }
   return parsed;
@@ -3504,6 +3509,18 @@ function isTransientQwenError(error) {
     status === 429 ||
     status >= 500
   );
+}
+
+function classifyQwenError(error) {
+  if (error?.errorType) return String(error.errorType);
+  const code = String(error?.code || "").toLowerCase();
+  if (code.includes("timeout")) return "TIMEOUT";
+  if (code.includes("abort")) return "ABORTED";
+  if (code.includes("invalid") || code.includes("parse")) return "INVALID_JSON";
+  if (code.includes("empty")) return "EMPTY_RESPONSE";
+  if (code.includes("network")) return "NETWORK_ERROR";
+  if (Number(error?.statusCode || error?.status || 0) >= 500) return "MODEL_ERROR";
+  return "MODEL_ERROR";
 }
 
 async function callHandwritingQwenJson(options, diagnostics = {}) {
@@ -7527,7 +7544,9 @@ async function handleTranscriptCorrection(req, res) {
     return;
   }
 
-  const result = await callQwenMultimodalJson({
+  let result;
+  try {
+    result = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: transcriptCorrectionSchema,
     instructions: TRANSCRIPT_CORRECTION_PROMPT_V2,
@@ -7552,13 +7571,21 @@ async function handleTranscriptCorrection(req, res) {
     maxOutputTokens: 500
   });
 
-  const correctedText = String(result.correctedText || text).trim() || text;
-  sendJson(res, 200, {
-    correctedText,
-    changed: Boolean(result.changed) && correctedText !== text,
-    model: QWEN_GUIDE_MODEL,
-    provider: "qwen-multimodal-transcript-correction"
-  });
+    const correctedText = String(result.correctedText || text).trim() || text;
+    sendJson(res, 200, {
+      correctedText,
+      changed: Boolean(result.changed) && correctedText !== text,
+      model: QWEN_GUIDE_MODEL,
+      provider: "qwen-multimodal-transcript-correction"
+    });
+  } catch (error) {
+    console.warn("[transcript-correction] failed", {
+      errorType: classifyQwenError(error),
+      code: error.code || "",
+      parseError: error.parseError || ""
+    });
+    sendJson(res, 200, { correctedText: text, changed: false, fallback: true });
+  }
 }
 
 async function handleArchiveSummary(req, res) {
@@ -8088,7 +8115,9 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
       },
       { type: "input_image", label: "当前题目图片", image_url: questionImage, detail: "high" }
     ],
-    maxOutputTokens: 1400
+    maxOutputTokens: 1400,
+    signal: context.signal,
+    diagnostics: context.diagnostics || {}
   });
 
   solver.finalAnswer = String(solver.finalAnswer || solver.canonicalAnswer || "").trim();
@@ -8193,7 +8222,12 @@ async function getVerifiedAnswerKey(questionImage, context = {}) {
     console.log(`[answer-key] cache hit trusted=${cached.trusted} confidence=${cached.confidence}`);
     return cloneJson(cached);
   }
-  if (answerKeyInflight.has(cacheKey)) return cloneJson(await answerKeyInflight.get(cacheKey));
+  // A request carrying a client-owned signal must not borrow another
+  // request's in-flight promise: that would make disconnect cancellation
+  // impossible and would leave the caller waiting for a task it no longer owns.
+  if (!context.signal && answerKeyInflight.has(cacheKey)) {
+    return cloneJson(await answerKeyInflight.get(cacheKey));
+  }
 
   const request = solveAndVerifyAnswerKey(questionImage, context)
     .then((result) => {
@@ -8204,7 +8238,7 @@ async function getVerifiedAnswerKey(questionImage, context = {}) {
       return result;
     })
     .finally(() => answerKeyInflight.delete(cacheKey));
-  answerKeyInflight.set(cacheKey, request);
+  if (!context.signal) answerKeyInflight.set(cacheKey, request);
   return cloneJson(await request);
 }
 
@@ -8267,6 +8301,131 @@ function makeUnavailableAnswerKey(error, status = "answer-key-unavailable") {
     studentTrace: null,
     reason: error?.message || "standard answer service unavailable",
     elapsedMs: 0
+  };
+}
+
+function normalizeProgressText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[−一]/g, "-")
+    .replace(/[＝﹦]/g, "=")
+    .replace(/[×＊]/g, "*")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
+function parseLinearExpression(expression) {
+  const compact = normalizeProgressText(expression).replace(/\*/g, "");
+  if (!compact || /[^0-9a-z+\-.]/i.test(compact)) return null;
+  const coefficients = { x: 0, y: 0, m: 0, n: 0, constant: 0 };
+  const terms = compact.replace(/-/g, "+-").split("+").filter(Boolean);
+  for (const term of terms) {
+    const variable = term.match(/^([+-]?\d*\.?\d*)([xymn])$/i);
+    if (variable) {
+      const coefficientText = variable[1];
+      const coefficient = coefficientText === "" || coefficientText === "+"
+        ? 1
+        : coefficientText === "-" ? -1 : Number(coefficientText);
+      if (!Number.isFinite(coefficient)) return null;
+      coefficients[variable[2].toLowerCase()] += coefficient;
+      continue;
+    }
+    if (/^[+-]?\d*\.?\d+$/.test(term)) {
+      coefficients.constant += Number(term);
+      continue;
+    }
+    return null;
+  }
+  return coefficients;
+}
+
+function canonicalLinearEquation(value) {
+  const text = normalizeProgressText(value);
+  const match = text.match(/([^\n。；;]{1,100})=([^\n。；;]{1,100})/);
+  if (!match) return null;
+  const left = parseLinearExpression(match[1].replace(/^[^0-9a-z+\-.]*/i, ""));
+  const right = parseLinearExpression(match[2].replace(/[^0-9a-z+\-.]*$/i, ""));
+  if (!left || !right) return null;
+  const vector = ["x", "y", "m", "n", "constant"].map((key) => left[key] - right[key]);
+  const scale = vector.find((value) => Math.abs(value) > 1e-9);
+  if (scale === undefined) return null;
+  const normalized = vector.map((value) => Number((value / Math.abs(scale)).toFixed(8)));
+  const first = normalized.find((value) => Math.abs(value) > 1e-9);
+  return first < 0 ? normalized.map((value) => -value) : normalized;
+}
+
+function equationsEquivalent(left, right) {
+  const a = canonicalLinearEquation(left);
+  const b = canonicalLinearEquation(right);
+  return Boolean(a && b && a.length === b.length && a.every((value, index) => Math.abs(value - b[index]) < 1e-7));
+}
+
+function extractLinearEquationText(value) {
+  const text = normalizeProgressText(value);
+  const match = text.match(/[0-9a-z][0-9a-z+\-*/().]{0,40}=[0-9a-z][0-9a-z+\-*/().]{0,40}/i);
+  return match ? match[0] : "";
+}
+
+function evidenceContainsStep(expectedStep, evidenceText) {
+  const expected = normalizeProgressText(expectedStep);
+  const evidence = normalizeProgressText(evidenceText);
+  if (!expected || !evidence) return false;
+  if (evidence.includes(expected) || expected.includes(evidence)) return true;
+  const expectedEquation = extractLinearEquationText(expected);
+  if (expectedEquation && expectedEquation !== expected) {
+    if (evidence.includes(expectedEquation)) return true;
+    const evidenceEquations = evidence.match(/[0-9a-z][0-9a-z+\-*/().]{0,40}=[0-9a-z][0-9a-z+\-*/().]{0,40}/gi) || [];
+    if (evidenceEquations.some((candidate) => equationsEquivalent(expectedEquation, candidate))) return true;
+  }
+  if (!canonicalLinearEquation(expected)) return false;
+  const equationMatches = evidence.match(/[^\n。；;]{1,100}=[^\n。；;]{1,100}/g) || [];
+  return equationMatches.some((candidate) => equationsEquivalent(expected, candidate));
+}
+
+function deriveGuideProgress({
+  verifiedGuideSteps = [],
+  latestHandwritingResult = null,
+  latestStudentSpeech = "",
+  previousGuideQuestion = "",
+  askedConcepts = [],
+  resolvedConcepts = []
+} = {}) {
+  const result = latestHandwritingResult && typeof latestHandwritingResult === "object"
+    ? latestHandwritingResult
+    : {};
+  const boardEvidence = [
+    result.detectedWriting,
+    result.recognizedText,
+    result.mathExpression,
+    ...(Array.isArray(result.completedSteps)
+      ? result.completedSteps.map((step) => typeof step === "object" ? step.evidence || step.text || "" : step)
+      : [])
+  ].filter(Boolean).join("\n");
+  const evidence = `${boardEvidence}\n${String(latestStudentSpeech || "")}`;
+  const completedSteps = [];
+  const resolved = new Set(
+    [...(Array.isArray(askedConcepts) ? askedConcepts : []), ...(Array.isArray(resolvedConcepts) ? resolvedConcepts : [])]
+      .map((item) => String(item || "").trim()).filter(Boolean)
+  );
+  for (let index = 0; index < (Array.isArray(verifiedGuideSteps) ? verifiedGuideSteps.length : 0); index += 1) {
+    const step = String(verifiedGuideSteps[index] || "").trim();
+    const stepId = `step_${index + 1}`;
+    if (!step || !evidenceContainsStep(step, evidence)) continue;
+    completedSteps.push({ stepId, evidence: step });
+    resolved.add(stepId);
+    const equation = canonicalLinearEquation(step);
+    if (equation) resolved.add(`equation:${equation.join(",")}`);
+  }
+  const previousGuideQuestionAnswered = Boolean(previousGuideQuestion && evidenceContainsStep(previousGuideQuestion, evidence));
+  const currentIndex = (Array.isArray(verifiedGuideSteps) ? verifiedGuideSteps : [])
+    .findIndex((step, index) => !completedSteps.some((item) => item.stepId === `step_${index + 1}`));
+  return {
+    completedSteps,
+    currentStep: currentIndex >= 0 ? String(verifiedGuideSteps[currentIndex] || "").trim() : "",
+    answeredPreviousQuestion: previousGuideQuestionAnswered,
+    shouldGuideCurrentStep: currentIndex >= 0,
+    askedConcepts: [...new Set((Array.isArray(askedConcepts) ? askedConcepts : []).map(String))],
+    resolvedConcepts: [...resolved]
   };
 }
 
@@ -8697,8 +8856,43 @@ const FINAL_ANSWER_PROMPT = [
 async function handleFinalAnswerCheck(req, res) {
   const requestId = String(req.headers?.["x-lian-request-id"] || `final-answer-${Date.now()}`);
   const startedAt = Date.now();
+  const abortController = new AbortController();
+  let clientDisconnected = false;
+  const disconnect = (reason) => {
+    if (clientDisconnected || res.writableEnded) return;
+    clientDisconnected = true;
+    abortController.abort(createAbortError("客户端已断开", "qwen_client_disconnected"));
+    console.warn("[final-answer] client_disconnected", {
+      requestId,
+      reason,
+      abort_success: abortController.signal.aborted,
+      elapsedMs: Date.now() - startedAt
+    });
+  };
+  const onAborted = () => disconnect("req.aborted");
+  const onRequestClose = () => {
+    if (req.aborted || !req.complete) disconnect("req.close");
+  };
+  const onResponseClose = () => {
+    if (!res.writableEnded) disconnect("res.close");
+  };
+  req.on("aborted", onAborted);
+  req.on("close", onRequestClose);
+  res.on("close", onResponseClose);
+  res.once("finish", () => {
+    req.off("aborted", onAborted);
+    req.off("close", onRequestClose);
+    res.off("close", onResponseClose);
+  });
   console.info("[final-answer] request-start", { requestId });
-  const body = await readJsonBody(req);
+  let body;
+  try {
+    body = await readJsonBody(req, 8 * 1024 * 1024, abortController.signal);
+  } catch (error) {
+    if (clientDisconnected || abortController.signal.aborted) return;
+    sendJson(res, 400, { error: error.message || "请求体无法读取", code: "request_body_error", requestId });
+    return;
+  }
   if (!body.questionImage || !String(body.answer || "").trim()) {
     sendJson(res, 400, { error: "缺少 questionImage 或 answer" });
     return;
@@ -8721,7 +8915,11 @@ async function handleFinalAnswerCheck(req, res) {
         trusted: Boolean(answerKey?.trusted)
       });
     } else {
-      answerKey = await getVerifiedAnswerKey(body.questionImage, { problemText: body.problemText || "" });
+      answerKey = await getVerifiedAnswerKey(body.questionImage, {
+        problemText: body.problemText || "",
+        signal: abortController.signal,
+        diagnostics: { requestId, stage_name: "final-answer-answer-key" }
+      });
     }
   } catch (error) {
     console.warn(`[final-answer] answer-key unavailable code=${error.code || "unknown"}: ${error.message || error}`);
@@ -8748,7 +8946,9 @@ async function handleFinalAnswerCheck(req, res) {
     }
     const fallback = await safeDirectFinalAnswerCheck(body, {
       reason: error.message || "answer-key request failed",
-      status: error.code || "answer-key-error"
+      status: error.code || "answer-key-error",
+      signal: abortController.signal,
+      diagnostics: { requestId, stage_name: "final-answer-direct-fallback" }
     });
     sendJson(res, fallback.serviceUnavailable ? 503 : 200, { ...fallback, requestId });
     return;
@@ -8759,7 +8959,9 @@ async function handleFinalAnswerCheck(req, res) {
     );
     const fallback = await safeDirectFinalAnswerCheck(body, {
       reason: answerKey.reason || "answer key not trusted",
-      status: answerKey.status || "answer-key-untrusted"
+      status: answerKey.status || "answer-key-untrusted",
+      signal: abortController.signal,
+      diagnostics: { requestId, stage_name: "final-answer-direct-fallback" }
     });
     sendJson(res, fallback.serviceUnavailable ? 503 : 200, { ...fallback, requestId });
     return;
@@ -8793,30 +8995,55 @@ async function handleFinalAnswerCheck(req, res) {
     return;
   }
 
-  const result = await callQwenMultimodalJson({
-    model: QWEN_GUIDE_MODEL,
-    schema: finalAnswerSchema,
-    instructions: [
-      FINAL_ANSWER_PROMPT,
-      ORDERED_PROPORTION_RULES,
-      "服务端已提供经过两次独立求解一致确认的私有标准答案。必须以该基线比较学生答案，不能重新猜测或被学生语气影响。"
-    ].join("\n\n"),
-    content: [
-      {
-        type: "input_text",
-        text: JSON.stringify({
-          studentAnswer: String(body.answer).trim(),
-          lectureText: body.lectureText || "",
-          latestHandwritingResult: body.latestHandwritingResult || null,
-          verifiedAnswerReference: privateAnswerReference(answerKey)
-        })
-      },
-      { type: "input_image", label: "当前题目图片", image_url: body.questionImage, detail: "high" },
-      ...(body.boardImage ? [{ type: "input_image", label: "当前黑板图片", image_url: body.boardImage, detail: "high" }] : [])
-    ],
-    maxOutputTokens: 700
-  });
-
+  let result;
+  try {
+    result = await callQwenMultimodalJson({
+      model: QWEN_GUIDE_MODEL,
+      schema: finalAnswerSchema,
+      instructions: [
+        FINAL_ANSWER_PROMPT,
+        ORDERED_PROPORTION_RULES,
+        "服务端已提供经过两次独立求解一致确认的私有标准答案。必须以该基线比较学生答案，不能重新猜测或被学生语气影响。"
+      ].join("\n\n"),
+      content: [
+        {
+          type: "input_text",
+          text: JSON.stringify({
+            studentAnswer: String(body.answer).trim(),
+            lectureText: body.lectureText || "",
+            latestHandwritingResult: body.latestHandwritingResult || null,
+            verifiedAnswerReference: privateAnswerReference(answerKey)
+          })
+        },
+        { type: "input_image", label: "当前题目图片", image_url: body.questionImage, detail: "high" },
+        ...(body.boardImage ? [{ type: "input_image", label: "当前黑板图片", image_url: body.boardImage, detail: "high" }] : [])
+      ],
+      maxOutputTokens: 700,
+      signal: abortController.signal,
+      diagnostics: { requestId, stage_name: "final-answer-check" }
+    });
+  } catch (error) {
+    if (clientDisconnected || abortController.signal.aborted) return;
+    const errorType = error.errorType || classifyQwenError(error);
+    console.error("[final-answer] qwen-failed", {
+      requestId,
+      errorType,
+      code: error.code || "",
+      model: error.model || QWEN_GUIDE_MODEL,
+      rawResponse: error.rawResponsePreview || error.responsePreview || "",
+      parseError: error.parseError || "",
+      durationMs: Date.now() - startedAt
+    });
+    sendJson(res, 503, {
+      error: error.message || "核对服务暂时没有返回",
+      code: error.code || "qwen_error",
+      errorType,
+      stage: "final-answer-check",
+      retryable: isTransientQwenError(error),
+      requestId
+    });
+    return;
+  }
   const interpretedCompatible = studentAnswerMatchesVerifiedKey(result.finalAnswer, answerKey);
   const correct =
     result.correct === true &&
@@ -8868,7 +9095,9 @@ async function directFinalAnswerCheck(body, fallbackInfo = {}) {
       { type: "input_image", label: "当前题目图片", image_url: body.questionImage, detail: "high" },
       ...(body.boardImage ? [{ type: "input_image", label: "当前黑板图片", image_url: body.boardImage, detail: "high" }] : [])
     ],
-    maxOutputTokens: 700
+    maxOutputTokens: 700,
+    signal: fallbackInfo.signal,
+    diagnostics: fallbackInfo.diagnostics || {}
   });
 
   const confidence = Number(result.confidence) || 0;
@@ -9236,19 +9465,30 @@ async function handleGuide(req, res) {
   const verifiedGuideSteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
     ? answerKey.solutionOutline.map((step) => String(step || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8)
     : [];
+  const guideProgress = deriveGuideProgress({
+    verifiedGuideSteps,
+    latestHandwritingResult: body.latestHandwritingResult,
+    latestStudentSpeech: body.latestStudentSpeech || "",
+    previousGuideQuestion: body.lianQuestion || body.previousGuideQuestion || "",
+    askedConcepts: body.askedConcepts,
+    resolvedConcepts: body.resolvedConcepts
+  });
   const suppliedStep = String(body.silenceContextStep || "").replace(/\s+/g, " ").trim();
   const suppliedStepIsTrusted = Boolean(
     suppliedStep && verifiedGuideSteps.some((step) => step === suppliedStep || step.includes(suppliedStep) || suppliedStep.includes(step))
   );
-  const verifiedGuideStep = verifiedGuideSteps.find((step) => /[A-Za-z0-9\u4e00-\u9fff][^\n]{0,100}(?:=|＝|:|：)[^\n]{0,100}[A-Za-z0-9\u4e00-\u9fff]/.test(step)) || "";
+  const verifiedGuideStep = guideProgress.currentStep || "";
   const guideBody = {
     ...body,
     skipGuideModelAudit: true,
     problemText: answerKey?.trusted && answerKey.problemText
       ? answerKey.problemText
       : body.problemText || "",
-    silenceContextStep: suppliedStepIsTrusted ? suppliedStep : verifiedGuideStep,
-    verifiedGuideSteps
+    silenceContextStep: suppliedStepIsTrusted && !guideProgress.completedSteps.some((item) => item.evidence === suppliedStep)
+      ? suppliedStep
+      : verifiedGuideStep,
+    verifiedGuideSteps,
+    guideProgress
   };
 
   const guideRequestStartedAt = Date.now();
@@ -9307,6 +9547,9 @@ async function handleGuide(req, res) {
           knownKnowledgePoints: body.knowledgePoints || [],
           hasBoardInk: body.hasBoardInk === true,
           latestHandwritingResult: body.latestHandwritingResult || null,
+          guideProgress,
+          askedConcepts: guideProgress.askedConcepts,
+          resolvedConcepts: guideProgress.resolvedConcepts,
           silenceContextStep: guideBody.silenceContextStep || "",
           verifiedGuideSteps,
           boardPendingRecognition: Boolean(body.boardPendingRecognition),
@@ -9375,6 +9618,7 @@ async function handleGuide(req, res) {
   });
   sendJson(res, 200, {
     ...guideResult,
+    progress: guideProgress,
     model: guideResult?.model || guideResult?.qwenModel || QWEN_GUIDE_MODEL,
     requestId: guideRequestId,
     sessionId: guideSessionId,
@@ -10226,6 +10470,10 @@ module.exports = {
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
   questionMemoryToAnswerKey,
+  deriveGuideProgress,
+  canonicalLinearEquation,
+  equationsEquivalent,
+  classifyQwenError,
   buildHandwritingProcessFeedback,
   isTransientQwenError,
   isConcreteGuideResult,
