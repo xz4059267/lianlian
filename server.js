@@ -3255,13 +3255,20 @@ async function raceQwenStructuredModels({ options = {}, models, isValid, diagnos
   const normalizedCandidates = [...new Set((Array.isArray(models) ? models : [])
     .map((model) => String(model || "").trim())
     .filter(Boolean))];
+  // Keep concurrency bounded, while still allowing a quota/availability
+  // failure to be replaced by the next configured fallback. The old slice
+  // limited the pool itself, so primary-quota + fallback-one could hang
+  // forever without ever reaching fallback-two.
+  const candidateLimit = Math.max(1, QWEN_MAX_MODEL_CANDIDATES);
   const activeCandidates = normalizedCandidates.filter((model) => !qwenModelIsCoolingDown(model));
-  const candidates = activeCandidates.length ? activeCandidates : normalizedCandidates;
-  const parallelSlots = Math.max(1, QWEN_MAX_MODEL_CANDIDATES);
+  const candidatePool = activeCandidates.length ? activeCandidates : normalizedCandidates;
+  const candidates = candidatePool;
+  const parallelSlots = Math.min(candidateLimit, candidates.length);
   console.info(`[${label}] model race`, {
     candidates,
     candidateCount: candidates.length,
-    parallelSlots
+    parallelSlots,
+    configuredCandidateCount: normalizedCandidates.length
   });
   if (!candidates.length) return callQwenMultimodalJson({ ...options, diagnostics });
   const deadlineAt = Number(options.deadlineAt) > 0
@@ -7713,6 +7720,7 @@ const answerKeySolverSchema = {
       finalAnswer: { type: "string" },
       canonicalAnswer: { type: "string" },
       acceptedAnswers: { type: "array", items: { type: "string" } },
+      givenConditions: { type: "array", items: { type: "string" } },
       choiceAnalysis: {
         type: "object",
         additionalProperties: false,
@@ -7767,6 +7775,7 @@ const answerKeySolverSchema = {
       "finalAnswer",
       "canonicalAnswer",
       "acceptedAnswers",
+      "givenConditions",
       "choiceAnalysis",
       "solutionSteps",
       "solutionOutline",
@@ -7864,6 +7873,8 @@ const ANSWER_KEY_SOLVER_PROMPT = [
   "必须自己根据题目条件计算，不得把图片里学生手写答案、红笔批改、勾叉或已填答案当成正确依据。",
   "先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核最终答案。",
   "canonicalAnswer 只写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
+  "先建立题目事实清单：givenConditions 必须包含题干描述、题目明确给出的数字/关系、定义、图形箭头关系、坐标轴信息、表格单元格信息以及图片中明确标注的已知量；这些内容都不是推导步骤。",
+  "givenConditions 与 solutionSteps、solutionOutline 必须语义互斥。solutionSteps 和 solutionOutline 只能写对已知条件进行的代入、变形、计算、证明和结论，不能把任何原题条件作为独立步骤重复写入。",
   "如果是选择题，必须返回 choiceAnalysis：逐字抄录可见的 A/B/C/D 选项，分别写入 options；如果题目包含结论 I/II 或多个判断，逐项写入 statementVerdicts，并独立判断 correct；selectedOption 必须根据这些选项文字匹配，selectedOptionText 必须完整写出对应含义。不能只返回字母。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "solutionOutline 和 verificationChecks 只写简洁、可核验的关键步骤，不写冗长推理。",
@@ -7881,7 +7892,8 @@ const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
   "choiceAnalysis 是选项语义的唯一依据。先判断各结论，再按题图中实际出现的选项文字匹配字母；不要凭记忆假定 C 或 D 的含义。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "finalAnswer 和 canonicalAnswer 都写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
-  "solutionSteps 和 solutionOutline 写关键步骤，简短、可核验，不要冗长。",
+  "givenConditions 必须单独列出题干、图片、图形、表格和定义中直接给出的全部事实；例如题图直接给出 m-n=8 时，必须把 m-n=8 放入 givenConditions，而不是把它当作需要学生推导的步骤。",
+  "solutionSteps 和 solutionOutline 只能写基于这些条件进行的具体变形或计算，不能重复列出 m-n=8 这类原题条件。",
   "verification.checks 写代入检查或计算核验过程。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，verification.isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verification.checks 中说明原因。",
   "只返回符合 schema 的 JSON，不要返回 Markdown，不要在 JSON 外输出任何文字。",
@@ -7897,7 +7909,8 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
   "如果题目是选择题，finalAnswer 和 canonicalAnswer 必须包含选项字母和选项含义，例如：C. I 不对，II 对。不要只返回 C。",
   "必须返回 choiceAnalysis：逐字抄录题图中的选项文字，独立填写各结论的 true/false，并用结论组合匹配 selectedOption 和 selectedOptionText。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
-  "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 写关键步骤，简短、可核验；verificationChecks 写代入检查或计算核验过程。",
+  "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 只能写代入、变形、计算、证明和结论，简短且可核验；verificationChecks 写代入检查或计算核验过程。",
+  "givenConditions 必须覆盖题干、图片、图形箭头、表格、坐标和定义中所有直接给出的事实；题目直接给出的 m-n=8 不能作为待推导步骤，也不能在 solutionOutline 中重复出现。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verificationChecks 中说明原因。",
   "只返回符合 schema 的 JSON。不要返回 Markdown，不要在 JSON 外输出任何文字。",
   ORDERED_PROPORTION_RULES
@@ -8122,6 +8135,7 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
 
   solver.finalAnswer = String(solver.finalAnswer || solver.canonicalAnswer || "").trim();
   solver.canonicalAnswer = String(solver.canonicalAnswer || solver.finalAnswer || "").trim();
+  solver.givenConditions = normalizeGivenConditions(solver.givenConditions);
   solver.choiceAnalysis = normalizeChoiceAnalysis(solver.choiceAnalysis);
   solver.solutionOutline = Array.isArray(solver.solutionSteps) && solver.solutionSteps.length
     ? solver.solutionSteps
@@ -8196,11 +8210,12 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     status: "structured-single-pass",
     canonicalAnswer: String(solver.canonicalAnswer).trim(),
     acceptedAnswers: answerKeyCandidates(solver),
+    givenConditions: normalizeGivenConditions(solver.givenConditions),
     choiceAnalysis: solverChoiceAnalysis,
     problemText: String(solver.problemText || context.problemText || "").trim(),
     questionType: String(solver.questionType || "").trim(),
     knowledge: String(solver.knowledge || "").trim(),
-    solutionOutline: Array.isArray(solver.solutionOutline) ? solver.solutionOutline.slice(0, 8) : [],
+    solutionOutline: filterGuideStepsByKnownConditions(solver.solutionOutline, solver.givenConditions),
     verificationChecks: Array.isArray(solver.verificationChecks) ? solver.verificationChecks.slice(0, 8) : [],
     studentTrace: solver.studentTrace || {
       hasStudentAnswer: false,
@@ -8253,8 +8268,9 @@ function privateAnswerReference(answerKey) {
     trusted: true,
     canonicalAnswer: answerKey.canonicalAnswer,
     acceptedAnswers: answerKey.acceptedAnswers,
+    givenConditions: answerKey.givenConditions,
     choiceAnalysis: normalizeChoiceAnalysis(answerKey.choiceAnalysis),
-    solutionOutline: answerKey.solutionOutline,
+    solutionOutline: filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions),
     verificationChecks: answerKey.verificationChecks,
     confidence: answerKey.confidence,
     instruction: "这是服务端私有标准答案基线。所有数学判断必须与它一致；选择题必须同时依据 selectedOption 和 selectedOptionText，不得重新猜测字母含义；未解锁讲解时不得把最终答案直接告诉学生。"
@@ -8280,7 +8296,8 @@ function privateQuestionMemoryReference(answerKey) {
       acceptedAnswers: answerKey.acceptedAnswers,
       choiceAnalysis: normalizeChoiceAnalysis(answerKey.choiceAnalysis)
     },
-    standardSteps: Array.isArray(answerKey.solutionOutline) ? answerKey.solutionOutline : [],
+    standardSteps: filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions),
+    givenConditions: Array.isArray(answerKey.givenConditions) ? answerKey.givenConditions : [],
     verificationChecks: Array.isArray(answerKey.verificationChecks) ? answerKey.verificationChecks : [],
     instruction: "这是唯一题目依据。只比较学生已经写出的可见步骤，不得重解题目、补全步骤或反推完整答案。"
   };
@@ -8293,6 +8310,7 @@ function makeUnavailableAnswerKey(error, status = "answer-key-unavailable") {
     confidence: 0,
     canonicalAnswer: "",
     acceptedAnswers: [],
+    givenConditions: [],
     problemText: "",
     questionType: "",
     knowledge: "",
@@ -8312,6 +8330,35 @@ function normalizeProgressText(value) {
     .replace(/[×＊]/g, "*")
     .replace(/\s+/g, "")
     .toLowerCase();
+}
+
+function normalizeGivenConditions(value) {
+  return [...new Set((Array.isArray(value) ? value : [])
+    .map((item) => String(item || "").replace(/^\s*(?:已知|条件|其中|约定)\s*[:：]?\s*/u, "").trim())
+    .filter(Boolean))].slice(0, 12);
+}
+
+function isExplicitGivenConditionStep(step, givenConditions = []) {
+  const candidate = String(step || "").trim();
+  if (!candidate) return false;
+  return normalizeGivenConditions(givenConditions).some((condition) => {
+    const left = normalizeProgressText(candidate);
+    const right = normalizeProgressText(condition);
+    if (!left || !right) return false;
+    if (left === right) return true;
+    if (left.includes(right) || right.includes(left)) return true;
+    const candidateEquation = extractLinearEquationText(left);
+    const conditionEquation = extractLinearEquationText(right);
+    return Boolean(candidateEquation && conditionEquation && equationsEquivalent(candidateEquation, conditionEquation));
+  });
+}
+
+function filterGuideStepsByKnownConditions(steps = [], givenConditions = []) {
+  return (Array.isArray(steps) ? steps : [])
+    .map((step) => String(step || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .filter((step) => !isExplicitGivenConditionStep(step, givenConditions))
+    .slice(0, 8);
 }
 
 function parseLinearExpression(expression) {
@@ -8384,6 +8431,7 @@ function evidenceContainsStep(expectedStep, evidenceText) {
 
 function deriveGuideProgress({
   verifiedGuideSteps = [],
+  givenConditions = [],
   latestHandwritingResult = null,
   latestStudentSpeech = "",
   previousGuideQuestion = "",
@@ -8393,6 +8441,8 @@ function deriveGuideProgress({
   const result = latestHandwritingResult && typeof latestHandwritingResult === "object"
     ? latestHandwritingResult
     : {};
+  const knownConditions = normalizeGivenConditions(givenConditions);
+  const usableGuideSteps = filterGuideStepsByKnownConditions(verifiedGuideSteps, knownConditions);
   const boardEvidence = [
     result.detectedWriting,
     result.recognizedText,
@@ -8407,8 +8457,8 @@ function deriveGuideProgress({
     [...(Array.isArray(askedConcepts) ? askedConcepts : []), ...(Array.isArray(resolvedConcepts) ? resolvedConcepts : [])]
       .map((item) => String(item || "").trim()).filter(Boolean)
   );
-  for (let index = 0; index < (Array.isArray(verifiedGuideSteps) ? verifiedGuideSteps.length : 0); index += 1) {
-    const step = String(verifiedGuideSteps[index] || "").trim();
+  for (let index = 0; index < usableGuideSteps.length; index += 1) {
+    const step = String(usableGuideSteps[index] || "").trim();
     const stepId = `step_${index + 1}`;
     if (!step || !evidenceContainsStep(step, evidence)) continue;
     completedSteps.push({ stepId, evidence: step });
@@ -8417,13 +8467,14 @@ function deriveGuideProgress({
     if (equation) resolved.add(`equation:${equation.join(",")}`);
   }
   const previousGuideQuestionAnswered = Boolean(previousGuideQuestion && evidenceContainsStep(previousGuideQuestion, evidence));
-  const currentIndex = (Array.isArray(verifiedGuideSteps) ? verifiedGuideSteps : [])
+  const currentIndex = usableGuideSteps
     .findIndex((step, index) => !completedSteps.some((item) => item.stepId === `step_${index + 1}`));
   return {
     completedSteps,
-    currentStep: currentIndex >= 0 ? String(verifiedGuideSteps[currentIndex] || "").trim() : "",
+    currentStep: currentIndex >= 0 ? String(usableGuideSteps[currentIndex] || "").trim() : "",
     answeredPreviousQuestion: previousGuideQuestionAnswered,
     shouldGuideCurrentStep: currentIndex >= 0,
+    givenConditions: knownConditions,
     askedConcepts: [...new Set((Array.isArray(askedConcepts) ? askedConcepts : []).map(String))],
     resolvedConcepts: [...resolved]
   };
@@ -8440,6 +8491,7 @@ function questionMemoryFingerprint(questionMemory) {
     ready: Boolean(questionMemory.ready),
     canonicalAnswer: String(questionMemory.canonicalAnswer || ""),
     acceptedAnswers: Array.isArray(questionMemory.acceptedAnswers) ? questionMemory.acceptedAnswers : [],
+    givenConditions: normalizeGivenConditions(questionMemory.givenConditions),
     choiceAnalysis: questionMemory.choiceAnalysis || null,
     solutionOutline: Array.isArray(questionMemory.solutionOutline) ? questionMemory.solutionOutline : [],
     verificationChecks: Array.isArray(questionMemory.verificationChecks) ? questionMemory.verificationChecks : []
@@ -8546,7 +8598,10 @@ function buildQuestionMemory(questionId, answerKey = {}, memoryId = "", sessionI
     problemText: ready ? String(answerKey.problemText || "").trim() : "",
     questionType: ready ? String(answerKey.questionType || "").trim() : "",
     knowledge: ready ? String(answerKey.knowledge || "").trim() : "",
-    solutionOutline: ready && Array.isArray(answerKey.solutionOutline) ? answerKey.solutionOutline : [],
+    givenConditions: ready ? normalizeGivenConditions(answerKey.givenConditions) : [],
+    solutionOutline: ready
+      ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
+      : [],
     verificationChecks: ready && Array.isArray(answerKey.verificationChecks) ? answerKey.verificationChecks : [],
     studentTrace: ready ? answerKey.studentTrace || null : null,
     reason: String(answerKey.reason || "").trim(),
@@ -8593,7 +8648,10 @@ function questionMemoryToAnswerKey(questionMemory, expectedQuestionId = "", expe
     problemText: trusted ? String(questionMemory.problemText || "").trim() : "",
     questionType: trusted ? String(questionMemory.questionType || "").trim() : "",
     knowledge: trusted ? String(questionMemory.knowledge || "").trim() : "",
-    solutionOutline: trusted && Array.isArray(questionMemory.solutionOutline) ? questionMemory.solutionOutline : [],
+    givenConditions: trusted ? normalizeGivenConditions(questionMemory.givenConditions) : [],
+    solutionOutline: trusted
+      ? filterGuideStepsByKnownConditions(questionMemory.solutionOutline, questionMemory.givenConditions)
+      : [],
     verificationChecks: trusted && Array.isArray(questionMemory.verificationChecks)
       ? questionMemory.verificationChecks
       : [],
@@ -9462,11 +9520,15 @@ async function handleGuide(req, res) {
   // hint, but that hint must never replace a verified step: OCR fragments can
   // concatenate unrelated symbols and create equations that are not in the
   // question.
+  const givenConditions = answerKey?.trusted
+    ? normalizeGivenConditions(answerKey.givenConditions)
+    : [];
   const verifiedGuideSteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
-    ? answerKey.solutionOutline.map((step) => String(step || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 8)
+    ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, givenConditions)
     : [];
   const guideProgress = deriveGuideProgress({
     verifiedGuideSteps,
+    givenConditions,
     latestHandwritingResult: body.latestHandwritingResult,
     latestStudentSpeech: body.latestStudentSpeech || "",
     previousGuideQuestion: body.lianQuestion || body.previousGuideQuestion || "",
@@ -9548,6 +9610,7 @@ async function handleGuide(req, res) {
           hasBoardInk: body.hasBoardInk === true,
           latestHandwritingResult: body.latestHandwritingResult || null,
           guideProgress,
+          givenConditions: guideProgress.givenConditions,
           askedConcepts: guideProgress.askedConcepts,
           resolvedConcepts: guideProgress.resolvedConcepts,
           silenceContextStep: guideBody.silenceContextStep || "",
@@ -9556,6 +9619,7 @@ async function handleGuide(req, res) {
           verifiedAnswerReference: answerReference,
           boundaryRules: [
             "When silenceStage is at least 1 and silenceContextStep is present, use that exact problem-specific relation as formulaOrStep and explain only that one next step; do not replace it with generic wording.",
+            "givenConditions 是题目明确给出的已知条件，优先级高于所有推导步骤。绝对不要询问 givenConditions 中的关系式是如何由其他式子推出的；例如 givenConditions 包含 m-n=8 时，只能把它作为已知条件使用，不能再问 m-n=8 是怎么得到的。",
             "At silenceStage 1, one concrete relation or formula is allowed, but the final answer is still forbidden until the verified-answer stage.",
             "At silenceStage 4, give the complete problem-specific explanation, key equations, and final answer even when the standard answer reference is unavailable; derive and check it from the question image instead of returning a generic retry message.",
             "如果 eventType=answer_to_lian_question，必须优先回应 lianQuestion 和 latestStudentSpeech 的对应关系，shouldSpeak=true，通常一句话确认后再给一个很小的下一步。",
@@ -9928,6 +9992,12 @@ function isOnlyDirectAnswerWriting(value) {
 
 function shouldAuditHandwritingResult(result, answerKey, body = {}) {
   if (!HANDWRITING_AUDIT_ENABLED) return false;
+  // Completion is a single user-facing save gate. Running a second
+  // multimodal audit after the primary handwriting result makes this path
+  // consume two full model calls and can exhaust the handwriting deadline.
+  // The primary result plus the local safety checks are sufficient here;
+  // audit remains available for ordinary handwriting observations.
+  if (/完成讲解前检查/.test(String(body.reason || ""))) return false;
   if (!answerKey?.trusted) return false;
   const status = String(result?.calculationStatus || "");
   if (!["correct", "wrong"].includes(status)) return false;
@@ -10048,6 +10118,7 @@ function answerKeyTextForSafety(answerKey) {
     answerKey?.canonicalAnswer,
     answerKey?.questionType,
     answerKey?.knowledge,
+    ...(Array.isArray(answerKey?.givenConditions) ? answerKey.givenConditions : []),
     ...(Array.isArray(answerKey?.acceptedAnswers) ? answerKey.acceptedAnswers : []),
     ...(Array.isArray(answerKey?.solutionOutline) ? answerKey.solutionOutline : []),
     ...(Array.isArray(answerKey?.verificationChecks) ? answerKey.verificationChecks : [])
@@ -10471,6 +10542,8 @@ module.exports = {
   buildQuestionMemory,
   questionMemoryToAnswerKey,
   deriveGuideProgress,
+  normalizeGivenConditions,
+  filterGuideStepsByKnownConditions,
   canonicalLinearEquation,
   equationsEquivalent,
   classifyQwenError,

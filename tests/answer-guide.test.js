@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const {
   deriveGuideProgress,
+  filterGuideStepsByKnownConditions,
   equationsEquivalent,
   classifyQwenError
 } = require("../server");
@@ -50,4 +51,19 @@ test("Case 4: stale request metadata cannot be treated as current", () => {
 test("Case 5: malformed model output is classified as INVALID_JSON", () => {
   assert.equal(classifyQwenError({ code: "invalid_model_output" }), "INVALID_JSON");
   assert.equal(classifyQwenError({ code: "qwen_response_timeout" }), "TIMEOUT");
+});
+
+test("Case 6: explicit known conditions are never treated as derivation steps", () => {
+  const givenConditions = ["m-n=8"];
+  assert.deepEqual(
+    filterGuideStepsByKnownConditions(["m-n=8", "4x-4y=8", "x-y=2"], givenConditions),
+    ["4x-4y=8", "x-y=2"]
+  );
+  const progress = deriveGuideProgress({
+    verifiedGuideSteps: ["m-n=8", "4x-4y=8", "x-y=2"],
+    givenConditions,
+    latestHandwritingResult: { detectedWriting: "m-n=8" }
+  });
+  assert.equal(progress.currentStep, "4x-4y=8");
+  assert.deepEqual(progress.givenConditions, ["m-n=8"]);
 });

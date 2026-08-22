@@ -277,6 +277,8 @@ const state = {
   finalAnswerVerificationUnavailableQuestionId: "",
   finalAnswerVerificationUnavailableAnswer: "",
   finalAnswerVerificationUnavailableAt: 0,
+  boardVerificationUnavailableQuestionId: "",
+  boardVerificationUnavailableAt: 0,
   boardCompletionVerified: false,
   completionCheckInProgress: false,
   autoSavePromptedQuestionId: "",
@@ -422,6 +424,8 @@ function pauseTeachSessionForNavigation() {
   state.finalAnswerVerificationUnavailableQuestionId = "";
   state.finalAnswerVerificationUnavailableAnswer = "";
   state.finalAnswerVerificationUnavailableAt = 0;
+  state.boardVerificationUnavailableQuestionId = "";
+  state.boardVerificationUnavailableAt = 0;
 
   if (state.resumeSpeechAfterNavigation) window.speechSynthesis.pause();
   if (state.resumeListeningAfterNavigation && state.speechRecognition) {
@@ -2516,6 +2520,8 @@ function startLecture(queue) {
   state.finalAnswerVerificationUnavailableQuestionId = "";
   state.finalAnswerVerificationUnavailableAnswer = "";
   state.finalAnswerVerificationUnavailableAt = 0;
+  state.boardVerificationUnavailableQuestionId = "";
+  state.boardVerificationUnavailableAt = 0;
   state.currentQuestionCompleted = false;
   state.hasExplicitFinalAnswer = false;
   state.pendingLianQuestion = null;
@@ -2847,6 +2853,7 @@ function normalizeQuestionMemory(question, payload = {}) {
     problemText: String(source.problemText || "").trim(),
     questionType: String(source.questionType || "").trim(),
     knowledge: String(source.knowledge || "").trim(),
+    givenConditions: Array.isArray(source.givenConditions) ? source.givenConditions : [],
     solutionOutline: Array.isArray(source.solutionOutline) ? source.solutionOutline : [],
     verificationChecks: Array.isArray(source.verificationChecks) ? source.verificationChecks : [],
     studentTrace: source.studentTrace || null,
@@ -4172,8 +4179,8 @@ function isHandwritingCalculationCorrect(result) {
 function isBoardCompletionVerified(result) {
   return Boolean(
     ["double-verified", "structured-single-pass", "question-memory"].includes(result?.answerVerification) &&
-    result?.boardComplete === true &&
-    result?.isRelevant === true &&
+    (result?.boardComplete === true || hasReviewableBoardStep(result)) &&
+    result?.isRelevant !== false &&
     result?.calculationStatus === "correct" &&
     Number(result?.confidence) >= 0.6 &&
     !isIncompleteHandwritingIssue(result) &&
@@ -4436,7 +4443,7 @@ function handleSpokenFinalAnswer(answerText) {
 function shouldPromptSaveFromHandwriting(result) {
   return Boolean(
     ["double-verified", "structured-single-pass", "question-memory"].includes(result?.answerVerification) &&
-    result?.isRelevant === true &&
+    result?.isRelevant !== false &&
     isHandwritingCalculationCorrect(result) &&
     hasReviewableBoardStep(result)
   );
@@ -5893,6 +5900,19 @@ function handleStudentSpeech(text, options = {}) {
   }
   recordFinalAnswerEvidence(text);
   if (state.currentQuestionCompleted) return;
+  if (state.finalAnswerVerified) {
+    const question = currentPageQuestion();
+    if (
+      question &&
+      !state.boardCompletionVerified &&
+      state.boardVerificationUnavailableQuestionId !== question.id &&
+      !state.completionCheckInProgress &&
+      hasCurrentBoardInk(question)
+    ) {
+      void verifyBoardAndCompleteQuestion({ feedback: "答案已经核对正确。" });
+    }
+    return;
+  }
   if (!hasCurrentBoardInk()) {
     clearTimeout(state.recognitionTimer);
     state.recognitionTimer = null;
@@ -6232,6 +6252,26 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     console.info("[guide] skipped", { eventType, reason: "question-completed" });
     return false;
   }
+  if (state.finalAnswerVerified) {
+    const question = currentPageQuestion();
+    const boardCheckUnavailable = state.boardVerificationUnavailableQuestionId === question?.id;
+    console.info("[guide] skipped after final answer verification", {
+      eventType,
+      questionId: question?.id || "",
+      boardCompletionVerified: state.boardCompletionVerified,
+      boardCheckUnavailable
+    });
+    if (
+      question &&
+      !state.boardCompletionVerified &&
+      !boardCheckUnavailable &&
+      !state.completionCheckInProgress &&
+      hasCurrentBoardInk(question)
+    ) {
+      void verifyBoardAndCompleteQuestion({ feedback: "答案已经核对正确。" });
+    }
+    return false;
+  }
   if (state.openingSpeechInProgress && options.allowDuringOpening !== true) {
     console.info("[guide] skipped while opening speech is active", { eventType });
     return false;
@@ -6466,8 +6506,17 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
 
   saveCurrentPage();
   const memory = getQuestionMemory(question);
+  const givenConditions = memory?.ready && Array.isArray(memory.givenConditions)
+    ? memory.givenConditions.map((condition) => String(condition || "").replace(/\s+/g, "").trim()).filter(Boolean)
+    : [];
   const trustedSteps = memory?.ready && Array.isArray(memory.solutionOutline)
-    ? memory.solutionOutline.map((step) => String(step || "").replace(/\s+/g, " ").trim()).filter(Boolean)
+    ? memory.solutionOutline
+      .map((step) => String(step || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .filter((step) => {
+        const normalizedStep = step.replace(/\s+/g, "");
+        return !givenConditions.some((condition) => normalizedStep === condition || normalizedStep.includes(condition) || condition.includes(normalizedStep));
+      })
     : [];
   const completedStepCount = Array.isArray(state.latestHandwritingResult?.completedSteps)
     ? state.latestHandwritingResult.completedSteps.length
@@ -6571,6 +6620,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
         problemText: memory.problemText,
         questionType: memory.questionType,
         knowledge: memory.knowledge,
+        givenConditions,
         solutionOutline: trustedSteps,
         verificationChecks: memory.verificationChecks || [],
         studentTrace: memory.studentTrace || null,
@@ -7544,13 +7594,9 @@ async function verifyBoardAndCompleteQuestion(options = {}) {
     }
 
     const feedback = String(options.feedback || boardCheck.result?.positiveFeedback || "").trim();
-    await lianSpeak(
-      feedback
-        ? `${feedback} 板书里也有正确的关键步骤，这道题可以结束。`
-        : "最终答案和板书里的关键步骤都核对好了，这道题可以结束。"
-    );
     dom.recognitionPill.classList.add("hidden");
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    // Persist before any TTS work. A stalled audio request must never keep a
+    // successfully verified question from moving to the next one.
     await saveCurrentQuestionAndContinue();
     return true;
   } catch (error) {
@@ -7558,17 +7604,22 @@ async function verifyBoardAndCompleteQuestion(options = {}) {
     state.boardCompletionVerified = false;
     state.currentQuestionCompleted = false;
     dom.finishQuestionBtn.disabled = false;
-    // A transient board-service failure must not strand a verified answer.
-    // Preserve the visible board image and let the explicit save action finish.
+    // A transient board-service failure must not strand a verified answer or
+    // cause the next interaction to re-enter the guide. Keep the board and
+    // persist a pending-verification record on this explicit save action.
     if (state.finalAnswerVerified && hasCurrentBoardInk(question)) {
-      state.boardCompletionVerified = true;
+      state.boardVerificationUnavailableQuestionId = question.id;
+      state.boardVerificationUnavailableAt = Date.now();
       console.warn("[completion] board verification unavailable; preserving visible board content");
-      await lianSpeak("答案已经核对正确。板书识别服务暂时没有返回，但黑板内容会一并保存。", {
+      await saveCurrentQuestionAndContinue({
+        allowUnverified: true,
+        feedback: "答案已经核对正确，板书已保留为待核验。"
+      });
+      void lianSpeak("答案已经核对正确，板书已保留为待核验记录。", {
         dedupeKey: `board-verification-unavailable:${question.id}`,
         cooldownMs: 0,
         allowRepeat: true
       });
-      await saveCurrentQuestionAndContinue({ feedback: "答案已经核对正确。" });
       return true;
     }
     await lianSpeak("答案已经核对过了，但这次还没能确认板书中的关键步骤。请保留板书，稍后再点击保存至错题本。");
@@ -7640,6 +7691,15 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
         return;
       }
       if (options.continueAfterAnswer) {
+        await verifyBoardAndCompleteQuestion({
+          feedback: feedback || "答案已经核对正确。"
+        });
+        return;
+      }
+      // A correct answer with a recognized board step is already at the
+      // completion gate. Do not send the student back through the guide or
+      // wait for another click before starting the board verification.
+      if (hasCurrentRecognizedBoardStep(question) && !state.completionCheckInProgress) {
         await verifyBoardAndCompleteQuestion({
           feedback: feedback || "答案已经核对正确。"
         });
@@ -7732,17 +7792,32 @@ function isCurrentFinalAnswerRequest(requestMeta) {
   );
 }
 
+function getAnswerCandidateForSave(question) {
+  const directAnswer = String(
+    state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
+  ).trim();
+  if (directAnswer) return directAnswer;
+  if (state.finalAnswerVerificationUnavailableQuestionId === question?.id) {
+    return String(state.finalAnswerVerificationUnavailableAnswer || "").trim();
+  }
+  if (state.finalAnswerVerified && state.verifiedFinalAnswerText) {
+    return String(state.verifiedFinalAnswerText).trim();
+  }
+  return "";
+}
+
 async function saveCurrentQuestionAndContinue(options = {}) {
   const question = currentPageQuestion();
   if (!question) return;
-  const pendingAnswer = String(
-    state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
-  ).trim();
+  const pendingAnswer = getAnswerCandidateForSave(question);
   const allowPendingVerificationSave = Boolean(
     options.allowUnverified === true &&
       pendingAnswer &&
-      state.finalAnswerVerificationUnavailableQuestionId === question.id &&
-      state.finalAnswerVerificationUnavailableAnswer === pendingAnswer
+      (
+        (state.finalAnswerVerificationUnavailableQuestionId === question.id &&
+          state.finalAnswerVerificationUnavailableAnswer === pendingAnswer) ||
+        state.boardVerificationUnavailableQuestionId === question.id
+      )
   );
 
   // A provider outage must not trap the user in a retry loop. This path is
@@ -7752,6 +7827,19 @@ async function saveCurrentQuestionAndContinue(options = {}) {
     state.finalAnswerVerified = false;
     state.boardCompletionVerified = false;
     state.currentQuestionCompleted = false;
+  }
+
+  // A confirmed final answer must go through board verification exactly once.
+  // This also protects non-button callers from falling back to another guide.
+  if (
+    state.finalAnswerVerified &&
+    !state.boardCompletionVerified &&
+    !options.allowUnverified &&
+    !state.completionCheckInProgress &&
+    state.boardVerificationUnavailableQuestionId !== question.id
+  ) {
+    await verifyBoardAndCompleteQuestion({ feedback: options.feedback || "答案已经核对正确。" });
+    return;
   }
 
   // A failed optional guide must never strand an answer that the student has
@@ -7805,6 +7893,7 @@ async function saveCurrentQuestionAndContinue(options = {}) {
       record.needsReview = true;
       record.answerVerificationPending = true;
       record.answerVerificationStatus = "service-unavailable";
+      record.boardVerificationPending = state.boardVerificationUnavailableQuestionId === question.id;
       record.pendingFinalAnswer = pendingAnswer;
       record.verifiedAnswer = "";
     }
@@ -7917,9 +8006,7 @@ dom.finishQuestionBtn.addEventListener("click", () => {
     void verifyBoardAndCompleteQuestion();
     return;
   }
-  const pendingAnswer = String(
-    state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
-  ).trim();
+  const pendingAnswer = getAnswerCandidateForSave(currentPageQuestion());
   if (
     pendingAnswer &&
     state.finalAnswerVerificationUnavailableQuestionId === currentPageQuestion()?.id &&
