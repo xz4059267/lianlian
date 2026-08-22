@@ -93,6 +93,39 @@ test("an invalid fast guide result cannot suppress a slower valid result", async
   assert.deepEqual(result, { valid: true, model: "slow-valid" });
 });
 
+test("quota-exhausted primary is removed and the next fallback fills the free slot", async () => {
+  const started = [];
+  const result = await raceQwenStructuredModels({
+    options: { deadlineAt: Date.now() + 500 },
+    models: ["primary-quota", "fallback-one", "fallback-two", "fallback-three"],
+    label: "test-quota-failover",
+    isValid: (value) => Boolean(value?.valid),
+    invokeModel: (model, signal) => {
+      started.push(model);
+      if (model === "primary-quota") {
+        const error = new Error("insufficient quota");
+        error.code = "insufficient_quota";
+        error.statusCode = 429;
+        return Promise.reject(error);
+      }
+      if (model === "fallback-two") return Promise.resolve({ valid: true, model });
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+  });
+
+  assert.deepEqual(result, { valid: true, model: "fallback-two" });
+  assert.ok(started.includes("primary-quota"));
+  assert.ok(started.includes("fallback-one"));
+  assert.ok(started.includes("fallback-two"));
+  assert.equal(started.includes("fallback-three"), false);
+});
+
 test("a hung model is closed by the race deadline", async () => {
   const deadlineAt = Date.now() + 35;
   await assert.rejects(

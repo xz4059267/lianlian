@@ -97,9 +97,9 @@ const QWEN_HANDWRITING_TOTAL_TIMEOUT_MS = Math.max(
   12000,
   Math.min(35000, Number(process.env.QWEN_HANDWRITING_TIMEOUT_MS || 30000))
 );
-// Keep failover bounded: one primary model and one fallback model run in the
-// same race. A longer candidate list turns a single board pause into several
-// rounds of model calls and makes the student wait without a useful result.
+// Keep failover bounded by limiting concurrent calls, not the candidate list.
+// When a model is out of quota, the next candidate must be able to enter the
+// race immediately without creating an unbounded burst of upstream requests.
 const QWEN_MAX_MODEL_CANDIDATES = 2;
 const QWEN_HANDWRITING_RETRY_COUNT = Math.max(
   0,
@@ -2935,7 +2935,7 @@ function getQwenModelCandidates(model, explicitCandidates = []) {
     configured,
     ...explicit.map((item) => String(item || "").trim()),
     ...byPurpose
-  ])].filter(Boolean).slice(0, QWEN_MAX_MODEL_CANDIDATES);
+  ])].filter(Boolean);
 }
 
 function isQwenModelQuotaOrAvailabilityError(error) {
@@ -3247,12 +3247,16 @@ function abortSignalPromise(signal) {
 }
 
 async function raceQwenStructuredModels({ options = {}, models, isValid, diagnostics = {}, label, invokeModel }) {
-  const candidates = [...new Set((Array.isArray(models) ? models : [])
+  const normalizedCandidates = [...new Set((Array.isArray(models) ? models : [])
     .map((model) => String(model || "").trim())
-    .filter(Boolean))].slice(0, QWEN_MAX_MODEL_CANDIDATES);
+    .filter(Boolean))];
+  const activeCandidates = normalizedCandidates.filter((model) => !qwenModelIsCoolingDown(model));
+  const candidates = activeCandidates.length ? activeCandidates : normalizedCandidates;
+  const parallelSlots = Math.max(1, QWEN_MAX_MODEL_CANDIDATES);
   console.info(`[${label}] model race`, {
     candidates,
-    maxCandidates: QWEN_MAX_MODEL_CANDIDATES
+    candidateCount: candidates.length,
+    parallelSlots
   });
   if (!candidates.length) return callQwenMultimodalJson({ ...options, diagnostics });
   const deadlineAt = Number(options.deadlineAt) > 0
@@ -3263,154 +3267,183 @@ async function raceQwenStructuredModels({ options = {}, models, isValid, diagnos
         : label === "handwriting"
           ? QWEN_HANDWRITING_TOTAL_TIMEOUT_MS
           : QWEN_TOTAL_TIMEOUT_MS
-    ));
+  ));
   let lastError = null;
+  let nextCandidateIndex = 0;
+  const entries = [];
+  const startedAt = Date.now();
 
-  for (let offset = 0; offset < candidates.length; offset += 2) {
-    const batch = candidates.slice(offset, offset + 2);
-    const controllers = batch.map(() => new AbortController());
-    const startedAt = Date.now();
-    const entries = batch.map((model, index) => {
-      const parentAbort = abortSignalPromise(options.signal);
-      const controller = controllers[index];
-      const abortParent = () => controller.abort();
-      if (options.signal && !options.signal.aborted) {
-        options.signal.addEventListener("abort", abortParent, { once: true });
-      }
-      const invoke = () => invokeModel
-        ? invokeModel(model, controller.signal, deadlineAt)
-        : callQwenMultimodalJson({
-          ...options,
-          model,
-          deadlineAt,
-          timeoutMs: Math.max(1000, deadlineAt - Date.now()),
-          signal: controller.signal,
-          diagnostics,
-          disableModelFallback: true
-        });
-      const outcome = Promise.resolve()
-        .then(invoke)
-        .then((result) => ({ kind: "result", result, model, index }))
-        .catch((error) => ({ kind: "error", error, model, index }));
-      return {
-        model,
-        index,
-        controller,
-        outcome,
-        parentAbort,
-        cleanup: () => {
-          parentAbort?.cleanup?.();
-          options.signal?.removeEventListener?.("abort", abortParent);
-        }
-      };
-    });
-
-    while (entries.length) {
-      const remainingMs = deadlineAt - Date.now();
-      if (remainingMs <= 0) {
-        entries.forEach((entry) => entry.controller.abort());
-        entries.forEach((entry) => entry.cleanup());
-        const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
-        timeoutError.statusCode = 504;
-        timeoutError.code = "qwen_total_timeout";
-        timeoutError.stage = label;
-        throw timeoutError;
-      }
-      const abortWait = abortSignalPromise(options.signal);
-      let deadlineTimer;
-      const deadlinePromise = new Promise((resolve) => {
-        deadlineTimer = setTimeout(() => resolve({ kind: "deadline" }), remainingMs);
-      });
-      let outcome;
-      try {
-        outcome = await Promise.race([
-          ...entries.map((entry) => entry.outcome),
-          deadlinePromise,
-          ...(abortWait ? [abortWait.promise] : [])
-        ]);
-      } finally {
-        clearTimeout(deadlineTimer);
-        abortWait?.cleanup?.();
-      }
-
-      if (outcome?.kind === "deadline") {
-        entries.forEach((entry) => entry.controller.abort());
-        entries.forEach((entry) => entry.cleanup());
-        const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
-        timeoutError.statusCode = 504;
-        timeoutError.code = "qwen_total_timeout";
-        timeoutError.stage = label;
-        throw timeoutError;
-      }
-      if (outcome?.kind === "aborted") {
-        entries.forEach((entry) => entry.controller.abort());
-        entries.forEach((entry) => entry.cleanup());
-        throw createAbortError(
-          "Qwen 请求已取消",
-          getAbortReasonCode(options.signal?.reason, "qwen_aborted")
-        );
-      }
-
-      const entryIndex = entries.findIndex((entry) => entry.index === outcome?.index);
-      if (entryIndex < 0) continue;
-      const [entry] = entries.splice(entryIndex, 1);
-      entry.cleanup();
-      if (outcome.kind === "result") {
-        const accepted = Boolean(outcome.result && isValid(outcome.result, diagnostics));
-        console.info(`[${label}] parallel model result`, {
-          model: outcome.model,
-          elapsedMs: Date.now() - startedAt,
-          accepted,
-          resultType: typeof outcome.result,
-          textLength: String(outcome.result?.detectedWriting || outcome.result?.speech || "").length
-        });
-        if (accepted) {
-          entries.forEach((item) => item.controller.abort());
-          entries.forEach((item) => item.cleanup());
-          diagnostics.winnerModel = outcome.model;
-          console.info(`[${label}] parallel winner`, {
-            model: outcome.model,
-            candidates: batch,
-            elapsedMs: Date.now() - startedAt,
-            questionId: diagnostics.questionId || "",
-            requestId: diagnostics.requestId || ""
-          });
-          return outcome.result;
-        }
-        lastError = Object.assign(new Error(`Qwen ${label} 返回了不可用结果`), {
-          statusCode: 502,
-          code: "invalid_model_output",
-          model: outcome.model
-        });
-        continue;
-      }
-
-      lastError = outcome.error;
-      console.warn(`[${label}] parallel model failed`, {
-        model: outcome.model,
-        elapsedMs: Date.now() - startedAt,
-        code: outcome.error?.code || "",
-        status: outcome.error?.statusCode || outcome.error?.status || 0,
-        message: outcome.error?.message || String(outcome.error)
-      });
-      if (outcome.error?.name === "AbortError" && options.signal?.aborted) {
-        entries.forEach((item) => item.controller.abort());
-        entries.forEach((item) => item.cleanup());
-        throw outcome.error;
-      }
+  const createEntry = (model, candidateIndex) => {
+    const controller = new AbortController();
+    const parentAbort = abortSignalPromise(options.signal);
+    const abortParent = () => controller.abort();
+    if (options.signal && !options.signal.aborted) {
+      options.signal.addEventListener("abort", abortParent, { once: true });
     }
+    const invoke = () => invokeModel
+      ? invokeModel(model, controller.signal, deadlineAt)
+      : callQwenMultimodalJson({
+        ...options,
+        model,
+        deadlineAt,
+        timeoutMs: Math.max(1000, deadlineAt - Date.now()),
+        signal: controller.signal,
+        diagnostics,
+        disableModelFallback: true
+      });
+    const outcome = Promise.resolve()
+      .then(invoke)
+      .then((result) => ({ kind: "result", result, model, candidateIndex }))
+      .catch((error) => ({ kind: "error", error, model, candidateIndex }));
+    return {
+      model,
+      candidateIndex,
+      controller,
+      outcome,
+      parentAbort,
+      cleanup: () => {
+        parentAbort?.cleanup?.();
+        options.signal?.removeEventListener?.("abort", abortParent);
+      }
+    };
+  };
 
-    if (Date.now() >= deadlineAt) {
+  const fillSlots = () => {
+    while (entries.length < parallelSlots && nextCandidateIndex < candidates.length) {
+      const candidateIndex = nextCandidateIndex;
+      nextCandidateIndex += 1;
+      entries.push(createEntry(candidates[candidateIndex], candidateIndex));
+    }
+  };
+
+  const abortAndCleanupEntries = () => {
+    entries.forEach((entry) => entry.controller.abort());
+    entries.forEach((entry) => entry.cleanup());
+    entries.length = 0;
+  };
+
+  fillSlots();
+  while (entries.length) {
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      abortAndCleanupEntries();
       const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
       timeoutError.statusCode = 504;
       timeoutError.code = "qwen_total_timeout";
       timeoutError.stage = label;
       throw timeoutError;
     }
-    if (lastError?.code === "qwen_total_timeout") throw lastError;
-    if (lastError?.code === "qwen_client_disconnected") throw lastError;
-    if (lastError && !isTransientQwenError(lastError)) throw lastError;
+
+    const abortWait = abortSignalPromise(options.signal);
+    let deadlineTimer;
+    const deadlinePromise = new Promise((resolve) => {
+      deadlineTimer = setTimeout(() => resolve({ kind: "deadline" }), remainingMs);
+    });
+    let outcome;
+    try {
+      outcome = await Promise.race([
+        ...entries.map((entry) => entry.outcome),
+        deadlinePromise,
+        ...(abortWait ? [abortWait.promise] : [])
+      ]);
+    } finally {
+      clearTimeout(deadlineTimer);
+      abortWait?.cleanup?.();
+    }
+
+    if (outcome?.kind === "deadline") {
+      abortAndCleanupEntries();
+      const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
+      timeoutError.statusCode = 504;
+      timeoutError.code = "qwen_total_timeout";
+      timeoutError.stage = label;
+      throw timeoutError;
+    }
+    if (outcome?.kind === "aborted") {
+      abortAndCleanupEntries();
+      throw createAbortError(
+        "Qwen 请求已取消",
+        getAbortReasonCode(options.signal?.reason, "qwen_aborted")
+      );
+    }
+
+    const entryIndex = entries.findIndex((entry) => entry.candidateIndex === outcome?.candidateIndex);
+    if (entryIndex < 0) continue;
+    const [entry] = entries.splice(entryIndex, 1);
+    entry.cleanup();
+
+    if (outcome.kind === "result") {
+      const accepted = Boolean(outcome.result && isValid(outcome.result, diagnostics));
+      console.info(`[${label}] parallel model result`, {
+        model: outcome.model,
+        elapsedMs: Date.now() - startedAt,
+        accepted,
+        resultType: typeof outcome.result,
+        textLength: String(outcome.result?.detectedWriting || outcome.result?.speech || "").length
+      });
+      if (accepted) {
+        entries.forEach((item) => item.controller.abort());
+        entries.forEach((item) => item.cleanup());
+        diagnostics.winnerModel = outcome.model;
+        console.info(`[${label}] parallel winner`, {
+          model: outcome.model,
+          candidates,
+          elapsedMs: Date.now() - startedAt,
+          questionId: diagnostics.questionId || "",
+          requestId: diagnostics.requestId || ""
+        });
+        return outcome.result;
+      }
+      lastError = Object.assign(new Error(`Qwen ${label} 返回了不可用结果`), {
+        statusCode: 502,
+        code: "invalid_model_output",
+        model: outcome.model
+      });
+      fillSlots();
+      continue;
+    }
+
+    lastError = outcome.error;
+    console.warn(`[${label}] parallel model failed`, {
+      model: outcome.model,
+      elapsedMs: Date.now() - startedAt,
+      code: outcome.error?.code || "",
+      status: outcome.error?.statusCode || outcome.error?.status || 0,
+      message: outcome.error?.message || String(outcome.error)
+    });
+    if (outcome.error?.name === "AbortError" && options.signal?.aborted) {
+      abortAndCleanupEntries();
+      throw outcome.error;
+    }
+
+    // A quota/availability failure removes only this model. Fill the freed
+    // slot immediately so the next fallback does not wait for the other
+    // in-flight model. Transient upstream failures use the same path; a
+    // permanent configuration error still propagates after active work ends.
+    const quotaOrAvailabilityFailure = isQwenModelQuotaOrAvailabilityError(outcome.error);
+    if (quotaOrAvailabilityFailure) {
+      qwenModelCooldownUntil.set(outcome.model, Date.now() + QWEN_MODEL_COOLDOWN_MS);
+      console.warn(`[${label}] model cooled down`, {
+        model: outcome.model,
+        cooldownMs: QWEN_MODEL_COOLDOWN_MS,
+        reason: outcome.error?.code || outcome.error?.statusCode || "quota_or_unavailable"
+      });
+    }
+    if (quotaOrAvailabilityFailure || isTransientQwenError(outcome.error)) {
+      fillSlots();
+    }
   }
+
+  if (Date.now() >= deadlineAt) {
+    const timeoutError = new Error(`Qwen ${label} 阶段总等待时间已用尽`);
+    timeoutError.statusCode = 504;
+    timeoutError.code = "qwen_total_timeout";
+    timeoutError.stage = label;
+    throw timeoutError;
+  }
+  if (lastError?.code === "qwen_total_timeout") throw lastError;
+  if (lastError?.code === "qwen_client_disconnected") throw lastError;
+  if (lastError && !isTransientQwenError(lastError)) throw lastError;
 
   throw lastError || Object.assign(new Error(`Qwen ${label} 没有返回有效结构化结果`), {
     statusCode: 502,
