@@ -286,7 +286,7 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
   test("does not treat a reviewable intermediate equation as a final answer", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const gateSource = appSource.slice(
-    appSource.indexOf("function hasExplicitHandwritingFinality"),
+    appSource.indexOf("function extractHandwritingFinalAnswerCandidate"),
     appSource.indexOf("async function maybeVerifyFinalAnswerFromHandwriting")
   );
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
@@ -295,17 +295,15 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
     serverSource.indexOf("const mimeTypes")
   );
 
-  assert.match(gateSource, /hasExplicitHandwritingFinality/);
-  assert.match(gateSource, /writingState === "complete"/);
-  assert.doesNotMatch(
-    gateSource,
-    /hasReviewableBoardStep\(result\)\s*\n\s*\);/
-  );
+  assert.match(gateSource, /modelAction === "verify_answer"/);
+  assert.doesNotMatch(gateSource, /hasExplicitHandwritingFinality/);
+  assert.doesNotMatch(gateSource, /standaloneAssignment/);
+  assert.doesNotMatch(gateSource, /hasReviewableBoardStep\(result\)/);
   assert.match(promptSource, /boardComplete=true 仅表示存在可核验关键步骤/);
     assert.match(promptSource, /x-2y=m、m-n=8/);
   });
 
-  test("does not trust a model-only finalAnswer over visible intermediate handwriting", () => {
+  test("uses the multimodal handwriting action and finalAnswer when provided", () => {
     const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
     const gateSource = appSource.slice(
       appSource.indexOf("function getVisibleHandwritingEvidence"),
@@ -317,13 +315,33 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
       serverSource.indexOf("const mimeTypes")
     );
 
-    assert.match(gateSource, /getVisibleHandwritingEvidence\(result\)/);
-    assert.match(gateSource, /standaloneAssignment/);
-    assert.doesNotMatch(
-      gateSource,
-      /String\(result\?\.finalAnswer \|\| ""\)\.trim\(\)/
-    );
+    assert.match(gateSource, /modelAction === "verify_answer"/);
+    assert.match(gateSource, /String\(result\?\.finalAnswer \|\| ""\)/);
+    assert.match(gateSource, /modelAction === "continue_guidance"/);
+    assert.doesNotMatch(gateSource, /standaloneAssignment/);
+    assert.match(gateSource, /Do not infer an answer/);
     assert.match(promptSource, /finalAnswer、answer 或 studentAnswer 不能凭空填写/);
+    assert.match(promptSource, /nextAction 必须返回 verify_answer/);
+  });
+
+  test("keeps handwriting analysis on the structured multimodal path", () => {
+    const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+    const handwritingCall = serverSource.slice(
+      serverSource.indexOf("async function callHandwritingQwenJson"),
+      serverSource.indexOf("function sanitizeKnowledge")
+    );
+    const schemaSource = serverSource.slice(
+      serverSource.indexOf("const handwritingSchema"),
+      serverSource.indexOf("const handwritingAuditSchema")
+    );
+
+    assert.doesNotMatch(handwritingCall, /plainTextMode:\s*true/);
+    assert.match(schemaSource, /finalAnswer:/);
+    assert.match(schemaSource, /nextAction:/);
+    assert.match(schemaSource, /guidance:/);
+    assert.match(schemaSource, /"finalAnswer"/);
+    assert.match(schemaSource, /"nextAction"/);
+    assert.match(schemaSource, /"guidance"/);
   });
 
 test("keeps correct board progress silent and grounds feedback in visible work", () => {

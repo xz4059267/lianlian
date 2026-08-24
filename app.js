@@ -3622,19 +3622,32 @@ async function runHandwritingRecognition(reason) {
 
     if (state.waitingForBoardBeforeFinalAnswer) {
       const pendingAnswer = state.pendingFinalAnswerText;
-      if (isHandwritingCalculationWrong(result)) {
-        dom.recognitionPill.textContent = "板书需要先检查";
-        maybeSpeakHandwritingGuidance(result);
-        return;
-      }
-      if (pendingAnswer && hasReviewableBoardStep(result)) {
+      const modelAction = String(result?.nextAction || "").trim();
+      if (pendingAnswer && ["verify_answer", "finished"].includes(modelAction)) {
         state.waitingForBoardBeforeFinalAnswer = false;
         state.pendingFinalAnswerText = "";
         dom.recognitionPill.textContent = "正在核对最后答案";
         void handleFinalAnswerSubmission(pendingAnswer, {
           source: "speech-after-board",
+          boardAlreadyVerified: true,
           silentLog: true
         });
+        return;
+      }
+      if (isHandwritingCalculationWrong(result)) {
+        dom.recognitionPill.textContent = "板书需要先检查";
+        maybeSpeakHandwritingGuidance(result);
+        return;
+      }
+      if (["continue_guidance", "ask_for_board"].includes(modelAction)) {
+        dom.recognitionPill.textContent = modelAction === "ask_for_board" ? "还需要关键步骤" : "继续写解题步骤";
+        if (result.guidance) {
+          void lianSpeak(result.guidance, {
+            dedupeKey: `handwriting-model-guidance:${question.id}:${boardVersion}`,
+            cooldownMs: 0,
+            allowRepeat: false
+          });
+        }
         return;
       }
       dom.recognitionPill.textContent = "还需要关键步骤";
@@ -3656,6 +3669,9 @@ async function runHandwritingRecognition(reason) {
       isRelevant: result?.isRelevant ?? null,
       boardComplete: result?.boardComplete ?? null,
       completedSteps: result?.completedSteps || [],
+      finalAnswer: result?.finalAnswer || "",
+      nextAction: result?.nextAction || "",
+      guidance: result?.guidance || "",
       finalAnswerCandidate
     });
 
@@ -3664,10 +3680,21 @@ async function runHandwritingRecognition(reason) {
     // ordinary progress and the student never gets an immediate check.
     if (
       finalAnswerCandidate &&
-      !isHandwritingCalculationWrong(result) &&
       await maybeVerifyFinalAnswerFromHandwriting(result)
     ) {
       dom.recognitionPill.textContent = "正在核对答案";
+      return;
+    }
+
+    if (["continue_guidance", "ask_for_board"].includes(result?.nextAction)) {
+      dom.recognitionPill.textContent = result.nextAction === "ask_for_board" ? "还需要关键步骤" : "继续写解题步骤";
+      if (result.guidance) {
+        void lianSpeak(result.guidance, {
+          dedupeKey: `handwriting-model-guidance:${question.id}:${boardVersion}`,
+          cooldownMs: 0,
+          allowRepeat: false
+        });
+      }
       return;
     }
 
@@ -4082,6 +4109,11 @@ function normalizeHandwritingResult(result) {
   const normalized = {
     ...result,
     writingState: String(result.writingState || "").trim(),
+    finalAnswer: String(result.finalAnswer || "").normalize("NFKC").trim(),
+    nextAction: ["continue_guidance", "verify_answer", "ask_for_board", "finished"].includes(result.nextAction)
+      ? result.nextAction
+      : "",
+    guidance: String(result.guidance || "").normalize("NFKC").trim(),
     completedSteps: Array.isArray(result.completedSteps)
       ? result.completedSteps.map((step) => String(step || "").trim()).filter(Boolean).slice(0, 8)
       : [],
@@ -4241,82 +4273,47 @@ function getHandwritingAnswerEvidence(result) {
     .normalize("NFKC");
 }
 
-function hasExplicitHandwritingFinality(value) {
-  return /(?:最终答案|最后答案|答案|结果|所以|因此|解得|得到|得出|答\s*[:：])/i.test(
-    String(value || "")
-  );
-}
-
 function extractHandwritingFinalAnswerCandidate(result) {
-  const combined = getVisibleHandwritingEvidence(result);
-  if (!combined.trim()) return "";
-
-  const explicitFinality = hasExplicitHandwritingFinality(combined);
-  const compactVisible = combined.replace(/\s+/g, "");
-  const standaloneAssignment = /^[a-zA-Z](?:=|＝|等于|为)[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/i.test(compactVisible);
-  const assignmentMatches = [
-    ...combined.matchAll(/([a-zA-Z])\s*(?:=|＝|等于|为)\s*([-+]?\d+(?:\.\d+)?(?:\s*\/\s*[-+]?\d+(?:\.\d+)?)?)\s*(°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?/g)
-  ];
-
-  // An embedded equation such as m-n=8 or 2y-3x=n is a calculation step,
-  // not a final answer. Only an explicit final-answer signal or an explicit
-  // complete state can make an assignment eligible for verification.
-  if (assignmentMatches.length && (explicitFinality || (result?.writingState === "complete" && standaloneAssignment))) {
-    for (const match of [...assignmentMatches].reverse()) {
-      const before = combined
-        .slice(0, match.index)
-        .replace(/\s+$/g, "")
-        .slice(-1);
-      if (before && /[A-Za-z0-9_+\-−*/×÷]/.test(before)) continue;
-      return `${match[1].toLowerCase()}=${match[2].replace(/\s+/g, "")}${match[3] || ""}`;
-    }
+  const modelAction = String(result?.nextAction || "").trim();
+  const modelFinalAnswer = String(result?.finalAnswer || "").normalize("NFKC").trim();
+  if (
+    modelFinalAnswer &&
+    (modelAction === "verify_answer" || modelAction === "finished")
+  ) {
+    return modelFinalAnswer;
+  }
+  if (modelAction === "continue_guidance" || modelAction === "ask_for_board") {
+    return "";
   }
 
-  const explicitAnswer = combined.match(
-    /(?:最终答案|最后答案|答案|结果|所以|因此|解得|得到|得出|答)\s*(?:是|为|等于|[:：=＝])?\s*([A-DＡ-Ｄ]|[-+]?\d+(?:\.\d+)?(?:\s*\/\s*[-+]?\d+(?:\.\d+)?)?\s*(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?)/i
-  );
-  if (explicitAnswer?.[1]) {
-    return explicitAnswer[1]
-      .replace(/[ＡＢＣＤ]/gi, (value) => ({ Ａ: "A", Ｂ: "B", Ｃ: "C", Ｄ: "D" }[value] || value))
-      .replace(/\s+/g, "");
-  }
+  // A structured handwriting response is authoritative about whether the
+  // board is ready. Do not reconstruct an answer from visible strings when
+  // the model did not select a verification action.
+  if (modelAction) return "";
 
-  // A bare number or option is ambiguous while the student is still writing.
-  if (explicitFinality || (result?.writingState === "complete" && standaloneAssignment)) {
-    const shortText = compactVisible;
-    if (/^[A-D]$/i.test(shortText)) return shortText.toUpperCase();
-    if (/^[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/.test(shortText)) {
-      return shortText;
-    }
-  }
+  // Do not infer an answer from legacy visible-text heuristics. The
+  // multimodal model must explicitly choose verify_answer/finished and
+  // provide finalAnswer, otherwise the UI stays in the current state.
   return "";
 }
 
 function shouldVerifyHandwritingFinalAnswer(result) {
-  const candidate = extractHandwritingFinalAnswerCandidate(result);
-  if (!candidate) return false;
-  if (isHandwritingCalculationWrong(result)) return false;
+  const modelAction = String(result?.nextAction || "").trim();
+  if (modelAction === "continue_guidance" || modelAction === "ask_for_board") return false;
+  if (modelAction === "verify_answer" || modelAction === "finished") {
+    const candidate = String(result?.finalAnswer || "").normalize("NFKC").trim();
+    if (!candidate) return false;
+    console.log("[handwriting] model-selected-final-answer", {
+      nextAction: modelAction,
+      finalAnswer: candidate,
+      completedSteps: result?.completedSteps || []
+    });
+    return result?.isRelevant !== false;
+  }
 
-  const evidence = getVisibleHandwritingEvidence(result);
-  const compactEvidence = evidence.replace(/\s+/g, "");
-  const standaloneAnswer = /^[A-DＡ-Ｄ]$|^[a-zA-Z](?:=|＝|等于|为)[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$|^[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?(?:°|度|cm3|cm³|cm|厘米|米|千米|分钟|%|π)?$/i.test(compactEvidence);
-  const hasFinalitySignal = Boolean(
-    hasExplicitHandwritingFinality(evidence) ||
-    (result?.writingState === "complete" && standaloneAnswer)
-  );
-
-  console.log("[handwriting] final-answer-gate", {
-    candidate,
-    hasFinalitySignal,
-    writingState: result?.writingState || "",
-    hasReviewableBoardStep: hasReviewableBoardStep(result)
-  });
-
-  // The model may omit isRelevant when it returns a valid structured answer
-  // candidate. Keep the safety gate, but do not discard usable board evidence.
-  if (result?.isRelevant === false && !hasFinalitySignal) return false;
-  if (isIncompleteHandwritingIssue(result) && !hasFinalitySignal) return false;
-  return hasFinalitySignal;
+  // No structured action means the response is incomplete. Do not infer a
+  // final answer from a multi-line board in the frontend.
+  return false;
 }
 
 async function maybeVerifyFinalAnswerFromHandwriting(result) {
@@ -4333,13 +4330,10 @@ async function maybeVerifyFinalAnswerFromHandwriting(result) {
   });
 
   if (hasStudentInputSinceHandwritingRecognition()) return false;
-  if (shouldPromptSaveFromHandwriting(result)) {
-    return await maybePromptSaveFromHandwriting(result);
-  }
-
   await handleFinalAnswerSubmission(answer, {
     source: "handwriting",
-    boardAlreadyVerified: isHandwritingCalculationCorrect(result) && hasReviewableBoardStep(result),
+    boardAlreadyVerified: ["verify_answer", "finished"].includes(result?.nextAction) &&
+      result?.isRelevant !== false,
     silentLog: true
   });
   return true;
@@ -4382,7 +4376,11 @@ function hasCurrentRecognizedBoardStep(question = currentPageQuestion()) {
   ) {
     return false;
   }
-  return hasReviewableBoardStep(state.latestHandwritingResult);
+  const result = state.latestHandwritingResult;
+  if (["verify_answer", "finished"].includes(result?.nextAction)) {
+    return result?.isRelevant !== false;
+  }
+  return hasReviewableBoardStep(result);
 }
 
 function handleSpokenFinalAnswer(answerText) {

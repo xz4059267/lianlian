@@ -471,7 +471,7 @@ const LECTURE_COMPLETION_RULES = [
 const HANDWRITING_PROMPT = [
   "你是初中数学黑板板书的异步观察器，只负责识别和分析学生当前写下的内容。",
   "你只会看到纯板书截图；题目、正确答案、标准步骤和知识点只能读取输入中的 questionMemory，不得重新分析题目图片。",
-  "你的职责只有四项：忠实转写可见笔迹；判断当前书写状态；列出学生已经明确完成且在板书上可见的步骤；定位明确错误。",
+  "你的职责只有五项：忠实转写可见笔迹；判断当前书写状态；列出学生已经明确完成且在板书上可见的步骤；定位明确错误；在需要继续时给出贴着当前板书的具体引导。",
   "禁止重新解整道题、禁止生成新的完整答案、禁止根据学生零散板书反推出未写出的步骤或最终答案。",
   "detectedWriting 和 mathExpression 必须忠实对应板书；completedSteps 只能包含板书上已经出现并可辨认的步骤，不能补齐 Question Memory 中但学生没写的内容。",
   "判断某个可见步骤是否正确时，只能与 questionMemory 中的题意、答案、标准步骤和核验点比较。Question Memory 不足时返回 unclear，不能自行解题补足。",
@@ -479,12 +479,14 @@ const HANDWRITING_PROMPT = [
   "只有能指出具体 errorLocation，并能在 errorEvidence 中说明可见数字、符号、运算或结论与 Question Memory 的明确冲突时，才返回 calculationStatus=wrong。",
   "可见步骤与 Question Memory 一致时返回 correct，但这只说明已经写出的步骤成立，不代表学生完成了整道题，也不得推断后续答案。",
   "writingState=complete 只有在当前截图明确出现最终结论、答案/结果/所以/解得等收束标记，或最后一行是独立且完整的最终答案时才允许；仅有 x-2y=m、m-n=8、代入式、过程式或一个正确关键步骤时，必须返回 in_progress 或 stalled。boardComplete=true 仅表示存在可核验关键步骤，绝不能作为最终答案信号。",
-  "不要生成鼓励、提示、讲解或下一步建议；反馈由板书观察之后的独立流程生成。",
+  "不要生成完整解题过程或替学生补写未出现的步骤。guidance 只在 nextAction=continue_guidance 或 ask_for_board 时给出一句贴着当前板书的具体引导；nextAction=verify_answer 或 finished 时 guidance 必须为空。",
   "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
   "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；只要一个可见关键关系或计算步骤与 Question Memory 一致，就可以作为可核验步骤。",
   "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
-  "如果板书已经出现最终结果或带有‘答案/所以/因此/解得’的结论，必须把该结果原样写入 detectedWriting 或 mathExpression，并把对应的最后一步保留在 completedSteps；不要只在 calculationCheck 里提到它。",
-  "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。",
+  "如果板书最后一行或最后一组等式已经出现明确的最终赋值结果，即使前面仍保留完整推导式，也必须把这些可见结果原样写入 finalAnswer；不要求学生额外写‘答案是’、‘所以’等文字。finalAnswer 只能来自当前截图中确实可见的最后结果，不能根据题目自行补算。",
+  "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，nextAction 必须返回 verify_answer；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；只有最终答案和关键步骤都已经明确、且当前动作可以收束时才返回 finished。模型只判断板书状态和动作，不负责判定答案最终是否正确。",
+  "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
+  "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");
@@ -676,6 +678,19 @@ const handwritingSchema = {
         type: "string",
         description: "Faithful normalized transcription of the main visible formula, relation, or conclusion."
       },
+      finalAnswer: {
+        type: "string",
+        description: "Only the final answer or final assignments visibly written in the current board image. Empty when no visible final result exists."
+      },
+      nextAction: {
+        type: "string",
+        enum: ["continue_guidance", "verify_answer", "ask_for_board", "finished"],
+        description: "The next application action based only on the visible board state and the supplied Question Memory."
+      },
+      guidance: {
+        type: "string",
+        description: "Concrete next-step guidance only for continue_guidance or ask_for_board; empty for verify_answer or finished."
+      },
       writingState: {
         type: "string",
         enum: ["in_progress", "stalled", "complete", "unclear", "not_relevant"],
@@ -736,6 +751,9 @@ const handwritingSchema = {
     required: [
       "detectedWriting",
       "mathExpression",
+      "finalAnswer",
+      "nextAction",
+      "guidance",
       "writingState",
       "completedSteps",
       "isRelevant",
@@ -3599,10 +3617,7 @@ async function callHandwritingQwenJson(options, diagnostics = {}) {
   try {
     return await raceQwenStructuredModels({
       options: {
-        ...options,
-        // Handwriting is intentionally plain text. Requiring JSON here made
-        // useful fast responses look invalid and forced the race to wait.
-        plainTextMode: true
+        ...options
       },
       models: getQwenModelCandidates(options.model || QWEN_HANDWRITING_MODEL, options.modelCandidates),
       isValid: isValidHandwritingResult,
@@ -9982,7 +9997,7 @@ async function handleHandwritingInternal(req, res, task) {
           boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
           questionMemory: privateQuestionMemoryReference(answerKey),
           instruction:
-            "只观察纯板书截图。用 Question Memory 核对学生已经写出的步骤；不要重解题目、不要补全学生未写的步骤、不要反推完整答案，也不要生成反馈话术。"
+            "只观察纯板书截图。用 Question Memory 判断学生已经写出的步骤和下一动作；不要重解题目、不要补全学生未写的步骤，也不要把题目条件当成学生推导步骤。"
         })
       },
       { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
@@ -10124,6 +10139,10 @@ function normalizeVisibleCompletedSteps(value) {
 
 function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   const completedSteps = normalizeVisibleCompletedSteps(result?.completedSteps);
+  const modelAction = ["continue_guidance", "verify_answer", "ask_for_board", "finished"].includes(result?.nextAction)
+    ? result.nextAction
+    : "";
+  const modelGuidance = String(result?.guidance || "").trim();
   const idleSeconds = Math.max(0, Number(body.boardIdleSeconds) || 0);
   const initialWritingState = String(result?.writingState || "").trim();
   const writingState = initialWritingState === "stalled" && idleSeconds < 15
@@ -10165,7 +10184,7 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
     errorLocation: explicitWrong ? errorLocation : "",
     errorEvidence: explicitWrong ? errorEvidence : "",
     expectedNextStep: "",
-    guidance: "",
+    guidance: modelGuidance,
     positiveFeedback: ""
   };
 
@@ -10176,6 +10195,13 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
       boardComplete: false,
       guidance: `先检查${errorLocation}：${errorEvidence}`
     };
+  }
+
+  // A structured handwriting result owns the next action. Do not recreate a
+  // stale local step from the answer key after the multimodal model has
+  // already decided whether to guide, request a board step, or verify.
+  if (modelAction) {
+    return output;
   }
 
   if (result?.calculationStatus === "incomplete" && writingState === "stalled" && nextMemoryStep) {
@@ -10253,7 +10279,7 @@ function applyHandwritingAudit(result, audit) {
     issueSummary: hasIssue ? (audit?.issueSummary || audit?.reason || "") : "",
     errorLocation: hasIssue ? String(audit?.errorLocation || result?.errorLocation || "").trim() : "",
     errorEvidence: hasIssue ? String(audit?.errorEvidence || result?.errorEvidence || "").trim() : "",
-    guidance: "",
+    guidance: String(result?.guidance || "").trim(),
     positiveFeedback: "",
     boardComplete: auditedStatus === "correct" && Boolean(audit?.boardComplete),
     missingBoardContent: audit?.missingBoardContent || "",
