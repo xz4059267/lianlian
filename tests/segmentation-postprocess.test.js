@@ -295,7 +295,12 @@ test("handwriting sends the current blackboard image without client OCR", () => 
   assert.match(snapshotSource, /question\.image/);
   assert.match(snapshotSource, /prepareGuideImage/);
   assert.doesNotMatch(snapshotSource, /getImageData|putImageData|threshold|二值化/);
-  assert.match(appHandwritingRun, /maybeVerifyFinalAnswerFromHandwriting\(result\)/);
+  assert.match(appHandwritingRun, /handleHandwritingAnswerVerification\(result\)/);
+  assert.match(handlerSource, /verifiedAnswerReference: privateAnswerReference\(answerKey\)/);
+  assert.match(handlerSource, /latestStudentSpeech/);
+  assert.match(handlerSource, /笔迹优先于 latestStudentSpeech/);
+  assert.match(serverSource, /题目图片中的印刷文字/);
+  assert.match(handlerSource, /applyHandwritingAnswerVerification\(result, answerKey\)/);
   assert.match(appHandwritingRun, /finalAnswerCandidate/);
   assert.doesNotMatch(appHandwritingRun, /getVerifiedAnswerKey\(|fetch\("\/api\/answer-key"/);
 });
@@ -318,6 +323,19 @@ test("guide receives one current blackboard image and ignores legacy handwriting
   assert.match(guideHandler, /当前黑板区域截图/);
   assert.match(guideHandler, /latestHandwritingResult: null/);
   assert.doesNotMatch(guideHandler, /latestHandwritingResult: body\.latestHandwritingResult/);
+});
+
+test("handwriting verification decides guide versus save from the same board request", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.match(appSource, /async function handleHandwritingAnswerVerification/);
+  assert.match(appSource, /answerVerificationStatus === "correct"/);
+  assert.match(appSource, /saveCurrentQuestionAndContinue\(\{ feedback/);
+  assert.match(appSource, /queueModelDecisionBeforeFinalCheck/);
+  assert.match(appSource, /useLegacyFinalCheck !== true/);
+  assert.match(serverSource, /answerVerificationStatus/);
+  assert.match(serverSource, /privateAnswerReference\(answerKey\)/);
+  assert.match(serverSource, /latestStudentSpeech/);
 });
 
   test("does not treat a reviewable intermediate equation as a final answer", () => {
@@ -358,7 +376,8 @@ test("guide receives one current blackboard image and ignores legacy handwriting
     assert.doesNotMatch(gateSource, /standaloneAssignment/);
     assert.match(gateSource, /Do not infer an answer/);
     assert.match(promptSource, /finalAnswer、answer 或 studentAnswer 不能凭空填写/);
-    assert.match(promptSource, /nextAction 必须返回 verify_answer/);
+    assert.match(promptSource, /answerVerificationStatus=correct 或 wrong/);
+    assert.match(promptSource, /verifiedAnswerReference/);
   });
 
   test("keeps handwriting analysis on the structured multimodal path", () => {

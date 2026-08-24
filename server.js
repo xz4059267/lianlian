@@ -469,25 +469,28 @@ const LECTURE_COMPLETION_RULES = [
 ].join("\n");
 
 const HANDWRITING_PROMPT = [
-  "你是初中数学黑板板书的异步观察器，只负责识别和分析学生当前写下的内容。",
-  "你会看到当前黑板区域的完整截图，截图同时包含当前题目图片和学生的原始笔迹。当前截图是唯一视觉事实来源；不要依赖 Question Memory、OCR 文字、前端整理文本或任何旧的板书识别结果。",
-  "你的职责只有五项：忠实转写可见笔迹；判断当前书写状态；列出学生已经明确完成且在板书上可见的步骤；定位明确错误；在需要继续时给出贴着当前板书的具体引导。",
-  "禁止重新解整道题、禁止生成新的完整答案、禁止根据学生零散板书反推出未写出的步骤或最终答案。",
+  "你是初中数学黑板板书的异步观察与核验器。你要在一次请求里同时识别当前板书，并把可见的最终答案和步骤与服务端提供的可信标准答案进行对比。",
+  "你会看到当前黑板区域的完整截图，截图同时包含当前题目图片和学生的原始笔迹。截图是所有视觉事实的唯一来源；服务端提供的 verifiedAnswerReference 是唯一的标准答案依据。不要依赖 OCR、前端整理文本或任何旧的板书识别结果。",
+  "当前黑板上的学生原始笔迹优先级高于语音。语音只能帮助理解学生正在说明哪一行或哪个意图，不能覆盖、改写或补充截图中没有出现的数学步骤和答案；当语音与笔迹冲突时，以笔迹为准并返回 unclear 或 ask_for_board。",
+  "题目图片中的印刷文字、红笔/蓝笔批注、勾叉、圈画、旧答案和非本次书写痕迹都不是当前学生笔迹，不能当作学生本次答案或步骤；只判断黑板上本次原始笔迹。",
+  "你的职责是：忠实转写可见笔迹；判断当前书写状态；列出已经明确完成且可见的步骤；定位明确错误；当最终答案和关键步骤都可见时，直接返回与标准答案的核验结果。",
+  "禁止根据学生零散板书补出未写出的步骤或最终答案。标准答案只用于核对已经写出的最终答案和可见步骤，不能替学生补写答案。",
   "detectedWriting 和 mathExpression 必须忠实对应当前截图；completedSteps 只能包含截图中已经出现并可辨认的步骤，不能补齐学生没写的内容。",
   "判断某个可见步骤是否正确时，先读取当前截图中的题目条件，再与学生当前笔迹比较；如果截图不清楚或无法可靠核算，返回 unclear，不能猜测。",
   "writingState=in_progress 表示学生显然还在写或只完成部分步骤；只有输入显示长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
   "只有能指出具体 errorLocation，并能在 errorEvidence 中说明截图中可见数字、符号、运算或结论的明确冲突时，才返回 calculationStatus=wrong。",
-  "可见步骤与当前截图中的题意一致时返回 correct，但这只说明已经写出的步骤成立，不代表学生完成了整道题，也不得推断后续答案。",
+  "可见步骤与当前截图中的题意和 verifiedAnswerReference 一致时返回 correct，但这只说明已经写出的步骤成立；最终答案必须另行填写 answerVerificationStatus。",
   "writingState=complete 只有在当前截图明确出现最终结论、答案/结果/所以/解得等收束标记，或最后一行是独立且完整的最终答案时才允许；仅有 x-2y=m、m-n=8、代入式、过程式或一个正确关键步骤时，必须返回 in_progress 或 stalled。boardComplete=true 仅表示存在可核验关键步骤，绝不能作为最终答案信号。",
   "不要生成完整解题过程或替学生补写未出现的步骤。guidance 只在 nextAction=continue_guidance 或 ask_for_board 时给出一句贴着当前板书的具体引导；nextAction=verify_answer 或 finished 时 guidance 必须为空。",
   "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
   "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；只要一个可见关键关系或计算步骤与 Question Memory 一致，就可以作为可核验步骤。",
   "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
   "如果板书最后一行或最后一组等式已经出现明确的最终赋值结果，即使前面仍保留完整推导式，也必须把这些可见结果原样写入 finalAnswer；不要求学生额外写‘答案是’、‘所以’等文字。finalAnswer 只能来自当前截图中确实可见的最后结果，不能根据题目自行补算。",
-  "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，nextAction 必须返回 verify_answer；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；只有最终答案和关键步骤都已经明确、且当前动作可以收束时才返回 finished。模型只判断板书状态和动作，不负责判定答案最终是否正确。",
+  "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，必须依据 verifiedAnswerReference 返回 answerVerificationStatus=correct 或 wrong，并将 answerFeedback 或 answerHint 填好；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；最终答案和关键步骤都明确且核验正确时返回 finished。",
   "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
   "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
-  "如果看不清或无法核算，calculationStatus=\"unclear\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
+  "如果看不清或无法核算，calculationStatus=\"unclear\"，answerVerificationStatus=\"unclear\"；如果没有可见最终答案，answerVerificationStatus=\"not_present\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
+  "如果只有语音而当前黑板没有学生关键笔迹或最终答案，禁止核验答案，返回 answerVerificationStatus=\"not_present\"、nextAction=ask_for_board，并提醒学生把关键关系式和最终答案写到黑板上。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");
 
@@ -682,6 +685,19 @@ const handwritingSchema = {
         type: "string",
         description: "Only the final answer or final assignments visibly written in the current board image. Empty when no visible final result exists."
       },
+      answerVerificationStatus: {
+        type: "string",
+        enum: ["not_present", "correct", "wrong", "unclear"],
+        description: "Comparison of the visible final answer with the trusted standard answer. Use not_present when no final answer is visible."
+      },
+      answerFeedback: {
+        type: "string",
+        description: "Short confirmation when the visible final answer matches the standard answer. Empty unless answerVerificationStatus is correct."
+      },
+      answerHint: {
+        type: "string",
+        description: "Short concrete correction when the visible final answer does not match or cannot be verified. Empty when correct."
+      },
       nextAction: {
         type: "string",
         enum: ["continue_guidance", "verify_answer", "ask_for_board", "finished"],
@@ -752,6 +768,9 @@ const handwritingSchema = {
       "detectedWriting",
       "mathExpression",
       "finalAnswer",
+      "answerVerificationStatus",
+      "answerFeedback",
+      "answerHint",
       "nextAction",
       "guidance",
       "writingState",
@@ -9971,8 +9990,10 @@ async function handleHandwritingInternal(req, res, task) {
     });
     return;
   }
-  // First-stage invariant: handwriting consumes the frozen Question Memory
-  // created when the question was entered. It must never call the answer model.
+  // The handwriting request consumes the frozen Question Memory created when
+  // the question was entered. The same multimodal call now compares visible
+  // board work with that trusted reference; no second final-answer call is
+  // needed for the normal completion path.
   const answerKey = questionMemoryToAnswerKey(body.questionMemory, questionId, memoryId);
   console.log(
     `[handwriting-timing] question-memory=${Date.now() - requestStartedAt}ms trusted=${answerKey.trusted} q=${diagnostics.questionId} v=${diagnostics.boardVersion}`
@@ -9996,8 +10017,11 @@ async function handleHandwritingInternal(req, res, task) {
         text: JSON.stringify({
           trigger: body.reason || "停笔后异步识别",
           boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
+          latestStudentSpeech: String(body.latestStudentSpeech || "").trim(),
+          hasBoardInk: body.hasBoardInk === true,
           instruction:
-            "只依据当前黑板区域截图（题目图片与学生原始笔迹）判断当前状态和下一动作；不要读取或复述任何旧识别结果。"
+            "只依据当前黑板区域截图（题目图片与学生原始笔迹）判断当前状态和下一动作；笔迹优先于 latestStudentSpeech；当截图中出现最终答案和关键步骤时，使用 verifiedAnswerReference 直接完成核验；如果没有笔迹只能提醒写板书；不要读取或复述任何旧识别结果。",
+          verifiedAnswerReference: privateAnswerReference(answerKey)
         })
       },
       { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: boardImage, detail: "high" }
@@ -10022,10 +10046,14 @@ async function handleHandwritingInternal(req, res, task) {
   });
   result = applyStatementEvaluationSafety(result, answerKey);
   result = buildHandwritingProcessFeedback(result, answerKey, body);
+  result = applyHandwritingAnswerVerification(result, answerKey);
 
   if (!answerKey.trusted && ["correct", "wrong"].includes(result.calculationStatus)) {
     result = {
       ...result,
+      answerVerificationStatus: result.finalAnswer ? "unclear" : "not_present",
+      answerFeedback: "",
+      answerHint: "Question Memory 尚未就绪，暂时不能确认最终答案。",
       calculationStatus: "unclear",
       calculationCheck: "Question Memory 尚未就绪，暂不判断板书对错。",
       hasPossibleIssue: false,
@@ -10224,6 +10252,61 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   return output;
 }
 
+function applyHandwritingAnswerVerification(result, answerKey) {
+  const finalAnswer = String(result?.finalAnswer || "").normalize("NFKC").trim();
+  const status = ["not_present", "correct", "wrong", "unclear"].includes(result?.answerVerificationStatus)
+    ? result.answerVerificationStatus
+    : "unclear";
+  if (!finalAnswer) {
+    return {
+      ...(result || {}),
+      answerVerificationStatus: "not_present",
+      answerFeedback: "",
+      answerHint: ""
+    };
+  }
+  if (!answerKey?.trusted) {
+    return {
+      ...(result || {}),
+      answerVerificationStatus: "unclear",
+      answerFeedback: "",
+      answerHint: "标准答案还没有准备完成，暂时不能确认最终答案。"
+    };
+  }
+
+  const matches = studentAnswerMatchesVerifiedKey(finalAnswer, answerKey);
+  if (matches && status === "correct") {
+    return {
+      ...(result || {}),
+      answerVerificationStatus: "correct",
+      answerFeedback: String(result?.answerFeedback || "答案与标准答案一致。").trim(),
+      answerHint: ""
+    };
+  }
+  if (!matches && status === "wrong") {
+    return {
+      ...(result || {}),
+      answerVerificationStatus: "wrong",
+      answerFeedback: "",
+      answerHint: String(result?.answerHint || result?.issueSummary || "最终答案与标准答案不一致，请检查最后一步。").trim()
+    };
+  }
+  if (!matches && status === "correct") {
+    return {
+      ...(result || {}),
+      answerVerificationStatus: "wrong",
+      answerFeedback: "",
+      answerHint: "最终答案与标准答案不一致，请检查最后一步的计算或选项。"
+    };
+  }
+  return {
+    ...(result || {}),
+    answerVerificationStatus: "unclear",
+    answerFeedback: "",
+    answerHint: String(result?.answerHint || "最终答案暂时看不清，或还不能与标准答案可靠比较。").trim()
+  };
+}
+
 function answerKeyTextForSafety(answerKey) {
   const parts = [
     answerKey?.problemText,
@@ -10306,7 +10389,8 @@ async function auditHandwritingResult(result, answerKey, body, boardImage, contr
             trigger: body.reason || "",
             boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
             instruction:
-              "只根据当前黑板区域截图独立审校可见步骤。不得读取旧识别结果、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和来自截图的证据。"
+              "只根据当前黑板区域截图独立审校可见步骤，并参考 verifiedAnswerReference 审校可见最终答案。不得读取旧识别结果、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和来自截图的证据。",
+            verifiedAnswerReference: privateAnswerReference(answerKey)
           })
         },
         { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: boardImage, detail: "high" }

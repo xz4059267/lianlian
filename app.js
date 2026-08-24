@@ -339,6 +339,7 @@ const state = {
   lastGuideAt: 0,
   lastSpeechAt: 0,
   lastRecognizedSpeechAt: 0,
+  latestStudentSpeechText: "",
   lastBoardWriteAt: 0,
   lastUserInputAt: 0,
   lastEncourageAt: 0,
@@ -2581,6 +2582,7 @@ function initCurrentQuestion() {
   state.lastGuideAt = 0;
   state.lastSpeechAt = now;
   state.lastRecognizedSpeechAt = 0;
+  state.latestStudentSpeechText = "";
   state.lastBoardWriteAt = now;
   state.lastUserInputAt = now;
   state.lastEncourageAt = now;
@@ -3308,6 +3310,7 @@ function resetQuestionGuideState(options = {}) {
   clearHandwritingRetryTimer();
   state.lastSpeechAt = now;
   state.lastRecognizedSpeechAt = 0;
+  state.latestStudentSpeechText = "";
   state.lastBoardWriteAt = 0;
   state.lastHandwritingRecognizedAt = 0;
   state.lastUserInputAt = now;
@@ -3626,6 +3629,12 @@ async function runHandwritingRecognition(reason) {
     }
 
     if (state.waitingForBoardBeforeFinalAnswer) {
+      if (await handleHandwritingAnswerVerification(result)) {
+        dom.recognitionPill.textContent = result.answerVerificationStatus === "correct"
+          ? "答案已核对正确"
+          : "答案需要检查";
+        return;
+      }
       const pendingAnswer = state.pendingFinalAnswerText;
       const modelAction = String(result?.nextAction || "").trim();
       if (pendingAnswer && isModelBoardReadyForFinalCheck(result)) {
@@ -3675,19 +3684,20 @@ async function runHandwritingRecognition(reason) {
       boardComplete: result?.boardComplete ?? null,
       completedSteps: result?.completedSteps || [],
       finalAnswer: result?.finalAnswer || "",
+      answerVerificationStatus: result?.answerVerificationStatus || "",
+      answerFeedback: result?.answerFeedback || "",
+      answerHint: result?.answerHint || "",
       nextAction: result?.nextAction || "",
       guidance: result?.guidance || "",
       finalAnswerCandidate
     });
 
-    // A final answer must enter the answer-check path before the generic
-    // "board recorded" state. Otherwise a valid last step is treated as
-    // ordinary progress and the student never gets an immediate check.
-    if (
-      finalAnswerCandidate &&
-      await maybeVerifyFinalAnswerFromHandwriting(result)
-    ) {
-      dom.recognitionPill.textContent = "正在核对答案";
+    // The handwriting model now compares the visible final answer and steps
+    // with the trusted standard answer in the same multimodal request.
+    if (await handleHandwritingAnswerVerification(result)) {
+      dom.recognitionPill.textContent = result.answerVerificationStatus === "correct"
+        ? "答案已核对正确"
+        : "答案需要检查";
       return;
     }
 
@@ -3847,6 +3857,8 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
         boardImage,
         reason,
         boardIdleSeconds,
+        latestStudentSpeech: state.latestStudentSpeechText || "",
+        hasBoardInk: Boolean(hasCurrentBoardInk(question)),
         handwritingDiagnostics: diagnostics
       }),
       signal: controller.signal
@@ -4215,6 +4227,49 @@ function shouldVerifyHandwritingFinalAnswer(result) {
   // No structured action means the response is incomplete. Do not infer a
   // final answer from a multi-line board in the frontend.
   return false;
+}
+
+async function handleHandwritingAnswerVerification(result) {
+  const question = currentPageQuestion();
+  const status = String(result?.answerVerificationStatus || "").trim();
+  const answer = extractHandwritingFinalAnswerCandidate(result);
+  if (!question || !answer || !["correct", "wrong"].includes(status)) return false;
+
+  if (status === "correct") {
+    if (!isHandwritingCalculationCorrect(result) || !isModelBoardReadyForFinalCheck(result)) return false;
+    state.finalAnswerVerified = true;
+    state.verifiedFinalAnswerText = answer;
+    state.awaitingFinalAnswer = false;
+    state.pendingFinalAnswerText = "";
+    state.boardCompletionVerified = true;
+    state.currentQuestionCompleted = false;
+    dom.finishQuestionBtn.disabled = false;
+    setGuideState(GUIDE_STATES.INTERACTIVE);
+    if (markCurrentQuestionComplete()) {
+      await lianSpeak(result.answerFeedback || "答案和板书步骤都核对正确了。", {
+        dedupeKey: `handwriting-answer-correct:${question.id}:${answer}`,
+        cooldownMs: 0,
+        allowRepeat: true
+      });
+      await saveCurrentQuestionAndContinue({ feedback: result.answerFeedback || "" });
+    }
+    return true;
+  }
+
+  state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.awaitingFinalAnswer = true;
+  state.pendingFinalAnswerText = answer;
+  state.boardCompletionVerified = false;
+  state.currentQuestionCompleted = false;
+  dom.finishQuestionBtn.disabled = false;
+  setGuideState(GUIDE_STATES.INTERACTIVE);
+  await lianSpeak(result.answerHint || result.guidance || "最终答案与标准答案不一致，请检查最后一步的计算。", {
+    dedupeKey: `handwriting-answer-wrong:${question.id}:${answer}`,
+    cooldownMs: 0,
+    allowRepeat: true
+  });
+  return true;
 }
 
 async function maybeVerifyFinalAnswerFromHandwriting(result) {
@@ -5703,6 +5758,7 @@ function buildSilenceEscalationFallback(stage) {
 function handleStudentSpeech(text, options = {}) {
   text = normalizeMathSpeechText(text);
   if (!text) return;
+  state.latestStudentSpeechText = text;
   const normalized = text.replace(/\s/g, "");
   if (!options.inputAlreadyRegistered) markUserInput("speech");
   const directFinalAnswer = extractDirectFinalAnswerCandidate(text);
@@ -7450,6 +7506,22 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
   const question = currentPageQuestion();
   const normalizedAnswer = String(answer || "").trim();
   if (!question || !normalizedAnswer) return;
+
+  // Board recognition is now the single verification route. The multimodal
+  // handwriting request receives the full board snapshot and the trusted
+  // answer reference, then decides whether to guide or verify. Keep the old
+  // final-answer endpoint only as an explicit compatibility escape hatch.
+  if (options.useLegacyFinalCheck !== true) {
+    if (
+      state.latestHandwritingResult &&
+      hasCurrentRecognizedBoardStep(question) &&
+      await handleHandwritingAnswerVerification(state.latestHandwritingResult)
+    ) {
+      return;
+    }
+    queueModelDecisionBeforeFinalCheck(normalizedAnswer, options.source || "答案核验");
+    return;
+  }
 
   // The handwriting model must decide that the board contains a relevant
   // key step before the answer-check model is called. This keeps the two
