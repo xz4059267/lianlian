@@ -3623,7 +3623,7 @@ async function runHandwritingRecognition(reason) {
     if (state.waitingForBoardBeforeFinalAnswer) {
       const pendingAnswer = state.pendingFinalAnswerText;
       const modelAction = String(result?.nextAction || "").trim();
-      if (pendingAnswer && ["verify_answer", "finished"].includes(modelAction)) {
+      if (pendingAnswer && isModelBoardReadyForFinalCheck(result)) {
         state.waitingForBoardBeforeFinalAnswer = false;
         state.pendingFinalAnswerText = "";
         dom.recognitionPill.textContent = "正在核对最后答案";
@@ -3905,67 +3905,6 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
   return result;
 }
 
-async function verifyCurrentBoardForCompletion(question) {
-  if (!question || !hasCurrentBoardInk(question)) {
-    state.boardCompletionVerified = false;
-    return {
-      verified: false,
-      result: null,
-      guidance: "黑板上还没有可核验的步骤。请写下一个关键关系式、公式或计算步骤，再点击保存至错题本。"
-    };
-  }
-
-  const requestMeta = createHandwritingRequestMeta(question, "completion");
-  const requestId = requestMeta.requestId;
-  const questionId = requestMeta.questionId;
-  const recognitionInputSnapshot = getStudentInputSnapshot();
-  const responseToken = getInteractionToken();
-  saveCurrentPage();
-  dom.recognitionPill.textContent = "正在检查板书步骤";
-  dom.recognitionPill.classList.remove("hidden");
-
-  const boardVersion = requestMeta.boardVersion;
-  beginHandwritingRequest(requestMeta);
-  try {
-  const result = normalizeHandwritingResult(
-    await requestHandwritingAnalysis(
-      question,
-      "完成讲解前检查：判断板书是否至少包含一个与本题相关且正确的关键步骤",
-      requestMeta
-    )
-  );
-  if (
-    !isCurrentHandwritingRequest(requestMeta) ||
-    !isCurrentInteraction(responseToken)
-  ) {
-    return { verified: false, stale: true, result: null, guidance: "题目已经切换，本次板书检查已取消。" };
-  }
-
-  if (hasStudentInputSince(recognitionInputSnapshot)) {
-    console.log("[handwriting] completion check skipped", {
-      reason: "new student board or speech input",
-      startedAt: recognitionInputSnapshot,
-      current: getStudentInputSnapshot()
-    });
-    return { verified: false, stale: true, newerInput: true, result: null, guidance: "" };
-  }
-
-  state.latestHandwritingResult = result;
-  state.lastHandwritingRecognizedAt = Date.now();
-  state.handwritingResults[question.id] = result;
-  const verified = shouldPromptSaveFromHandwriting(result);
-  state.boardCompletionVerified = verified;
-  dom.recognitionPill.textContent = verified ? "板书步骤已确认" : "板书还需一个正确步骤";
-  return {
-    verified,
-    result,
-    guidance: verified ? "" : getBoardCompletionGuidance(result)
-  };
-  } finally {
-    finishHandwritingRequest(requestMeta, isCurrentHandwritingRequest(requestMeta) ? "completed" : "stale");
-  }
-}
-
 async function createCurrentBoardSnapshot() {
   const question = currentPageQuestion();
   if (!question) return getBoardImageForGuide();
@@ -4209,15 +4148,20 @@ function isHandwritingCalculationCorrect(result) {
 }
 
 function isBoardCompletionVerified(result) {
+  return isModelBoardReadyForFinalCheck(result);
+}
+
+// The multimodal handwriting response owns progress detection. The client
+// must not reconstruct readiness from visible strings or legacy confidence
+// heuristics, otherwise a completed board can be sent back into guidance.
+function isModelBoardReadyForFinalCheck(result) {
   return Boolean(
-    ["double-verified", "structured-single-pass", "question-memory"].includes(result?.answerVerification) &&
-    (result?.boardComplete === true || hasReviewableBoardStep(result)) &&
     result?.isRelevant !== false &&
-    result?.calculationStatus === "correct" &&
-    Number(result?.confidence) >= 0.6 &&
+    result?.boardComplete === true &&
+    Array.isArray(result?.completedSteps) &&
+    result.completedSteps.length > 0 &&
     !isIncompleteHandwritingIssue(result) &&
-    !hasAssignmentConflict(result) &&
-    !hasContradictoryCorrectSignal(result)
+    !isHandwritingCalculationWrong(result)
   );
 }
 
@@ -4308,7 +4252,7 @@ function shouldVerifyHandwritingFinalAnswer(result) {
       finalAnswer: candidate,
       completedSteps: result?.completedSteps || []
     });
-    return result?.isRelevant !== false;
+    return isModelBoardReadyForFinalCheck(result);
   }
 
   // No structured action means the response is incomplete. Do not infer a
@@ -4332,8 +4276,7 @@ async function maybeVerifyFinalAnswerFromHandwriting(result) {
   if (hasStudentInputSinceHandwritingRecognition()) return false;
   await handleFinalAnswerSubmission(answer, {
     source: "handwriting",
-    boardAlreadyVerified: ["verify_answer", "finished"].includes(result?.nextAction) &&
-      result?.isRelevant !== false,
+    boardAlreadyVerified: isModelBoardReadyForFinalCheck(result),
     silentLog: true
   });
   return true;
@@ -4377,10 +4320,43 @@ function hasCurrentRecognizedBoardStep(question = currentPageQuestion()) {
     return false;
   }
   const result = state.latestHandwritingResult;
-  if (["verify_answer", "finished"].includes(result?.nextAction)) {
-    return result?.isRelevant !== false;
+  return isModelBoardReadyForFinalCheck(result);
+}
+
+function queueModelDecisionBeforeFinalCheck(answerText, source = "") {
+  const answer = String(answerText || "").trim();
+  const question = currentPageQuestion();
+  if (!answer || !question) return false;
+
+  state.waitingForBoardBeforeFinalAnswer = true;
+  state.pendingFinalAnswerText = answer;
+  state.finalAnswerVerified = false;
+  state.verifiedFinalAnswerText = "";
+  state.boardCompletionVerified = false;
+
+  if (!hasCurrentBoardInk(question)) {
+    dom.recognitionPill.textContent = "请先补充板书步骤";
+    dom.recognitionPill.classList.remove("hidden");
+    void lianSpeak("我先记下你的最后答案。请在黑板上写出一个关键关系式或计算步骤，写好后我再帮你核对答案。", {
+      dedupeKey: `final-answer-needs-board:${question.id}`,
+      cooldownMs: 0,
+      allowRepeat: true
+    });
+    return true;
   }
-  return hasReviewableBoardStep(result);
+
+  if (state.handwritingRequestInFlight) {
+    dom.recognitionPill.textContent = "正在检查板书步骤";
+    dom.recognitionPill.classList.remove("hidden");
+    return true;
+  }
+
+  // Run the model decision immediately. Delaying this path can leave a
+  // spoken final answer waiting behind a stale debounce timer.
+  void runHandwritingRecognition(`最终核验前由模型判断板书进度${source ? `:${source}` : ""}`);
+  dom.recognitionPill.textContent = "正在检查板书步骤";
+  dom.recognitionPill.classList.remove("hidden");
+  return true;
 }
 
 function handleSpokenFinalAnswer(answerText) {
@@ -4393,94 +4369,12 @@ function handleSpokenFinalAnswer(answerText) {
     // Keep the answer until the service confirms it. A transport failure must
     // never force the student to repeat an answer that was already captured.
     state.pendingFinalAnswerText = answer;
-    void handleFinalAnswerSubmission(answer);
+    void handleFinalAnswerSubmission(answer, { boardAlreadyVerified: true });
     return;
   }
 
-  // Keep the spoken answer, but require a freshly recognized key board step
-  // before the answer-check request is allowed to run.
-  state.waitingForBoardBeforeFinalAnswer = true;
-  state.pendingFinalAnswerText = answer;
-  state.finalAnswerVerified = false;
-  state.verifiedFinalAnswerText = "";
-  state.boardCompletionVerified = false;
   addLog("我", answer);
-
-  if (!hasCurrentBoardInk(question)) {
-    dom.recognitionPill.textContent = "请先补充板书步骤";
-    dom.recognitionPill.classList.remove("hidden");
-    void lianSpeak("我先记下你的最后答案。请在黑板上写出一个关键关系式或计算步骤，写好后我再帮你核对答案。", {
-      dedupeKey: `final-answer-needs-board:${question.id}`,
-      cooldownMs: 0,
-      allowRepeat: true
-    });
-    return;
-  }
-
-  if (state.handwritingRequestInFlight) {
-    dom.recognitionPill.textContent = "正在检查板书步骤";
-    dom.recognitionPill.classList.remove("hidden");
-    void lianSpeak("我先等板书识别完成，再结合你写的关键步骤核对最后答案。", {
-      dedupeKey: `final-answer-waiting-board:${question.id}`,
-      cooldownMs: 0,
-      allowRepeat: true
-    });
-    return;
-  }
-
-  scheduleHandwritingRecognition("语音答案后检查关键步骤");
-  dom.recognitionPill.textContent = "请先补充板书步骤";
-  dom.recognitionPill.classList.remove("hidden");
-  void lianSpeak("我先记下你的最后答案。现在请把关键关系式或计算步骤写在黑板上，板书识别完成后我就开始核对。", {
-    dedupeKey: `final-answer-schedule-board:${question.id}`,
-    cooldownMs: 0,
-    allowRepeat: true
-  });
-}
-
-function shouldPromptSaveFromHandwriting(result) {
-  return Boolean(
-    ["double-verified", "structured-single-pass", "question-memory"].includes(result?.answerVerification) &&
-    result?.isRelevant !== false &&
-    isHandwritingCalculationCorrect(result) &&
-    hasReviewableBoardStep(result)
-  );
-}
-
-async function maybePromptSaveFromHandwriting(result) {
-  const question = currentPageQuestion();
-  if (!question || state.currentQuestionCompleted || state.completionCheckInProgress) return false;
-  if (!shouldPromptSaveFromHandwriting(result)) return false;
-  if (hasStudentInputSinceHandwritingRecognition()) return false;
-  if (state.autoSavePromptedQuestionId === question.id) return false;
-
-  state.autoSavePromptedQuestionId = question.id;
-  state.finalAnswerVerified = true;
-  state.verifiedFinalAnswerText = extractAnswerTextFromHandwriting(result);
-  state.awaitingFinalAnswer = false;
-  state.pendingFinalAnswerText = "";
-  state.boardCompletionVerified = true;
-  dom.finishQuestionBtn.disabled = false;
-
-  markCurrentQuestionComplete();
-  dom.recognitionPill.textContent = "板书已确认";
-  await new Promise((resolve) => setTimeout(resolve, 320));
-  dom.recognitionPill.classList.add("hidden");
-  await new Promise((resolve) => setTimeout(resolve, 120));
-  if (hasStudentInputSinceHandwritingRecognition()) return false;
-  const feedback = String(result.positiveFeedback || "").trim();
-  await lianSpeak(
-    feedback
-      ? `${feedback} 答案和板书都核对好了。`
-      : "答案和板书都核对好了。"
-  );
-  setTimeout(() => {
-    if (currentPageQuestion()?.id !== question.id) return;
-    if (hasStudentInputSinceHandwritingRecognition()) return;
-    if (!state.finalAnswerVerified || !state.boardCompletionVerified) return;
-    void saveCurrentQuestionAndContinue({ feedback });
-  }, 1500);
-  return true;
+  queueModelDecisionBeforeFinalCheck(answer, "语音答案");
 }
 
 function getBoardCompletionGuidance(result) {
@@ -5899,16 +5793,8 @@ function handleStudentSpeech(text, options = {}) {
   recordFinalAnswerEvidence(text);
   if (state.currentQuestionCompleted) return;
   if (state.finalAnswerVerified) {
-    const question = currentPageQuestion();
-    if (
-      question &&
-      !state.boardCompletionVerified &&
-      state.boardVerificationUnavailableQuestionId !== question.id &&
-      !state.completionCheckInProgress &&
-      hasCurrentBoardInk(question)
-    ) {
-      void verifyBoardAndCompleteQuestion({ feedback: "答案已经核对正确。" });
-    }
+    // Final-answer verification is terminal for the current answer. A later
+    // board recognition result must not start a second completion workflow.
     return;
   }
   if (!hasCurrentBoardInk()) {
@@ -6251,23 +6137,11 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     return false;
   }
   if (state.finalAnswerVerified) {
-    const question = currentPageQuestion();
-    const boardCheckUnavailable = state.boardVerificationUnavailableQuestionId === question?.id;
     console.info("[guide] skipped after final answer verification", {
       eventType,
-      questionId: question?.id || "",
-      boardCompletionVerified: state.boardCompletionVerified,
-      boardCheckUnavailable
+      questionId: currentPageQuestion()?.id || "",
+      boardCompletionVerified: state.boardCompletionVerified
     });
-    if (
-      question &&
-      !state.boardCompletionVerified &&
-      !boardCheckUnavailable &&
-      !state.completionCheckInProgress &&
-      hasCurrentBoardInk(question)
-    ) {
-      void verifyBoardAndCompleteQuestion({ feedback: "答案已经核对正确。" });
-    }
     return false;
   }
   if (state.openingSpeechInProgress && options.allowDuringOpening !== true) {
@@ -7622,70 +7496,21 @@ async function requestFinalAnswerCheckWithRetry(answer, options = {}) {
   return requestFinalAnswerCheck(answer, options);
 }
 
-async function verifyBoardAndCompleteQuestion(options = {}) {
-  const question = currentPageQuestion();
-  if (!question || !state.finalAnswerVerified || state.completionCheckInProgress) return false;
-
-  state.completionCheckInProgress = true;
-  dom.finishQuestionBtn.disabled = true;
-  setGuideState(GUIDE_STATES.INTERACTIVE);
-
-  try {
-    const boardCheck = await verifyCurrentBoardForCompletion(question);
-    if (boardCheck.stale || currentPageQuestion()?.id !== question.id) return false;
-    if (!boardCheck.verified) {
-      state.currentQuestionCompleted = false;
-      dom.finishQuestionBtn.disabled = false;
-      await lianSpeak(boardCheck.guidance);
-      return false;
-    }
-
-    if (!markCurrentQuestionComplete()) {
-      dom.finishQuestionBtn.disabled = false;
-      return false;
-    }
-
-    const feedback = String(options.feedback || boardCheck.result?.positiveFeedback || "").trim();
-    dom.recognitionPill.classList.add("hidden");
-    // Persist before any TTS work. A stalled audio request must never keep a
-    // successfully verified question from moving to the next one.
-    await saveCurrentQuestionAndContinue();
-    return true;
-  } catch (error) {
-    console.warn("Board completion check fallback:", error);
-    state.boardCompletionVerified = false;
-    state.currentQuestionCompleted = false;
-    dom.finishQuestionBtn.disabled = false;
-    // A transient board-service failure must not strand a verified answer or
-    // cause the next interaction to re-enter the guide. Keep the board and
-    // persist a pending-verification record on this explicit save action.
-    if (state.finalAnswerVerified && hasCurrentBoardInk(question)) {
-      state.boardVerificationUnavailableQuestionId = question.id;
-      state.boardVerificationUnavailableAt = Date.now();
-      console.warn("[completion] board verification unavailable; preserving visible board content");
-      await saveCurrentQuestionAndContinue({
-        allowUnverified: true,
-        feedback: "答案已经核对正确，板书已保留为待核验。"
-      });
-      void lianSpeak("答案已经核对正确，板书已保留为待核验记录。", {
-        dedupeKey: `board-verification-unavailable:${question.id}`,
-        cooldownMs: 0,
-        allowRepeat: true
-      });
-      return true;
-    }
-    await lianSpeak("答案已经核对过了，但这次还没能确认板书中的关键步骤。请保留板书，稍后再点击保存至错题本。");
-    return false;
-  } finally {
-    state.completionCheckInProgress = false;
-    setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
-  }
-}
-
 async function handleFinalAnswerSubmission(answer, options = {}) {
   const question = currentPageQuestion();
   const normalizedAnswer = String(answer || "").trim();
   if (!question || !normalizedAnswer) return;
+
+  // The handwriting model must decide that the board contains a relevant
+  // key step before the answer-check model is called. This keeps the two
+  // model responsibilities separate and prevents answer checking from
+  // silently bypassing board progress detection.
+  if (!options.boardAlreadyVerified && !hasCurrentRecognizedBoardStep(question)) {
+    queueModelDecisionBeforeFinalCheck(normalizedAnswer, options.source || "答案核验");
+    return;
+  }
+  options = { ...options, boardAlreadyVerified: true };
+
   state.finalAnswerAbortController?.abort("superseded-final-answer");
   const requestId = ++state.finalAnswerRequestId;
   const requestBoardVersion = getBoardVersion(question);
@@ -7750,31 +7575,20 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
         }
         return;
       }
-      if (options.continueAfterAnswer) {
-        await verifyBoardAndCompleteQuestion({
-          feedback: feedback || "答案已经核对正确。"
-        });
-        return;
+      // boardAlreadyVerified is guaranteed by the gate above. The only
+      // successful terminal path is therefore: final check correct -> save
+      // prompt. No second board-check request and no guide loop.
+      if (!state.boardCompletionVerified) {
+        throw new Error("board_progress_decision_missing");
       }
-      // A correct answer with a recognized board step is already at the
-      // completion gate. Do not send the student back through the guide or
-      // wait for another click before starting the board verification.
-      if (hasCurrentRecognizedBoardStep(question) && !state.completionCheckInProgress) {
-        await verifyBoardAndCompleteQuestion({
-          feedback: feedback || "答案已经核对正确。"
-        });
-        return;
-      }
-      await lianSpeak(
-        `${
-          feedback || "最后答案正确。"
-        } 点击右上角“保存至错题本”，我会核对板书，并提醒你保存到错题本。`,
-        {
-          dedupeKey: `final-answer-correct:${question.id}:${normalizedAnswer}`,
+      if (markCurrentQuestionComplete()) {
+        await lianSpeak(feedback || "答案和关键步骤都核对正确了。", {
+          dedupeKey: `final-answer-board-correct:${question.id}:${normalizedAnswer}`,
           cooldownMs: 0,
           allowRepeat: true
-        }
-      );
+        });
+        await saveCurrentQuestionAndContinue({ feedback });
+      }
       return;
     }
 
@@ -7813,32 +7627,19 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
     state.finalAnswerVerified = false;
     state.verifiedFinalAnswerText = "";
     state.boardCompletionVerified = false;
-    state.finalAnswerVerificationUnavailableQuestionId = question.id;
-    state.finalAnswerVerificationUnavailableAnswer = normalizedAnswer;
-    state.finalAnswerVerificationUnavailableAt = Date.now();
+    state.finalAnswerVerificationUnavailableQuestionId = "";
+    state.finalAnswerVerificationUnavailableAnswer = "";
+    state.finalAnswerVerificationUnavailableAt = 0;
     dom.finishQuestionBtn.disabled = false;
     dom.recognitionPill.classList.add("hidden");
-    const serviceFailureNotice =
-      "核对服务暂时没有返回，我先保留你的答案和板书。再次点击“保存至错题本”可以先按待核验状态保存，不会继续卡在等待中。";
-    // When this failure came from the explicit save action, finish that same
-    // action immediately as a pending-verification notebook record. Do not
-    // make the student click again or start another model request.
-    if (options.continueAfterAnswer) {
-      // The save button is an explicit user action. Do not wait for TTS or a
-      // second provider request before persisting the answer and board.
-      addLog("提示", serviceFailureNotice, {
-        key: `final-answer-service-failed:${question.id}:${normalizedAnswer}`
-      });
-      await saveCurrentQuestionAndContinue({
-        allowUnverified: true,
-        feedback: "核对服务暂时不可用，答案和板书已按待核验状态保存。"
-      });
-    } else {
-      await lianSpeak(serviceFailureNotice, {
-        dedupeKey: `final-answer-service-failed:${question.id}:${normalizedAnswer}`,
-        cooldownMs: 60000
-      });
-    }
+    // A failed check keeps the student's evidence but cannot open the save
+    // prompt. A later explicit click starts a fresh model decision/check.
+    state.pendingFinalAnswerText = normalizedAnswer;
+    const serviceFailureNotice = "这次核对没有完成，答案和板书已保留。核对成功后才能保存到错题本，请稍后再试。";
+    await lianSpeak(serviceFailureNotice, {
+      dedupeKey: `final-answer-service-failed:${question.id}:${normalizedAnswer}`,
+      cooldownMs: 60000
+    });
   } finally {
     if (state.finalAnswerActiveRequest === requestMeta) {
       state.finalAnswerActiveRequest = null;
@@ -7877,42 +7678,16 @@ async function saveCurrentQuestionAndContinue(options = {}) {
   const question = currentPageQuestion();
   if (!question) return;
   const pendingAnswer = getAnswerCandidateForSave(question);
-  const allowPendingVerificationSave = Boolean(
-    options.allowUnverified === true &&
-      pendingAnswer &&
-      (
-        (state.finalAnswerVerificationUnavailableQuestionId === question.id &&
-          state.finalAnswerVerificationUnavailableAnswer === pendingAnswer) ||
-        state.boardVerificationUnavailableQuestionId === question.id
-      )
-  );
-
-  // A provider outage must not trap the user in a retry loop. This path is
-  // only reachable after an explicit second click and is stored as pending
-  // verification, never as a confirmed-correct answer.
-  if (allowPendingVerificationSave) {
-    state.finalAnswerVerified = false;
-    state.boardCompletionVerified = false;
-    state.currentQuestionCompleted = false;
-  }
-
-  // A confirmed final answer must go through board verification exactly once.
-  // This also protects non-button callers from falling back to another guide.
   if (
     state.finalAnswerVerified &&
     !state.boardCompletionVerified &&
-    !options.allowUnverified &&
-    !state.completionCheckInProgress &&
-    state.boardVerificationUnavailableQuestionId !== question.id
+    !state.completionCheckInProgress
   ) {
-    await verifyBoardAndCompleteQuestion({ feedback: options.feedback || "答案已经核对正确。" });
+    queueModelDecisionBeforeFinalCheck(pendingAnswer, "保存前板书进度");
     return;
   }
 
-  // A failed optional guide must never strand an answer that the student has
-  // already said. The next click can resume the answer-check path directly;
-  // board verification remains a separate gate after the answer is confirmed.
-  if (!state.finalAnswerVerified && !allowPendingVerificationSave) {
+  if (!state.finalAnswerVerified) {
     if (pendingAnswer) {
       dom.finishQuestionBtn.disabled = true;
       await handleFinalAnswerSubmission(pendingAnswer, {
@@ -7923,14 +7698,14 @@ async function saveCurrentQuestionAndContinue(options = {}) {
       return;
     }
   }
-  if ((!state.finalAnswerVerified || !state.boardCompletionVerified) && !allowPendingVerificationSave) {
+  if (!state.finalAnswerVerified || !state.boardCompletionVerified) {
     state.currentQuestionCompleted = false;
     dom.finishQuestionBtn.disabled = false;
     setGuideState(GUIDE_STATES.INTERACTIVE);
     lianSpeak(
       !state.finalAnswerVerified
-        ? "这道题还不能结束，先把最终答案说清楚并核对正确。"
-        : "答案已经正确，但板书里还没有确认到正确的关键步骤。请写下一个关系式、公式或计算步骤。"
+        ? "这道题还不能保存，先把最终答案说清楚并核对正确。"
+        : "答案已经正确，但还需要板书模型确认关键步骤。"
     );
     return;
   }
@@ -7955,15 +7730,6 @@ async function saveCurrentQuestionAndContinue(options = {}) {
       latestHandwritingResult: state.latestHandwritingResult
     };
     record = buildNotebookRecord(question);
-    if (allowPendingVerificationSave) {
-      record.status = "待核验";
-      record.needsReview = true;
-      record.answerVerificationPending = true;
-      record.answerVerificationStatus = "service-unavailable";
-      record.boardVerificationPending = state.boardVerificationUnavailableQuestionId === question.id;
-      record.pendingFinalAnswer = pendingAnswer;
-      record.verifiedAnswer = "";
-    }
     state.notebook.unshift(record);
     state.completedThisSession.push(record);
     state.completedLectureQuestionIds.add(question.id);
@@ -8070,24 +7836,12 @@ dom.finishQuestionBtn.addEventListener("click", () => {
     return;
   }
   if (state.finalAnswerVerified) {
-    void verifyBoardAndCompleteQuestion();
+    void saveCurrentQuestionAndContinue();
     return;
   }
   const pendingAnswer = getAnswerCandidateForSave(currentPageQuestion());
-  if (
-    pendingAnswer &&
-    state.finalAnswerVerificationUnavailableQuestionId === currentPageQuestion()?.id &&
-    state.finalAnswerVerificationUnavailableAnswer === pendingAnswer
-  ) {
-    void saveCurrentQuestionAndContinue({
-      allowUnverified: true,
-      feedback: "答案已保留，待核验状态已保存。"
-    });
-    return;
-  }
-  // The answer may have been captured successfully while an automatic guide
-  // request timed out. Treat the save button as an explicit recovery action
-  // instead of asking the student to repeat the answer or wait indefinitely.
+  // A pending answer must pass through the model board-progress decision and
+  // the final-answer check. The button never creates an unverified record.
   if (pendingAnswer) {
     void handleFinalAnswerSubmission(pendingAnswer, {
       silentLog: true,

@@ -59,7 +59,7 @@ test("keeps final answer checking single-purpose and traceable", () => {
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const finalAnswerClient = appSource.slice(
     appSource.indexOf("async function requestFinalAnswerCheck"),
-    appSource.indexOf("async function verifyBoardAndCompleteQuestion")
+    appSource.indexOf("async function handleFinalAnswerSubmission")
   );
   const finalAnswerSubmission = appSource.slice(
     appSource.indexOf("async function handleFinalAnswerSubmission"),
@@ -75,8 +75,12 @@ test("keeps final answer checking single-purpose and traceable", () => {
   assert.match(finalAnswerClient, /response\.status/);
   assert.match(finalAnswerClient, /errorType/);
   assert.match(finalAnswerSubmission, /state\.pendingFinalAnswerText = normalizedAnswer/);
-  assert.match(finalAnswerSubmission, /保留你的答案和板书/);
-  assert.match(finalAnswerSubmission, /allowUnverified: true/);
+  assert.match(finalAnswerSubmission, /queueModelDecisionBeforeFinalCheck/);
+  assert.match(finalAnswerSubmission, /boardAlreadyVerified/);
+  assert.match(appSource, /function isModelBoardReadyForFinalCheck/);
+  assert.match(finalAnswerSubmission, /答案和板书已保留/);
+  assert.match(finalAnswerSubmission, /核对成功后才能保存到错题本/);
+  assert.doesNotMatch(finalAnswerSubmission, /allowUnverified: true/);
   assert.match(finalAnswerSubmission, /requestFinalAnswerCheckWithRetry/);
   assert.match(finalAnswerClient, /waitForEnteredQuestionMemory\(question\)/);
   assert.match(finalAnswerClient, /questionMemory/);
@@ -224,7 +228,7 @@ test("propagates session and memory identity through handwriting requests", () =
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const requestSource = appSource.slice(
     appSource.indexOf("async function requestHandwritingAnalysis"),
-    appSource.indexOf("async function verifyCurrentBoardForCompletion")
+    appSource.indexOf("async function createCurrentBoardSnapshot")
   );
   const handlerSource = serverSource.slice(
     serverSource.indexOf("async function handleHandwriting"),
@@ -263,7 +267,7 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const appHandwritingRequest = appSource.slice(
     appSource.indexOf("async function requestHandwritingAnalysis"),
-    appSource.indexOf("async function verifyCurrentBoardForCompletion")
+    appSource.indexOf("async function createCurrentBoardSnapshot")
   );
   const appHandwritingRun = appSource.slice(
     appSource.indexOf("async function runHandwritingRecognition"),
