@@ -54,42 +54,16 @@ test("classifies only retryable Qwen transport failures as transient", () => {
   assert.equal(isTransientQwenError({ code: "missing_qwen_api_key", statusCode: 503 }), false);
 });
 
-test("keeps final answer checking single-purpose and traceable", () => {
+test("uses one multimodal board request for verification", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  const finalAnswerClient = appSource.slice(
-    appSource.indexOf("async function requestFinalAnswerCheck"),
-    appSource.indexOf("async function handleFinalAnswerSubmission")
-  );
-  const finalAnswerSubmission = appSource.slice(
-    appSource.indexOf("async function handleFinalAnswerSubmission"),
-    appSource.indexOf("async function saveCurrentQuestionAndContinue")
-  );
-  const finalAnswerHandler = serverSource.slice(
-    serverSource.indexOf("async function handleFinalAnswerCheck"),
-    serverSource.indexOf("function enforceOrderedProportionConvention")
-  );
 
-  assert.match(finalAnswerClient, /X-Lian-Trace-Id/);
-  assert.match(finalAnswerClient, /X-Lian-Request-Id/);
-  assert.match(finalAnswerClient, /response\.status/);
-  assert.match(finalAnswerClient, /errorType/);
-  assert.match(finalAnswerSubmission, /state\.pendingFinalAnswerText = normalizedAnswer/);
-  assert.match(finalAnswerSubmission, /queueModelDecisionBeforeFinalCheck/);
-  assert.match(finalAnswerSubmission, /boardAlreadyVerified/);
-  assert.match(appSource, /function isModelBoardReadyForFinalCheck/);
-  assert.match(finalAnswerSubmission, /答案和板书已保留/);
-  assert.match(finalAnswerSubmission, /核对成功后才能保存到错题本/);
-  assert.doesNotMatch(finalAnswerSubmission, /allowUnverified: true/);
-  assert.match(finalAnswerSubmission, /requestFinalAnswerCheckWithRetry/);
-  assert.match(finalAnswerClient, /waitForEnteredQuestionMemory\(question\)/);
-  assert.match(finalAnswerClient, /questionMemory/);
-  assert.match(finalAnswerClient, /ANSWER_KEY_NOT_READY/);
-  assert.match(finalAnswerHandler, /ANSWER_KEY_NOT_READY/);
-  assert.match(finalAnswerHandler, /modelCallCount/);
-  assert.match(finalAnswerHandler, /disableModelFallback: true/);
-  assert.doesNotMatch(finalAnswerHandler, /getVerifiedAnswerKey\(/);
-  assert.doesNotMatch(finalAnswerHandler, /safeDirectFinalAnswerCheck|directFinalAnswerCheck/);
+  assert.doesNotMatch(appSource, /\/api\/final-answer|requestFinalAnswerCheck|useLegacyFinalCheck|FINAL_CHECK/);
+  assert.doesNotMatch(serverSource, /handleFinalAnswerCheck|\/api\/final-answer|finalAnswerSchema|FINAL_ANSWER_PROMPT|FINAL_CHECK/);
+  assert.match(appSource, /async function handleHandwritingAnswerVerification/);
+  assert.match(appSource, /handleHandwritingAnswerVerification\(state\.latestHandwritingResult\)/);
+  assert.match(serverSource, /answerVerificationStatus/);
+  assert.match(serverSource, /applyHandwritingAnswerVerification\(result, answerKey\)/);
 });
 
 test("uses parallel model racing for guide requests", () => {
@@ -333,7 +307,6 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(appSource, /answerVerificationStatus === "correct"/);
   assert.match(appSource, /saveCurrentQuestionAndContinue\(\{ feedback/);
   assert.match(appSource, /queueModelDecisionBeforeFinalCheck/);
-  assert.match(appSource, /useLegacyFinalCheck !== true/);
   assert.match(serverSource, /answerVerificationStatus/);
   assert.match(serverSource, /privateAnswerReference\(answerKey\)/);
   assert.match(serverSource, /latestStudentSpeech/);
@@ -343,7 +316,7 @@ test("handwriting verification decides guide versus save from the same board req
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const gateSource = appSource.slice(
     appSource.indexOf("function extractHandwritingFinalAnswerCandidate"),
-    appSource.indexOf("async function maybeVerifyFinalAnswerFromHandwriting")
+    appSource.indexOf("function normalizeBoardMathText")
   );
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const promptSource = serverSource.slice(
@@ -363,7 +336,7 @@ test("handwriting verification decides guide versus save from the same board req
     const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
     const gateSource = appSource.slice(
       appSource.indexOf("function getVisibleHandwritingEvidence"),
-      appSource.indexOf("async function maybeVerifyFinalAnswerFromHandwriting")
+      appSource.indexOf("function normalizeBoardMathText")
     );
     const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
     const promptSource = serverSource.slice(

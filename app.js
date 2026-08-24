@@ -279,17 +279,11 @@ const state = {
   waitingForBoardBeforeFinalAnswer: false,
   finalAnswerVerified: false,
   verifiedFinalAnswerText: "",
-  finalAnswerVerificationUnavailableQuestionId: "",
-  finalAnswerVerificationUnavailableAnswer: "",
-  finalAnswerVerificationUnavailableAt: 0,
   boardVerificationUnavailableQuestionId: "",
   boardVerificationUnavailableAt: 0,
   boardCompletionVerified: false,
   completionCheckInProgress: false,
   autoSavePromptedQuestionId: "",
-  finalAnswerRequestId: 0,
-  finalAnswerAbortController: null,
-  finalAnswerActiveRequest: null,
   questionMemoryStatusByQuestion: {},
   questionMemoriesByQuestion: {},
   questionMemoryFetchPromises: {},
@@ -426,10 +420,6 @@ function pauseTeachSessionForNavigation() {
   state.handwritingRequestInFlight = false;
   state.handwritingQueuedReason = "";
   state.handwritingQueuedMeta = null;
-  state.finalAnswerRequestId += 1;
-  state.finalAnswerVerificationUnavailableQuestionId = "";
-  state.finalAnswerVerificationUnavailableAnswer = "";
-  state.finalAnswerVerificationUnavailableAt = 0;
   state.boardVerificationUnavailableQuestionId = "";
   state.boardVerificationUnavailableAt = 0;
 
@@ -827,10 +817,6 @@ function markUserInput(type) {
   state.guideUnavailableUntil = 0;
   state.lianSpeechRequestId += 1;
   state.openingSpeechInProgress = false;
-  state.finalAnswerRequestId += 1;
-  state.finalAnswerAbortController?.abort(`new-student-${type}`);
-  state.finalAnswerAbortController = null;
-  state.finalAnswerActiveRequest = null;
   stopLianSpeechOutput();
   if (type === "speech") {
     state.lastSpeechAt = now;
@@ -2522,10 +2508,6 @@ function startLecture(queue) {
   state.verifiedFinalAnswerText = "";
   state.boardCompletionVerified = false;
   state.completionCheckInProgress = false;
-  state.finalAnswerRequestId = 0;
-  state.finalAnswerVerificationUnavailableQuestionId = "";
-  state.finalAnswerVerificationUnavailableAnswer = "";
-  state.finalAnswerVerificationUnavailableAt = 0;
   state.boardVerificationUnavailableQuestionId = "";
   state.boardVerificationUnavailableAt = 0;
   state.currentQuestionCompleted = false;
@@ -3340,10 +3322,6 @@ function resetQuestionGuideState(options = {}) {
   state.boardCompletionVerified = false;
   state.completionCheckInProgress = false;
   state.autoSavePromptedQuestionId = "";
-  state.finalAnswerRequestId += 1;
-  state.finalAnswerVerificationUnavailableQuestionId = "";
-  state.finalAnswerVerificationUnavailableAnswer = "";
-  state.finalAnswerVerificationUnavailableAt = 0;
   state.silenceGuidePending = false;
   state.openingSpeechInProgress = options.speak !== false;
   state.latestHandwritingResult = null;
@@ -4211,25 +4189,6 @@ function extractHandwritingFinalAnswerCandidate(result) {
   return "";
 }
 
-function shouldVerifyHandwritingFinalAnswer(result) {
-  const modelAction = String(result?.nextAction || "").trim();
-  if (modelAction === "continue_guidance" || modelAction === "ask_for_board") return false;
-  if (modelAction === "verify_answer" || modelAction === "finished") {
-    const candidate = String(result?.finalAnswer || "").normalize("NFKC").trim();
-    if (!candidate) return false;
-    console.log("[handwriting] model-selected-final-answer", {
-      nextAction: modelAction,
-      finalAnswer: candidate,
-      completedSteps: result?.completedSteps || []
-    });
-    return isModelBoardReadyForFinalCheck(result);
-  }
-
-  // No structured action means the response is incomplete. Do not infer a
-  // final answer from a multi-line board in the frontend.
-  return false;
-}
-
 async function handleHandwritingAnswerVerification(result) {
   const question = currentPageQuestion();
   const status = String(result?.answerVerificationStatus || "").trim();
@@ -4269,28 +4228,6 @@ async function handleHandwritingAnswerVerification(result) {
     dedupeKey: `handwriting-answer-wrong:${question.id}:${answer}`,
     cooldownMs: 0,
     allowRepeat: true
-  });
-  return true;
-}
-
-async function maybeVerifyFinalAnswerFromHandwriting(result) {
-  if (!shouldVerifyHandwritingFinalAnswer(result)) return false;
-  const question = currentPageQuestion();
-  if (!question || state.currentQuestionCompleted || state.completionCheckInProgress) return false;
-  if (hasStudentInputSinceHandwritingRecognition()) return false;
-
-  const answer = extractHandwritingFinalAnswerCandidate(result);
-  await lianSpeak("我来核对答案。", {
-    dedupeKey: `handwriting-final-answer-check:${question.id}:${answer}`,
-    cooldownMs: 0,
-    allowRepeat: true
-  });
-
-  if (hasStudentInputSinceHandwritingRecognition()) return false;
-  await handleFinalAnswerSubmission(answer, {
-    source: "handwriting",
-    boardAlreadyVerified: isModelBoardReadyForFinalCheck(result),
-    silentLog: true
   });
   return true;
 }
@@ -7372,315 +7309,23 @@ function askForFinalAnswer() {
   );
 }
 
-async function requestFinalAnswerCheck(answer, options = {}) {
-  const question = currentPageQuestion();
-  if (!question) throw new Error("没有当前题目");
-  saveCurrentPage();
-  // Question Memory is created when the question is entered. The final check
-  // may happen before that request has settled, so wait for that existing
-  // request instead of sending null and receiving ANSWER_KEY_NOT_READY.
-  const questionMemory = await waitForEnteredQuestionMemory(question);
-  const requestId = options.requestId || `final-answer:${question.id || "question"}:${Date.now()}`;
-  const traceId = options.traceId || `final-check:${question.id || "question"}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-  const requestBoardVersion = Number(options.boardVersion ?? getBoardVersion(question));
-  console.info(`[FINAL_CHECK][${traceId}] 01_TRIGGERED`, {
-    traceId,
-    requestId,
-    questionId: question.id || "",
-    boardVersion: requestBoardVersion
-  });
-  console.info(`[FINAL_CHECK][${traceId}] 02_INPUT_READY`, {
-    traceId,
-    requestId,
-    answerLength: String(answer || "").trim().length,
-    hasQuestionMemory: Boolean(questionMemory?.ready),
-    questionMemoryStatus: questionMemory?.status || "missing"
-  });
-  console.info(`[FINAL_CHECK][${traceId}] 03_REQUEST_SENT`, { traceId, requestId });
-  const response = await fetch("/api/final-answer", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Lian-Request-Id": requestId,
-      "X-Lian-Trace-Id": traceId
-    },
-    signal: options.signal,
-    body: JSON.stringify({
-      questionImage: question.image,
-      boardImage: getBoardImageForGuide(),
-      questionId: question.id || "",
-      boardVersion: requestBoardVersion,
-      memoryId: questionMemory?.memoryId || state.questionMemoryIdsByQuestion[question.id] || "",
-      questionMemory,
-      answer,
-      lectureText: dom.transcriptInput.value.trim(),
-      latestHandwritingResult: state.latestHandwritingResult,
-      problemText: question.problemText || ""
-    })
-  });
-  console.info(`[FINAL_CHECK][${traceId}] 11_CLIENT_RESPONSE_RECEIVED`, {
-    traceId,
-    requestId,
-    status: response.status,
-    ok: response.ok,
-    headers: Object.fromEntries(response.headers.entries())
-  });
-  const rawResponse = await response.text();
-  let result = {};
-  if (rawResponse.trim()) {
-    try {
-      result = JSON.parse(rawResponse);
-    } catch (parseError) {
-      const error = new Error("核对服务返回了无法解析的结果");
-      error.code = "INVALID_JSON";
-      error.parseError = parseError.message;
-      error.rawResponse = rawResponse.slice(0, 1200);
-      error.status = response.status;
-      error.requestId = requestId;
-      error.traceId = traceId;
-      error.errorType = "INVALID_JSON";
-      console.error(`[FINAL_CHECK][${traceId}] FAILED_AT=JSON_PARSE`, {
-        traceId,
-        requestId,
-        status: response.status,
-        parseError: parseError.message
-      });
-      throw error;
-    }
-  } else {
-    const error = new Error("核对服务返回为空");
-    error.code = "EMPTY_RESPONSE";
-    error.status = response.status;
-    error.requestId = requestId;
-    error.traceId = traceId;
-    error.errorType = "EMPTY_RESPONSE";
-    throw error;
-  }
-  if (!response.ok || result.ok === false || result.serviceUnavailable === true || String(result.verificationStatus || "").startsWith("service-unavailable:")) {
-    const error = new Error(result.message || result.error || "最后答案核对失败");
-    error.code = result.code || (response.status >= 500 ? "upstream_5xx" : `http_${response.status}`);
-    error.status = response.status;
-    error.stage = result.stage || "UNKNOWN";
-    error.errorType = result.errorType || "MODEL_ERROR";
-    error.retryable = result.retryable === true || response.status >= 500 || response.status === 429;
-    error.requestId = result.requestId || requestId;
-    error.traceId = result.traceId || traceId;
-    error.modelCallCount = Number(result.modelCallCount || 0);
-    console.error(`[FINAL_CHECK][${error.traceId}] FAILED_AT=${error.stage}`, {
-      traceId: error.traceId,
-      requestId: error.requestId,
-      status: response.status,
-      errorType: error.errorType,
-      modelCallCount: error.modelCallCount
-    });
-    throw error;
-  }
-  console.info(`[FINAL_CHECK][${traceId}] 12_RESPONSE_READY`, {
-    traceId,
-    requestId,
-    modelCallCount: Number(result.modelCallCount || 0)
-  });
-  result.traceId = result.traceId || traceId;
-  return result;
-}
-
-function isFinalAnswerCheckRetryable(error) {
-  if (!error || error.code === "qwen_timeout") return false;
-  return Boolean(
-    error.retryable === true ||
-      error.code === "network_error" ||
-      error.code === "rate_limited" ||
-      error.code === "http_408" ||
-      error.code === "http_429" ||
-      Number(error.status) >= 500
-  );
-}
-
-async function requestFinalAnswerCheckWithRetry(answer, options = {}) {
-  // One explicit save action equals one verification request. Automatic
-  // retries made a slow or exhausted provider look like an endless loop and
-  // blocked the only path to saving the student's work.
-  return requestFinalAnswerCheck(answer, options);
-}
-
 async function handleFinalAnswerSubmission(answer, options = {}) {
   const question = currentPageQuestion();
   const normalizedAnswer = String(answer || "").trim();
   if (!question || !normalizedAnswer) return;
 
-  // Board recognition is now the single verification route. The multimodal
-  // handwriting request receives the full board snapshot and the trusted
-  // answer reference, then decides whether to guide or verify. Keep the old
-  // final-answer endpoint only as an explicit compatibility escape hatch.
-  if (options.useLegacyFinalCheck !== true) {
-    if (
-      state.latestHandwritingResult &&
-      hasCurrentRecognizedBoardStep(question) &&
-      await handleHandwritingAnswerVerification(state.latestHandwritingResult)
-    ) {
-      return;
-    }
-    queueModelDecisionBeforeFinalCheck(normalizedAnswer, options.source || "答案核验");
+  // The current blackboard recognition request is the only verification route.
+  // It receives the full board snapshot and trusted answer reference, then
+  // decides whether to guide the student or allow saving.
+  if (
+    state.latestHandwritingResult &&
+    hasCurrentRecognizedBoardStep(question) &&
+    await handleHandwritingAnswerVerification(state.latestHandwritingResult)
+  ) {
     return;
   }
 
-  // The handwriting model must decide that the board contains a relevant
-  // key step before the answer-check model is called. This keeps the two
-  // model responsibilities separate and prevents answer checking from
-  // silently bypassing board progress detection.
-  if (!options.boardAlreadyVerified && !hasCurrentRecognizedBoardStep(question)) {
-    queueModelDecisionBeforeFinalCheck(normalizedAnswer, options.source || "答案核验");
-    return;
-  }
-  options = { ...options, boardAlreadyVerified: true };
-
-  state.finalAnswerAbortController?.abort("superseded-final-answer");
-  const requestId = ++state.finalAnswerRequestId;
-  const requestBoardVersion = getBoardVersion(question);
-  const requestMeta = {
-    requestId,
-    traceId: `final-check:${question.id || "question"}:${requestId}:${Math.random().toString(36).slice(2, 8)}`,
-    questionId: question.id || "",
-    boardVersion: requestBoardVersion,
-    answer: normalizedAnswer,
-    timestamp: Date.now()
-  };
-  const requestController = new AbortController();
-  state.finalAnswerAbortController = requestController;
-  state.finalAnswerActiveRequest = requestMeta;
-  state.awaitingFinalAnswer = false;
-  state.pendingFinalAnswerText = normalizedAnswer;
-  state.finalAnswerVerified = false;
-  state.verifiedFinalAnswerText = "";
-  state.boardCompletionVerified = false;
-  state.currentQuestionCompleted = false;
-  dom.finishQuestionBtn.disabled = true;
-  dom.recognitionPill.textContent = "正在核对最后答案";
-  dom.recognitionPill.classList.remove("hidden");
-  if (!options.silentLog) addLog("我", normalizedAnswer);
-  console.info(`[FINAL_CHECK][${requestMeta.traceId}] 01_TRIGGERED`, requestMeta);
-
-  try {
-    const result = await requestFinalAnswerCheckWithRetry(normalizedAnswer, {
-      requestId: `final-answer:${question.id || "question"}:${requestId}`,
-      traceId: requestMeta.traceId,
-      boardVersion: requestBoardVersion,
-      signal: requestController.signal
-    });
-    if (!isCurrentFinalAnswerRequest(requestMeta)) {
-      console.info(`[FINAL_CHECK][${requestMeta.traceId}] FAILED_AT=STALE_RESPONSE`, requestMeta);
-      return;
-    }
-    console.info(`[FINAL_CHECK][${requestMeta.traceId}] 12_UI_UPDATED`, {
-      traceId: requestMeta.traceId,
-      requestId: requestMeta.requestId,
-      modelCallCount: Number(result.modelCallCount || 0)
-    });
-
-    if (result.correct) {
-      state.finalAnswerVerified = true;
-      state.verifiedFinalAnswerText = normalizedAnswer;
-      state.awaitingFinalAnswer = false;
-      state.pendingFinalAnswerText = "";
-      state.boardCompletionVerified = Boolean(options.boardAlreadyVerified);
-      state.currentQuestionCompleted = false;
-      dom.finishQuestionBtn.disabled = false;
-      setGuideState(GUIDE_STATES.INTERACTIVE);
-      const feedback = String(result.feedback || "").trim();
-      if (state.boardCompletionVerified) {
-        if (markCurrentQuestionComplete()) {
-          await lianSpeak(feedback || "答案和板书都核对好了。", {
-            dedupeKey: `final-answer-board-correct:${question.id}:${normalizedAnswer}`,
-            cooldownMs: 0,
-            allowRepeat: true
-          });
-          await saveCurrentQuestionAndContinue({ feedback });
-        }
-        return;
-      }
-      // boardAlreadyVerified is guaranteed by the gate above. The only
-      // successful terminal path is therefore: final check correct -> save
-      // prompt. No second board-check request and no guide loop.
-      if (!state.boardCompletionVerified) {
-        throw new Error("board_progress_decision_missing");
-      }
-      if (markCurrentQuestionComplete()) {
-        await lianSpeak(feedback || "答案和关键步骤都核对正确了。", {
-          dedupeKey: `final-answer-board-correct:${question.id}:${normalizedAnswer}`,
-          cooldownMs: 0,
-          allowRepeat: true
-        });
-        await saveCurrentQuestionAndContinue({ feedback });
-      }
-      return;
-    }
-
-    state.finalAnswerVerified = false;
-    state.verifiedFinalAnswerText = "";
-    state.boardCompletionVerified = false;
-    state.awaitingFinalAnswer = true;
-    state.pendingFinalAnswerText = "";
-    dom.finishQuestionBtn.disabled = false;
-    setGuideState(GUIDE_STATES.INTERACTIVE);
-    await lianSpeak(
-      result.hint ||
-        pickPrompt("final-answer-check", [
-          "这个答案和题目条件没有对上。请检查最后一步的运算、符号或单位。",
-          "最后结果不正确。把它代回题目条件，会发现等式不能成立。",
-          "这个答案还不能通过核验。请重新检查得到它的那一步计算。"
-        ])
-    );
-  } catch (error) {
-    console.warn("Final answer check fallback:", error);
-    if (!isCurrentFinalAnswerRequest(requestMeta)) {
-      console.info(`[FINAL_CHECK][${requestMeta.traceId}] FAILED_AT=STALE_RESPONSE`, {
-        ...requestMeta,
-        code: error?.code || "unknown"
-      });
-      return;
-    }
-    console.error(`[FINAL_CHECK][${requestMeta.traceId}] FAILED_AT=${error?.stage || "CLIENT_RESPONSE"}`, {
-      ...requestMeta,
-      errorType: error?.errorType || error?.code || "CLIENT_RESPONSE_ERROR",
-      status: error?.status || 0,
-      modelCallCount: Number(error?.modelCallCount || 0),
-      message: error?.message || ""
-    });
-    state.awaitingFinalAnswer = true;
-    state.finalAnswerVerified = false;
-    state.verifiedFinalAnswerText = "";
-    state.boardCompletionVerified = false;
-    state.finalAnswerVerificationUnavailableQuestionId = "";
-    state.finalAnswerVerificationUnavailableAnswer = "";
-    state.finalAnswerVerificationUnavailableAt = 0;
-    dom.finishQuestionBtn.disabled = false;
-    dom.recognitionPill.classList.add("hidden");
-    // A failed check keeps the student's evidence but cannot open the save
-    // prompt. A later explicit click starts a fresh model decision/check.
-    state.pendingFinalAnswerText = normalizedAnswer;
-    const serviceFailureNotice = "这次核对没有完成，答案和板书已保留。核对成功后才能保存到错题本，请稍后再试。";
-    await lianSpeak(serviceFailureNotice, {
-      dedupeKey: `final-answer-service-failed:${question.id}:${normalizedAnswer}`,
-      cooldownMs: 60000
-    });
-  } finally {
-    if (state.finalAnswerActiveRequest === requestMeta) {
-      state.finalAnswerActiveRequest = null;
-      state.finalAnswerAbortController = null;
-    }
-    setTimeout(() => dom.recognitionPill.classList.add("hidden"), 1200);
-  }
-}
-
-function isCurrentFinalAnswerRequest(requestMeta) {
-  const question = currentPageQuestion();
-  return Boolean(
-    requestMeta &&
-    state.finalAnswerActiveRequest?.requestId === requestMeta.requestId &&
-    state.finalAnswerRequestId === requestMeta.requestId &&
-    question?.id === requestMeta.questionId &&
-    getBoardVersion(question) === requestMeta.boardVersion
-  );
+  queueModelDecisionBeforeFinalCheck(normalizedAnswer, options.source || "答案核验");
 }
 
 function getAnswerCandidateForSave(question) {
@@ -7688,9 +7333,6 @@ function getAnswerCandidateForSave(question) {
     state.pendingFinalAnswerText || extractFinalAnswerCandidate(dom.transcriptInput.value)
   ).trim();
   if (directAnswer) return directAnswer;
-  if (state.finalAnswerVerificationUnavailableQuestionId === question?.id) {
-    return String(state.finalAnswerVerificationUnavailableAnswer || "").trim();
-  }
   if (state.finalAnswerVerified && state.verifiedFinalAnswerText) {
     return String(state.verifiedFinalAnswerText).trim();
   }
@@ -7783,9 +7425,6 @@ async function saveCurrentQuestionAndContinue(options = {}) {
 
   state.finalAnswerVerified = false;
   state.verifiedFinalAnswerText = "";
-  state.finalAnswerVerificationUnavailableQuestionId = "";
-  state.finalAnswerVerificationUnavailableAnswer = "";
-  state.finalAnswerVerificationUnavailableAt = 0;
   state.boardCompletionVerified = false;
   state.currentQuestionCompleted = false;
   dom.finishQuestionBtn.disabled = true;
@@ -7863,8 +7502,8 @@ dom.finishQuestionBtn.addEventListener("click", () => {
     return;
   }
   const pendingAnswer = getAnswerCandidateForSave(currentPageQuestion());
-  // A pending answer must pass through the model board-progress decision and
-  // the final-answer check. The button never creates an unverified record.
+  // A pending answer must pass through the current board recognition decision.
+  // The button never creates an unverified record.
   if (pendingAnswer) {
     void handleFinalAnswerSubmission(pendingAnswer, {
       silentLog: true,
