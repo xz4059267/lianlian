@@ -171,6 +171,11 @@ const LIAN_VOICE_VOLUME = 0.82;
 const GUIDE_IMAGE_MAX_SIDE = 1400;
 const GUIDE_BOARD_MAX_SIDE = 1100;
 const GUIDE_IMAGE_JPEG_QUALITY = 0.76;
+// Handwriting recognition receives the visual blackboard itself. Keep enough
+// pixels for handwritten symbols; only downsize when the board is larger than
+// the multimodal request budget.
+const HANDWRITING_IMAGE_MAX_SIDE = 1400;
+const HANDWRITING_IMAGE_JPEG_QUALITY = 0.9;
 const GUIDE_IMAGE_CACHE_LIMIT = 6;
 const guideImageCache = new Map();
 const ACTIVE_HELP_PATTERN = /为什么|不懂|求助|不会|不会做|没思路|不知道|卡住|讲一下|提示一下|怎么(?:来|来的|求|算|做|解|得到|列|消元|化简)|如何(?:求|算|做|解|得到|列|消元|化简)|该(?:怎么|如何)|能不能(?:提示|讲|告诉)|可以怎么/;
@@ -3806,7 +3811,12 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     error.stage = "request-identity";
     throw error;
   }
-  const boardOnlyImage = await createCurrentBoardOnlySnapshot();
+  // Freeze the visible blackboard as one image. It contains the question image
+  // and the student's original strokes; no client OCR or thresholding is used.
+  const boardImage = await createCurrentBoardSnapshot({
+    maxSide: HANDWRITING_IMAGE_MAX_SIDE,
+    quality: HANDWRITING_IMAGE_JPEG_QUALITY
+  });
   const boardIdleSeconds = Math.max(0, Math.round((Date.now() - (state.lastBoardWriteAt || Date.now())) / 1000));
   const diagnostics = {
     requestId,
@@ -3817,8 +3827,7 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     reason: String(reason || ""),
     canvasWidth: Number(dom.canvas.width || 0),
     canvasHeight: Number(dom.canvas.height || 0),
-    boardOnlyBytes: String(boardOnlyImage || "").length,
-    boardImageBytes: 0,
+    boardImageBytes: String(boardImage || "").length,
     capturedAt: new Date().toISOString()
   };
   console.log("[handwriting] request snapshot", diagnostics);
@@ -3835,7 +3844,7 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
         requestId,
         memoryId: requestMeta.memoryId,
         questionMemory,
-        boardOnlyImage,
+        boardImage,
         reason,
         boardIdleSeconds,
         handwritingDiagnostics: diagnostics
@@ -3905,72 +3914,20 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
   return result;
 }
 
-async function createCurrentBoardSnapshot() {
+async function createCurrentBoardSnapshot(options = {}) {
   const question = currentPageQuestion();
   if (!question) return getBoardImageForGuide();
   saveCurrentPage();
   const pages = pagesForQuestion(question.id);
-  return composeBoardSnapshot(pages[0] || getBoardImageForGuide(), question.image, getSnapshotImageState(question.id));
-}
-
-async function createCurrentBoardOnlySnapshot() {
-  const question = currentPageQuestion();
-  if (!question) return getBoardImageForGuide();
-  saveCurrentPage();
-  const pages = pagesForQuestion(question.id);
-  return composeStrokeOcrSnapshot(pages[0] || getBoardImageForGuide());
-}
-
-async function composeStrokeOcrSnapshot(strokesDataUrl) {
-  if (!strokesDataUrl) return "";
-  const strokes = await loadImage(strokesDataUrl);
-  if (!strokes.naturalWidth || !strokes.naturalHeight) {
-    const error = new Error("板书快照尺寸无效");
-    error.code = "invalid_board_snapshot";
-    throw error;
-  }
-  // Keep the handwriting payload readable while avoiding a large PNG upload.
-  const maxWidth = 1024;
-  const scale = Math.min(1, maxWidth / strokes.naturalWidth);
-  const width = Math.max(1, Math.round(strokes.naturalWidth * scale));
-  const height = Math.max(1, Math.round(strokes.naturalHeight * scale));
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ocrCtx = canvas.getContext("2d");
-  ocrCtx.fillStyle = "#ffffff";
-  ocrCtx.fillRect(0, 0, width, height);
-
-  const tempCanvas = document.createElement("canvas");
-  tempCanvas.width = width;
-  tempCanvas.height = height;
-  const tempCtx = tempCanvas.getContext("2d");
-  tempCtx.clearRect(0, 0, width, height);
-  tempCtx.drawImage(strokes, 0, 0, width, height);
-  const imageData = tempCtx.getImageData(0, 0, width, height);
-  const data = imageData.data;
-  for (let index = 0; index < data.length; index += 4) {
-    const alpha = data[index + 3];
-    if (alpha > 12) {
-      data[index] = 18;
-      data[index + 1] = 26;
-      data[index + 2] = 24;
-      data[index + 3] = 255;
-    } else {
-      data[index] = 255;
-      data[index + 1] = 255;
-      data[index + 2] = 255;
-      data[index + 3] = 255;
-    }
-  }
-  ocrCtx.putImageData(imageData, 0, 0);
-  const dataUrl = canvas.toDataURL("image/jpeg", 0.84);
-  if (!dataUrl || dataUrl.length < 100) {
-    const error = new Error("板书快照生成失败");
-    error.code = "invalid_board_snapshot";
-    throw error;
-  }
-  return dataUrl;
+  const snapshot = await composeBoardSnapshot(
+    pages[0] || getBoardImageForGuide(),
+    question.image,
+    getSnapshotImageState(question.id)
+  );
+  return prepareGuideImage(snapshot, {
+    maxSide: options.maxSide || HANDWRITING_IMAGE_MAX_SIDE,
+    quality: options.quality || HANDWRITING_IMAGE_JPEG_QUALITY
+  });
 }
 
 function isIncompleteHandwritingIssue(result) {
@@ -6390,13 +6347,6 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
         return !givenConditions.some((condition) => normalizedStep === condition || normalizedStep.includes(condition) || condition.includes(normalizedStep));
       })
     : [];
-  const completedStepCount = Array.isArray(state.latestHandwritingResult?.completedSteps)
-    ? state.latestHandwritingResult.completedSteps.length
-    : 0;
-  // Never fall back to the first standard step after the student has already
-  // supplied board evidence. The server recomputes the next unresolved step
-  // from the latest board/speech snapshot.
-  const trustedContextStep = trustedSteps[completedStepCount] || "";
   const trustedProblemText = memory?.ready && memory.problemText
     ? memory.problemText
     : question.problemText || "";
@@ -6428,12 +6378,12 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
   });
   let response;
   try {
-    const rawQuestionImage = question.image;
-    const rawBoardImage = getBoardImageForGuide();
-    const [questionImage, boardImage] = await Promise.all([
-      prepareGuideImage(rawQuestionImage, { maxSide: GUIDE_IMAGE_MAX_SIDE }),
-      prepareGuideImage(rawBoardImage, { maxSide: GUIDE_BOARD_MAX_SIDE, quality: 0.78 })
-    ]);
+    // Give the guide the same frozen visual state as handwriting recognition:
+    // one current blackboard image containing the question and raw strokes.
+    const boardImage = await createCurrentBoardSnapshot({
+      maxSide: GUIDE_IMAGE_MAX_SIDE,
+      quality: GUIDE_IMAGE_JPEG_QUALITY
+    });
     if (!markGuideRequestActive()) {
       const staleError = new Error("stale guide request");
       staleError.name = "AbortError";
@@ -6444,9 +6394,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       questionId: question.id || "",
       requestId: guideRequestId,
       sessionId: guideSessionId,
-      questionImageChars: questionImage.length,
+      questionImageChars: 0,
       boardImageChars: boardImage.length,
-      totalImageChars: questionImage.length + boardImage.length
+      totalImageChars: boardImage.length
     });
     while (true) {
       requestAttempt += 1;
@@ -6455,7 +6405,6 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-      questionImage,
       questionId: question.id,
       requestId: guideRequestId,
       sessionId: guideSessionId,
@@ -6469,11 +6418,12 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       knowledgePoints: question.knowledgePoints || [],
       boardImage,
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
-      latestHandwritingResult: state.latestHandwritingResult || null,
       askedConcepts: state.askedConceptsByQuestion[question.id] || [],
       resolvedConcepts: state.resolvedConceptsByQuestion[question.id] || [],
       previousGuideQuestion: state.pendingLianQuestion?.text || "",
-      silenceContextStep: /silence/.test(eventType) ? (trustedContextStep || getSilenceContextStep()) : "",
+      // The server/model reads progress from the current blackboard image;
+      // never send a step reconstructed from an older handwriting result.
+      silenceContextStep: "",
       verifiedGuideSteps: trustedSteps,
       // Reuse the frozen Question Memory created when this question was
       // entered. The guide endpoint must not solve the same image again just
@@ -8188,8 +8138,12 @@ function getSnapshotImageState(questionId) {
 }
 
 async function composeBoardSnapshot(strokesDataUrl, questionImageUrl, imageState = null) {
-  const width = 1280;
-  const height = 720;
+  const strokes = strokesDataUrl ? await loadImage(strokesDataUrl) : null;
+  const boardRect = dom.blackboard.getBoundingClientRect();
+  const boardCssWidth = imageState?.boardWidth || dom.blackboard.clientWidth || boardRect.width || 1280;
+  const boardCssHeight = imageState?.boardHeight || dom.blackboard.clientHeight || boardRect.height || 720;
+  const width = Math.max(1, strokes?.naturalWidth || Math.round(boardCssWidth * (window.devicePixelRatio || 1)) || 1280);
+  const height = Math.max(1, strokes?.naturalHeight || Math.round(boardCssHeight * (window.devicePixelRatio || 1)) || 720);
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -8198,13 +8152,15 @@ async function composeBoardSnapshot(strokesDataUrl, questionImageUrl, imageState
   snapshot.fillRect(0, 0, width, height);
   snapshot.strokeStyle = "rgba(248,242,216,0.08)";
   snapshot.lineWidth = 1;
-  for (let x = 0; x < width; x += 54) {
+  const scaleX = width / boardCssWidth;
+  const scaleY = height / boardCssHeight;
+  for (let x = 0; x < width; x += Math.max(1, Math.round(54 * scaleX))) {
     snapshot.beginPath();
     snapshot.moveTo(x, 0);
     snapshot.lineTo(x, height);
     snapshot.stroke();
   }
-  for (let y = 0; y < height; y += 54) {
+  for (let y = 0; y < height; y += Math.max(1, Math.round(54 * scaleY))) {
     snapshot.beginPath();
     snapshot.moveTo(0, y);
     snapshot.lineTo(width, y);
@@ -8213,23 +8169,16 @@ async function composeBoardSnapshot(strokesDataUrl, questionImageUrl, imageState
 
   if (questionImageUrl) {
     const questionImage = await loadImage(questionImageUrl);
-    const boardWidth = imageState?.boardWidth || width;
-    const boardHeight = imageState?.boardHeight || height;
-    const scaleX = width / boardWidth;
-    const scaleY = height / boardHeight;
-    const drawX = imageState ? imageState.x * scaleX : 43;
-    const drawY = imageState ? imageState.y * scaleY : 43;
-    const drawW = imageState ? imageState.baseWidth * imageState.scale * scaleX : 420;
-    const drawH = imageState ? imageState.baseHeight * imageState.scale * scaleY : 240;
+    const drawX = imageState ? imageState.x * scaleX : 43 * scaleX;
+    const drawY = imageState ? imageState.y * scaleY : 43 * scaleY;
+    const drawW = imageState ? imageState.baseWidth * imageState.scale * scaleX : 420 * scaleX;
+    const drawH = imageState ? imageState.baseHeight * imageState.scale * scaleY : 240 * scaleY;
     snapshot.fillStyle = "#fff";
     snapshot.fillRect(drawX - 9, drawY - 9, drawW + 18, drawH + 18);
     snapshot.drawImage(questionImage, drawX, drawY, drawW, drawH);
   }
 
-  if (strokesDataUrl) {
-    const strokes = await loadImage(strokesDataUrl);
-    snapshot.drawImage(strokes, 0, 0, width, height);
-  }
+  if (strokes) snapshot.drawImage(strokes, 0, 0, width, height);
 
   return canvas.toDataURL("image/jpeg", 0.9);
 }

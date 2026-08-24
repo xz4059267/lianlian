@@ -254,7 +254,7 @@ test("fails closed when handwriting has no matching Question Memory", () => {
   );
 });
 
-test("handwriting consumes Question Memory without acquiring an answer key", () => {
+test("handwriting sends the current blackboard image without client OCR", () => {
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const handlerSource = serverSource.slice(
     serverSource.indexOf("async function handleHandwriting"),
@@ -269,6 +269,10 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
     appSource.indexOf("async function requestHandwritingAnalysis"),
     appSource.indexOf("async function createCurrentBoardSnapshot")
   );
+  const snapshotSource = appSource.slice(
+    appSource.indexOf("async function createCurrentBoardSnapshot"),
+    appSource.indexOf("function isIncompleteHandwritingIssue")
+  );
   const appHandwritingRun = appSource.slice(
     appSource.indexOf("async function runHandwritingRecognition"),
     appSource.indexOf("async function requestHandwritingAnalysis")
@@ -276,15 +280,44 @@ test("handwriting consumes Question Memory without acquiring an answer key", () 
 
   assert.match(handlerSource, /questionMemoryToAnswerKey\(body\.questionMemory/);
   assert.doesNotMatch(handlerSource, /getVerifiedAnswerKey\(/);
-  assert.doesNotMatch(handlerSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|包含题目区域|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
-  assert.doesNotMatch(auditSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|包含题目区域|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
+  assert.doesNotMatch(handlerSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
+  assert.doesNotMatch(auditSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
+  assert.match(handlerSource, /body\.boardImage/);
+  assert.match(handlerSource, /当前黑板区域截图/);
+  assert.doesNotMatch(handlerSource, /privateQuestionMemoryReference\(answerKey\)/);
+  assert.doesNotMatch(auditSource, /privateQuestionMemoryReference\(answerKey\)|initialHandwritingResult/);
   assert.match(appSource, /fetch\("\/api\/question-memory"/);
   assert.doesNotMatch(appSource, /fetch\("\/api\/answer-key"/);
   assert.match(appSource, /questionMemory,/);
-  assert.doesNotMatch(appHandwritingRequest, /questionImage:|problemText:|knowledgePoints:|boardImage:|createCurrentBoardSnapshot/);
+  assert.match(appHandwritingRequest, /boardImage/);
+  assert.match(appHandwritingRequest, /createCurrentBoardSnapshot/);
+  assert.doesNotMatch(appHandwritingRequest, /boardOnlyImage|createCurrentBoardOnlySnapshot|composeStrokeOcrSnapshot/);
+  assert.match(snapshotSource, /question\.image/);
+  assert.match(snapshotSource, /prepareGuideImage/);
+  assert.doesNotMatch(snapshotSource, /getImageData|putImageData|threshold|二值化/);
   assert.match(appHandwritingRun, /maybeVerifyFinalAnswerFromHandwriting\(result\)/);
   assert.match(appHandwritingRun, /finalAnswerCandidate/);
   assert.doesNotMatch(appHandwritingRun, /getVerifiedAnswerKey\(|fetch\("\/api\/answer-key"/);
+});
+
+test("guide receives one current blackboard image and ignores legacy handwriting text", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const guideRequest = appSource.slice(
+    appSource.indexOf("async function requestAIGuide"),
+    appSource.indexOf("function shouldCompleteCurrentLecture")
+  );
+  const guideHandler = serverSource.slice(
+    serverSource.indexOf("async function handleGuide"),
+    serverSource.indexOf("async function handleHandwriting")
+  );
+  assert.match(guideRequest, /createCurrentBoardSnapshot/);
+  assert.match(guideRequest, /boardImage/);
+  assert.doesNotMatch(guideRequest, /questionImage,|latestHandwritingResult:/);
+  assert.match(guideHandler, /currentBoardImage/);
+  assert.match(guideHandler, /当前黑板区域截图/);
+  assert.match(guideHandler, /latestHandwritingResult: null/);
+  assert.doesNotMatch(guideHandler, /latestHandwritingResult: body\.latestHandwritingResult/);
 });
 
   test("does not treat a reviewable intermediate equation as a final answer", () => {
@@ -427,7 +460,7 @@ test("keeps independent handwriting attempts distinguishable", () => {
     reason: "停笔后识别",
     canvasWidth: 800,
     canvasHeight: 600,
-    boardOnlyBytes: 1200
+    boardImageBytes: 1200
   });
   const second = summarizeHandwritingDiagnostics({
     requestId: 12,
@@ -436,13 +469,13 @@ test("keeps independent handwriting attempts distinguishable", () => {
     reason: "继续写字后再次停笔",
     canvasWidth: 800,
     canvasHeight: 600,
-    boardOnlyBytes: 1800
+    boardImageBytes: 1800
   });
 
   assert.notEqual(first.requestId, second.requestId);
   assert.notEqual(first.boardVersion, second.boardVersion);
   assert.equal(first.questionId, second.questionId);
-  assert.ok(second.boardOnlyBytes > first.boardOnlyBytes);
+  assert.ok(second.boardImageBytes > first.boardImageBytes);
 });
 
 test("clips layout regions to OCR question-number intervals", () => {

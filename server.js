@@ -299,23 +299,23 @@ const LIAN_GUIDE_PROMPT = [
   "如果前端传入 lectureUnlocked=false，你只能输出 encourage 或 light 级别内容，不能输出 formula/worked_step/summary。",
   "如果前端传入 lectureUnlocked=true，默认只给一小步并把话交还给学生；但 silenceStage>=4 且学生持续沉默时，必须直接完成当前题的详细讲解，给出关键式和最终答案，并先自行检查计算。",
   "不要直接说“你错了”，要转成检查提醒或启发式问题。",
-  "必须以当前传入的题目图片和当前黑板截图为准；不要沿用上一道题的变量、答案、比例式或知识点。",
-  "如果当前题目图片和黑板里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
+  "必须以当前黑板区域截图（其中包含当前题目图片和学生原始笔迹）为准；不要沿用上一道题的变量、答案、比例式或知识点。",
+  "如果当前黑板区域截图里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
   "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
 ].join("\n");
 
-// The structured handwriting result is the freshest interpretation of the board.
+// The current blackboard screenshot is the freshest interpretation of the board.
 // Keep these rules separate from the long legacy prompt so they are easy to audit.
 const HANDWRITING_CONSISTENCY_RULES = [
-  "Use latestHandwritingResult as the freshest structured reading of the current board.",
-  "Never praise, correct, or extend an equation, variable, answer, or method that is not supported by the current question, current board image, latestHandwritingResult, or the student's latest speech.",
-  "If latestHandwritingResult.calculationStatus is wrong, guide from its guidance, issueSummary, or expectedNextStep. State the specific mismatch briefly and do not replace it with an unrelated old equation.",
-  "If latestHandwritingResult.calculationStatus is correct, do not interrupt solely to praise it. Only respond when another user event already requires a response, and ground that response in completedSteps.",
+  "Use the current blackboard screenshot as the freshest structured reading of the current board.",
+  "Never praise, correct, or extend an equation, variable, answer, or method that is not supported by the current blackboard screenshot or the student's latest speech.",
+  "Do not copy equations, variables, answers, or guidance from latestHandwritingResult or any older recognition result. If that legacy field is present, treat it as diagnostics only.",
+  "If the current screenshot clearly shows a wrong step, guide from the visible error location and evidence. If it clearly shows a correct step, do not interrupt solely to praise it.",
   "If calculationStatus is unclear or incomplete, avoid definitive claims and do not interrupt unless the student explicitly asks for help or is already in a stalled/silence event.",
-  "The board has higher priority than speech for mathematical judgment. When board evidence and speech conflict, use the latest board status to judge the written calculation; use speech only to understand the student's intended explanation.",
+  "The current screenshot has higher priority than speech for mathematical judgment; use speech only to understand the student's intended explanation.",
   "If hasBoardInk is false, speech alone is not evidence that any question's step or final answer is correct, including choice questions. Ask the student to write the key relation, option, or calculation on the board before checking it.",
   "If boardPendingRecognition is true, the board may have changed after the last recognition. Do not make a definitive judgment about the new strokes; ask the student to continue while recognition updates.",
-  "When the structured result and the generated guidance conflict, prefer a short uncertainty response over guessing."
+  "When the screenshot and generated guidance conflict, prefer a short uncertainty response over guessing."
 ].join("\n");
 
 const ORDERED_PROPORTION_RULES = [
@@ -470,14 +470,14 @@ const LECTURE_COMPLETION_RULES = [
 
 const HANDWRITING_PROMPT = [
   "你是初中数学黑板板书的异步观察器，只负责识别和分析学生当前写下的内容。",
-  "你只会看到纯板书截图；题目、正确答案、标准步骤和知识点只能读取输入中的 questionMemory，不得重新分析题目图片。",
+  "你会看到当前黑板区域的完整截图，截图同时包含当前题目图片和学生的原始笔迹。当前截图是唯一视觉事实来源；不要依赖 Question Memory、OCR 文字、前端整理文本或任何旧的板书识别结果。",
   "你的职责只有五项：忠实转写可见笔迹；判断当前书写状态；列出学生已经明确完成且在板书上可见的步骤；定位明确错误；在需要继续时给出贴着当前板书的具体引导。",
   "禁止重新解整道题、禁止生成新的完整答案、禁止根据学生零散板书反推出未写出的步骤或最终答案。",
-  "detectedWriting 和 mathExpression 必须忠实对应板书；completedSteps 只能包含板书上已经出现并可辨认的步骤，不能补齐 Question Memory 中但学生没写的内容。",
-  "判断某个可见步骤是否正确时，只能与 questionMemory 中的题意、答案、标准步骤和核验点比较。Question Memory 不足时返回 unclear，不能自行解题补足。",
+  "detectedWriting 和 mathExpression 必须忠实对应当前截图；completedSteps 只能包含截图中已经出现并可辨认的步骤，不能补齐学生没写的内容。",
+  "判断某个可见步骤是否正确时，先读取当前截图中的题目条件，再与学生当前笔迹比较；如果截图不清楚或无法可靠核算，返回 unclear，不能猜测。",
   "writingState=in_progress 表示学生显然还在写或只完成部分步骤；只有输入显示长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
-  "只有能指出具体 errorLocation，并能在 errorEvidence 中说明可见数字、符号、运算或结论与 Question Memory 的明确冲突时，才返回 calculationStatus=wrong。",
-  "可见步骤与 Question Memory 一致时返回 correct，但这只说明已经写出的步骤成立，不代表学生完成了整道题，也不得推断后续答案。",
+  "只有能指出具体 errorLocation，并能在 errorEvidence 中说明截图中可见数字、符号、运算或结论的明确冲突时，才返回 calculationStatus=wrong。",
+  "可见步骤与当前截图中的题意一致时返回 correct，但这只说明已经写出的步骤成立，不代表学生完成了整道题，也不得推断后续答案。",
   "writingState=complete 只有在当前截图明确出现最终结论、答案/结果/所以/解得等收束标记，或最后一行是独立且完整的最终答案时才允许；仅有 x-2y=m、m-n=8、代入式、过程式或一个正确关键步骤时，必须返回 in_progress 或 stalled。boardComplete=true 仅表示存在可核验关键步骤，绝不能作为最终答案信号。",
   "不要生成完整解题过程或替学生补写未出现的步骤。guidance 只在 nextAction=continue_guidance 或 ask_for_board 时给出一句贴着当前板书的具体引导；nextAction=verify_answer 或 finished 时 guidance 必须为空。",
   "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
@@ -685,7 +685,7 @@ const handwritingSchema = {
       nextAction: {
         type: "string",
         enum: ["continue_guidance", "verify_answer", "ask_for_board", "finished"],
-        description: "The next application action based only on the visible board state and the supplied Question Memory."
+        description: "The next application action based only on the current blackboard screenshot."
       },
       guidance: {
         type: "string",
@@ -708,11 +708,11 @@ const handwritingSchema = {
       calculationStatus: {
         type: "string",
         enum: ["not_relevant", "incomplete", "unclear", "correct", "wrong"],
-        description: "Result of comparing only the student's visible work with Question Memory."
+        description: "Result of comparing the student's visible work with the question and current blackboard screenshot."
       },
       calculationCheck: {
         type: "string",
-        description: "Short private note comparing visible work with Question Memory, without solving missing work."
+        description: "Short private note grounded in the current blackboard screenshot, without solving missing work."
       },
       hasPossibleIssue: {
         type: "boolean",
@@ -733,7 +733,7 @@ const handwritingSchema = {
       },
       errorEvidence: {
         type: "string",
-        description: "Concise evidence for the error based on visible writing and Question Memory. Empty unless wrong."
+        description: "Concise evidence for the error based only on the current screenshot. Empty unless wrong."
       },
       boardComplete: {
         type: "boolean",
@@ -811,7 +811,7 @@ const handwritingAuditSchema = {
       },
       errorEvidence: {
         type: "string",
-        description: "Audited evidence from visible writing and Question Memory. Empty unless wrong."
+        description: "Audited evidence from the current blackboard screenshot. Empty unless wrong."
       },
       boardComplete: {
         type: "boolean",
@@ -849,11 +849,11 @@ const handwritingAuditSchema = {
 
 const HANDWRITING_AUDIT_PROMPT = [
   "你是初中数学板书观察结果的安全审校员，不负责重新解题或生成教学反馈。",
-  "你只会看到纯板书截图、Question Memory 和初次板书观察；禁止要求或分析题目图片。",
-  "题意、答案、标准步骤和知识点只能来自 Question Memory，不得根据板书重新推导完整答案或补写学生没有写出的步骤。",
+  "你会看到当前黑板区域完整截图，其中同时包含题目图片和学生原始笔迹。当前截图是唯一视觉事实来源；不要采用 OCR、前端整理文本或任何旧识别结果。",
+  "请独立检查截图中的题目与当前笔迹，不要补写学生没有写出的步骤，也不要根据截图外的历史内容推断。",
   "completedSteps 只能保留板书上明确可见且已经完成的步骤。",
-  "如果初次结果说 correct，但可见步骤与 Question Memory 不一致，必须改为 wrong 或 unclear。",
-  "如果初次结果说 wrong，但不能同时给出具体 errorLocation 和可核对的 errorEvidence，必须降级为 unclear 或 incomplete。",
+  "如果当前截图不能同时支持题意和笔迹的判断，必须返回 unclear。",
+  "如果判断为 wrong，必须同时给出具体 errorLocation 和来自当前截图的 errorEvidence，否则降级为 unclear 或 incomplete。",
   "如果板书已经包含本题相关且数学上成立的关键式子、推理、代入、计算步骤或正确结论，就可以 boardComplete=true；不要求完整抄出所有步骤。",
   "如果只有孤立答案或看不出关键关系式，boardComplete=false；只记录缺少什么，不生成提示话术。",
   "输出必须严格 JSON，不要输出 Markdown 或 JSON 外文字。"
@@ -3571,7 +3571,6 @@ function summarizeHandwritingDiagnostics(diagnostics = {}) {
     reason: String(diagnostics.reason || "").slice(0, 120),
     canvasWidth: Number(diagnostics.canvasWidth || 0),
     canvasHeight: Number(diagnostics.canvasHeight || 0),
-    boardOnlyBytes: Number(diagnostics.boardOnlyBytes || 0),
     boardImageBytes: Number(diagnostics.boardImageBytes || 0),
     capturedAt: String(diagnostics.capturedAt || "")
   };
@@ -9533,8 +9532,9 @@ function getSilenceGuidePolicy(stage) {
 
 async function handleGuide(req, res) {
   const body = await readJsonBody(req);
-  if (!body.questionImage) {
-    sendJson(res, 400, { error: "缺少 questionImage" });
+  const currentBoardImage = body.boardImage || body.questionImage || "";
+  if (!currentBoardImage) {
+    sendJson(res, 400, { error: "缺少当前黑板截图 boardImage" });
     return;
   }
 
@@ -9627,10 +9627,13 @@ async function handleGuide(req, res) {
   const verifiedGuideSteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
     ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, givenConditions)
     : [];
+  // The current screenshot is the only source of board progress. The client
+  // may still send a legacy handwriting result for diagnostics, but it must
+  // never steer this model request.
   const guideProgress = deriveGuideProgress({
     verifiedGuideSteps,
     givenConditions,
-    latestHandwritingResult: body.latestHandwritingResult,
+    latestHandwritingResult: null,
     latestStudentSpeech: body.latestStudentSpeech || "",
     previousGuideQuestion: body.lianQuestion || body.previousGuideQuestion || "",
     askedConcepts: body.askedConcepts,
@@ -9657,9 +9660,9 @@ async function handleGuide(req, res) {
   const guideRequestStartedAt = Date.now();
   console.info("[guide] payload-images", {
     questionId: body.questionId || "",
-    questionImageChars: String(body.questionImage || "").length,
-    boardImageChars: String(body.boardImage || "").length,
-    totalImageChars: String(body.questionImage || "").length + String(body.boardImage || "").length
+    questionImageChars: 0,
+    boardImageChars: String(currentBoardImage).length,
+    totalImageChars: String(currentBoardImage).length
   });
   let guideResult = await callGuideQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
@@ -9709,7 +9712,6 @@ async function handleGuide(req, res) {
           questionType: body.questionType || body.problemType || body.type || "",
           knownKnowledgePoints: body.knowledgePoints || [],
           hasBoardInk: body.hasBoardInk === true,
-          latestHandwritingResult: body.latestHandwritingResult || null,
           guideProgress,
           givenConditions: guideProgress.givenConditions,
           askedConcepts: guideProgress.askedConcepts,
@@ -9746,8 +9748,7 @@ async function handleGuide(req, res) {
           styleRules: LIAN_STYLE_RULES
         })
       },
-      { type: "input_image", label: "题目图片", image_url: body.questionImage, detail: "high" },
-      ...(body.boardImage ? [{ type: "input_image", label: "当前黑板截图", image_url: body.boardImage, detail: "high" }] : [])
+      { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: currentBoardImage, detail: "high" }
     ],
     maxOutputTokens: 1200
   }, {
@@ -9889,12 +9890,12 @@ async function handleHandwritingInternal(req, res, task) {
     });
     return;
   }
-  if (!body.boardOnlyImage) {
-    sendJson(res, 400, { error: "缺少纯板书截图 boardOnlyImage" });
+  if (!body.boardImage) {
+    sendJson(res, 400, { error: "缺少当前黑板截图 boardImage" });
     return;
   }
 
-  const boardForOcr = body.boardOnlyImage;
+  const boardImage = body.boardImage;
   const diagnostics = summarizeHandwritingDiagnostics(body.handwritingDiagnostics);
   task.taskId = String(body.taskId || body.handwritingDiagnostics?.taskId || task.taskId);
   task.boardVersion = Number(diagnostics.boardVersion || 0);
@@ -9962,7 +9963,7 @@ async function handleHandwritingInternal(req, res, task) {
     board_version: task.boardVersion
   });
   console.log("[handwriting] request", diagnostics);
-  if (String(boardForOcr || "").length < 100) {
+  if (String(boardImage || "").length < 100) {
     sendJson(res, 400, {
       error: "板书快照为空或过小，请保留板书后重试",
       code: "empty_board_snapshot",
@@ -9995,12 +9996,11 @@ async function handleHandwritingInternal(req, res, task) {
         text: JSON.stringify({
           trigger: body.reason || "停笔后异步识别",
           boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
-          questionMemory: privateQuestionMemoryReference(answerKey),
           instruction:
-            "只观察纯板书截图。用 Question Memory 判断学生已经写出的步骤和下一动作；不要重解题目、不要补全学生未写的步骤，也不要把题目条件当成学生推导步骤。"
+            "只依据当前黑板区域截图（题目图片与学生原始笔迹）判断当前状态和下一动作；不要读取或复述任何旧识别结果。"
         })
       },
-      { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
+      { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: boardImage, detail: "high" }
     ],
     maxOutputTokens: 700,
     signal: task.abortController.signal,
@@ -10015,7 +10015,7 @@ async function handleHandwritingInternal(req, res, task) {
   });
   console.log(`[handwriting-timing] initial=${Date.now() - requestStartedAt}ms`);
 
-  result = await auditHandwritingResult(result, answerKey, body, boardForOcr, {
+  result = await auditHandwritingResult(result, answerKey, body, boardImage, {
     signal: task.abortController.signal,
     timeoutMs: QWEN_HANDWRITING_TOTAL_TIMEOUT_MS,
     diagnostics
@@ -10287,7 +10287,7 @@ function applyHandwritingAudit(result, audit) {
   };
 }
 
-async function auditHandwritingResult(result, answerKey, body, boardForOcr, control = {}) {
+async function auditHandwritingResult(result, answerKey, body, boardImage, control = {}) {
   if (!shouldAuditHandwritingResult(result, answerKey, body)) {
     console.log(
       `[handwriting-audit] skipped status=${result?.calculationStatus || ""} confidence=${result?.confidence || 0}`
@@ -10305,13 +10305,11 @@ async function auditHandwritingResult(result, answerKey, body, boardForOcr, cont
           text: JSON.stringify({
             trigger: body.reason || "",
             boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
-            questionMemory: privateQuestionMemoryReference(answerKey),
-            initialHandwritingResult: result,
             instruction:
-              "只根据纯板书与 Question Memory 审校可见步骤。不得重解题目、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和证据。"
+              "只根据当前黑板区域截图独立审校可见步骤。不得读取旧识别结果、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和来自截图的证据。"
           })
         },
-        { type: "input_image", label: "纯板书截图", image_url: boardForOcr, detail: "high" }
+        { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: boardImage, detail: "high" }
       ],
       maxOutputTokens: 500,
       signal: control.signal || null,
