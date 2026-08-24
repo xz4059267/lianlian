@@ -2525,8 +2525,53 @@ function parseTesseractTsv(tsv) {
     .sort((a, b) => a.y - b.y || a.x - b.x);
 }
 
+function extractModelText(data) {
+  if (!data || typeof data !== "object") {
+    const error = new Error("模型响应对象为空");
+    error.code = "empty_model_response";
+    error.errorType = "EMPTY_MODEL_RESPONSE";
+    throw error;
+  }
+
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content === "string") {
+    const text = content.trim();
+    if (!text) {
+      const error = new Error("模型返回文本为空");
+      error.code = "empty_model_text";
+      error.errorType = "EMPTY_MODEL_TEXT";
+      throw error;
+    }
+    return text;
+  }
+
+  if (Array.isArray(content)) {
+    const text = content
+      .map((part) => typeof part === "string" ? part : String(part?.text || ""))
+      .join("")
+      .trim();
+    if (!text) {
+      const error = new Error("模型返回内容中没有文本");
+      error.code = "model_text_not_found";
+      error.errorType = "MODEL_TEXT_NOT_FOUND";
+      throw error;
+    }
+    return text;
+  }
+
+  const error = new Error("模型响应中没有 choices.message.content 文本字段");
+  error.code = "model_text_not_found";
+  error.errorType = "MODEL_TEXT_NOT_FOUND";
+  error.responseKeys = Object.keys(data);
+  throw error;
+}
+
 function extractDeepSeekText(data) {
-  return String(data?.choices?.[0]?.message?.content || "").trim();
+  try {
+    return extractModelText(data);
+  } catch {
+    return "";
+  }
 }
 
 function parseModelJson(text) {
@@ -2660,7 +2705,17 @@ async function callDeepSeekJson({ model, content, schema, instructions, maxOutpu
     throw error;
   }
 
-  const rawText = extractDeepSeekText(data);
+  let rawText = "";
+  try {
+    rawText = extractModelText(data);
+  } catch (error) {
+    error.statusCode = error.statusCode || 502;
+    error.code = error.code || "model_text_not_found";
+    error.errorType = error.errorType || "MODEL_TEXT_NOT_FOUND";
+    error.model = model;
+    error.responseKeys = error.responseKeys || Object.keys(data || {});
+    throw error;
+  }
   const parsed = parseModelJson(rawText);
   if (!parsed) {
     console.warn("[qwen] invalid structured output", {
@@ -3110,7 +3165,7 @@ async function callQwenMultimodalJson({
       diagnostics
     });
   } catch (error) {
-    if (plainTextMode) throw error;
+    if (disableModelFallback || plainTextMode) throw error;
     if (!isQwenJsonFormatUnsupported(error)) throw error;
     data = await requestQwenChatCompletion(payload, false, {
       deadlineAt,
@@ -3121,7 +3176,17 @@ async function callQwenMultimodalJson({
     });
   }
 
-  const rawText = extractDeepSeekText(data);
+  let rawText;
+  try {
+    rawText = extractModelText(data);
+  } catch (error) {
+    error.statusCode = error.statusCode || 502;
+    error.code = error.code || "model_text_not_found";
+    error.errorType = error.errorType || "MODEL_TEXT_NOT_FOUND";
+    error.model = error.model || model;
+    error.responseKeys = error.responseKeys || Object.keys(data || {});
+    throw error;
+  }
   if (plainTextMode) {
     const handwritingText = String(rawText || "")
       .replace(/```(?:text|markdown)?/gi, "")
@@ -7661,6 +7726,80 @@ const finalAnswerSchema = {
   }
 };
 
+function createFinalCheckTraceId(requestId = "") {
+  const suffix = crypto.randomBytes(4).toString("hex");
+  return `final-check:${String(requestId || Date.now()).replace(/[^A-Za-z0-9:_-]/g, "-")}:${suffix}`;
+}
+
+function logFinalCheckStage(traceId, stage, details = {}) {
+  console.info(`[FINAL_CHECK][${traceId}] ${stage}`, {
+    traceId,
+    ...details,
+    at: new Date().toISOString()
+  });
+}
+
+function finalCheckError(errorType, message, stage, retryable = false, extra = {}) {
+  const error = new Error(message);
+  error.code = String(extra.code || errorType).toLowerCase();
+  error.errorType = errorType;
+  error.stage = stage;
+  error.retryable = Boolean(retryable);
+  Object.assign(error, extra);
+  return error;
+}
+
+function validateFinalAnswerCheckResult(result) {
+  const required = ["correct", "finalAnswer", "feedback", "hint", "confidence"];
+  const missingFields = required.filter((field) => {
+    if (!(field in (result || {}))) return true;
+    if (["finalAnswer", "feedback", "hint"].includes(field)) return typeof result[field] !== "string";
+    if (field === "correct") return typeof result[field] !== "boolean";
+    return typeof result[field] !== "number" || !Number.isFinite(result[field]);
+  });
+  if (missingFields.length) {
+    throw finalCheckError(
+      "SCHEMA_INVALID",
+      "最终核对模型返回字段不完整",
+      "SCHEMA_VALIDATION",
+      false,
+      { code: "schema_invalid", missingFields }
+    );
+  }
+  if (result.confidence < 0 || result.confidence > 1) {
+    throw finalCheckError(
+      "SCHEMA_INVALID",
+      "最终核对模型返回的 confidence 不在 0 到 1 之间",
+      "SCHEMA_VALIDATION",
+      false,
+      { code: "schema_invalid", missingFields: [] }
+    );
+  }
+  return result;
+}
+
+function sendFinalCheckError(res, status, { traceId, requestId, stage, errorType, message, retryable = false, error, extra = {} }) {
+  const payload = {
+    ok: false,
+    error: message,
+    message,
+    traceId,
+    requestId,
+    stage,
+    errorType,
+    retryable: Boolean(retryable),
+    ...extra
+  };
+  logFinalCheckStage(traceId, `FAILED_AT=${stage}`, {
+    requestId,
+    errorType,
+    errorMessage: message,
+    errorStack: error?.stack || "",
+    retryable: Boolean(retryable)
+  });
+  return sendJson(res, status, payload);
+}
+
 const archiveSummarySchema = {
   name: "wrong_question_archive_summary",
   strict: true,
@@ -8913,6 +9052,7 @@ const FINAL_ANSWER_PROMPT = [
 
 async function handleFinalAnswerCheck(req, res) {
   const requestId = String(req.headers?.["x-lian-request-id"] || `final-answer-${Date.now()}`);
+  const traceId = String(req.headers?.["x-lian-trace-id"] || createFinalCheckTraceId(requestId));
   const startedAt = Date.now();
   const abortController = new AbortController();
   let clientDisconnected = false;
@@ -8942,117 +9082,100 @@ async function handleFinalAnswerCheck(req, res) {
     req.off("close", onRequestClose);
     res.off("close", onResponseClose);
   });
-  console.info("[final-answer] request-start", { requestId });
+  logFinalCheckStage(traceId, "01_TRIGGERED", { requestId });
+  logFinalCheckStage(traceId, "03_SERVER_RECEIVED", { requestId });
   let body;
   try {
     body = await readJsonBody(req, 8 * 1024 * 1024, abortController.signal);
   } catch (error) {
     if (clientDisconnected || abortController.signal.aborted) return;
-    sendJson(res, 400, { error: error.message || "请求体无法读取", code: "request_body_error", requestId });
+    sendFinalCheckError(res, 400, {
+      traceId,
+      requestId,
+      stage: "INPUT",
+      errorType: "REQUEST_BODY_ERROR",
+      message: error.message || "请求体无法读取",
+      error,
+      extra: { code: "request_body_error" }
+    });
     return;
   }
+  logFinalCheckStage(traceId, "02_INPUT_READY", {
+    requestId,
+    questionId: String(body.questionId || ""),
+    boardVersion: Number(body.boardVersion || 0),
+    answerLength: String(body.answer || "").trim().length
+  });
   if (!body.questionImage || !String(body.answer || "").trim()) {
-    sendJson(res, 400, { error: "缺少 questionImage 或 answer" });
+    sendFinalCheckError(res, 400, {
+      traceId,
+      requestId,
+      stage: "INPUT",
+      errorType: "INVALID_INPUT",
+      message: "缺少 questionImage 或 answer",
+      extra: { code: "invalid_input" }
+    });
     return;
   }
 
-  let answerKey = null;
+  let answerKey;
   try {
-    // Reuse the frozen Question Memory created when the question opened. A
-    // final-answer click must not trigger another multimodal answer solve when
-    // the browser already has a trusted answer key.
-    if (body.questionMemory?.ready === true) {
-      answerKey = questionMemoryToAnswerKey(
-        body.questionMemory,
-        String(body.questionId || "").trim(),
-        String(body.memoryId || body.questionMemory.memoryId || "").trim()
-      );
-      console.info("[final-answer] answer-key source=question-memory", {
+    if (!body.questionMemory || body.questionMemory.ready !== true) {
+      sendFinalCheckError(res, 409, {
+        traceId,
         requestId,
-        questionId: body.questionId || "",
-        trusted: Boolean(answerKey?.trusted)
-      });
-    } else {
-      answerKey = await getVerifiedAnswerKey(body.questionImage, {
-        problemText: body.problemText || "",
-        signal: abortController.signal,
-        diagnostics: { requestId, stage_name: "final-answer-answer-key" }
-      });
-    }
-  } catch (error) {
-    console.warn(`[final-answer] answer-key unavailable code=${error.code || "unknown"}: ${error.message || error}`);
-    // A timeout is a transient upstream failure. Do not immediately send the
-    // same image to Qwen again: that doubles latency and often exceeds the
-    // Vercel function budget. The client can retry this single request later,
-    // while Question Memory will reuse the successful cache when available.
-    if (isTransientQwenError(error)) {
-      sendJson(res, 503, {
-        error: error.message || "Qwen 多模态请求暂时没有返回",
-        code: error.code || "qwen_unavailable",
-        stage: "final-answer-answer-key",
-        retryable: true,
-        model: error.model || QWEN_GUIDE_MODEL,
-        requestId
-      });
-      console.warn("[final-answer] request-failed", {
-        requestId,
-        stage: "answer-key",
-        code: error.code || "qwen_unavailable",
-        elapsedMs: Date.now() - startedAt
+        stage: "ANSWER_KEY_LOOKUP",
+        errorType: "ANSWER_KEY_NOT_READY",
+        message: "标准答案尚未准备完成，暂时无法核对。",
+        retryable: false,
+        extra: { code: "answer_key_not_ready", modelCallCount: 0 }
       });
       return;
     }
-    const fallback = await safeDirectFinalAnswerCheck(body, {
-      reason: error.message || "answer-key request failed",
-      status: error.code || "answer-key-error",
-      signal: abortController.signal,
-      diagnostics: { requestId, stage_name: "final-answer-direct-fallback" }
-    });
-    sendJson(res, fallback.serviceUnavailable ? 503 : 200, { ...fallback, requestId });
-    return;
-  }
-  if (!answerKey.trusted) {
-    console.warn(
-      `[final-answer] answer-key not trusted, using direct fallback status=${answerKey.status} confidence=${answerKey.confidence}`
+    answerKey = questionMemoryToAnswerKey(
+      body.questionMemory,
+      String(body.questionId || "").trim(),
+      String(body.memoryId || body.questionMemory.memoryId || "").trim()
     );
-    const fallback = await safeDirectFinalAnswerCheck(body, {
-      reason: answerKey.reason || "answer key not trusted",
-      status: answerKey.status || "answer-key-untrusted",
-      signal: abortController.signal,
-      diagnostics: { requestId, stage_name: "final-answer-direct-fallback" }
-    });
-    sendJson(res, fallback.serviceUnavailable ? 503 : 200, { ...fallback, requestId });
-    return;
-  }
-  if (!answerKey.trusted) {
-    sendJson(res, 200, {
-      correct: false,
-      finalAnswer: String(body.answer).trim(),
-      feedback: "",
-      hint: "这道题的标准答案还没有可靠核准，我先不判断对错。请确认题目图片完整清晰后再核对。",
-      confidence: 0,
-      verificationStatus: answerKey.status,
-      model: QWEN_GUIDE_MODEL,
-      provider: "qwen-double-verified-final-answer"
-    });
-    return;
-  }
-
-  const directlyCompatible = studentAnswerMatchesVerifiedKey(body.answer, answerKey);
-  if (directlyCompatible) {
-    sendJson(res, 200, {
-      correct: true,
-      finalAnswer: String(body.answer).trim(),
-      feedback: "这个结果和题目条件对上了。",
-      hint: "",
+    if (!answerKey.trusted) {
+      sendFinalCheckError(res, 409, {
+        traceId,
+        requestId,
+        stage: "ANSWER_KEY_LOOKUP",
+        errorType: "ANSWER_KEY_NOT_READY",
+        message: "标准答案尚未通过核验，暂时无法核对。",
+        retryable: false,
+        extra: { code: "answer_key_not_ready", modelCallCount: 0 }
+      });
+      return;
+    }
+    logFinalCheckStage(traceId, "04_ANSWER_KEY_FOUND", {
+      requestId,
+      questionId: body.questionId || "",
+      memoryId: body.memoryId || body.questionMemory.memoryId || "",
       confidence: answerKey.confidence,
-      verificationStatus: "double-verified-direct-match",
-      model: QWEN_GUIDE_MODEL,
-      provider: "qwen-double-verified-final-answer"
+      source: "question-memory"
+    });
+  } catch (error) {
+    sendFinalCheckError(res, 409, {
+      traceId,
+      requestId,
+      stage: "ANSWER_KEY_LOOKUP",
+      errorType: error.code === "question_memory_mismatch" ? "ANSWER_KEY_IDENTITY_MISMATCH" : "ANSWER_KEY_NOT_READY",
+      message: error.message || "标准答案尚未准备完成，暂时无法核对。",
+      retryable: false,
+      error,
+      extra: { code: error.code || "answer_key_not_ready", modelCallCount: 0 }
     });
     return;
   }
 
+  let modelCallCount = 0;
+  logFinalCheckStage(traceId, "05_MODEL_REQUEST_SENT", {
+    requestId,
+    model: QWEN_GUIDE_MODEL,
+    modelCallCount: ++modelCallCount
+  });
   let result;
   try {
     result = await callQwenMultimodalJson({
@@ -9078,27 +9201,43 @@ async function handleFinalAnswerCheck(req, res) {
       ],
       maxOutputTokens: 700,
       signal: abortController.signal,
-      diagnostics: { requestId, stage_name: "final-answer-check" }
+      diagnostics: { requestId, traceId, stage_name: "final-answer-check" },
+      disableModelFallback: true
     });
+    logFinalCheckStage(traceId, "06_MODEL_RESPONSE_RECEIVED", {
+      requestId,
+      model: QWEN_GUIDE_MODEL,
+      modelCallCount,
+      responseType: typeof result,
+      responseKeys: Object.keys(result || {})
+    });
+    logFinalCheckStage(traceId, "07_RESPONSE_EXTRACTED", { requestId, modelCallCount });
+    result = validateFinalAnswerCheckResult(result);
+    logFinalCheckStage(traceId, "08_JSON_PARSED", { requestId, modelCallCount });
+    logFinalCheckStage(traceId, "09_SCHEMA_VALIDATED", { requestId, modelCallCount });
   } catch (error) {
     if (clientDisconnected || abortController.signal.aborted) return;
     const errorType = error.errorType || classifyQwenError(error);
-    console.error("[final-answer] qwen-failed", {
+    const stage = errorType === "INVALID_JSON" ? "JSON_PARSE"
+      : errorType === "MODEL_TEXT_NOT_FOUND" || errorType === "EMPTY_MODEL_RESPONSE" || errorType === "EMPTY_MODEL_TEXT"
+        ? "RESPONSE_EXTRACTION"
+        : errorType === "SCHEMA_INVALID" ? "SCHEMA_VALIDATION" : "MODEL_REQUEST";
+    const status = stage === "MODEL_REQUEST" ? 502 : 422;
+    sendFinalCheckError(res, status, {
+      traceId,
       requestId,
+      stage,
       errorType,
-      code: error.code || "",
-      model: error.model || QWEN_GUIDE_MODEL,
-      rawResponse: error.rawResponsePreview || error.responsePreview || "",
-      parseError: error.parseError || "",
-      durationMs: Date.now() - startedAt
-    });
-    sendJson(res, 503, {
-      error: error.message || "核对服务暂时没有返回",
-      code: error.code || "qwen_error",
-      errorType,
-      stage: "final-answer-check",
-      retryable: isTransientQwenError(error),
-      requestId
+      message: error.message || "最终答案核对失败",
+      retryable: stage === "MODEL_REQUEST" && isTransientQwenError(error),
+      error,
+      extra: {
+        code: error.code || "final_answer_check_failed",
+        model: error.model || QWEN_GUIDE_MODEL,
+        modelCallCount,
+        responseKeys: error.responseKeys || [],
+        parseError: error.parseError || ""
+      }
     });
     return;
   }
@@ -9107,7 +9246,15 @@ async function handleFinalAnswerCheck(req, res) {
     result.correct === true &&
     Number(result.confidence) >= ANSWER_KEY_MIN_CONFIDENCE &&
     interpretedCompatible;
+  logFinalCheckStage(traceId, "10_SERVER_RESPONSE_SENT", {
+    requestId,
+    modelCallCount,
+    correct
+  });
   sendJson(res, 200, {
+    ok: true,
+    traceId,
+    modelCallCount,
     ...result,
     correct,
     feedback: correct ? result.feedback : "",
@@ -9123,77 +9270,16 @@ async function handleFinalAnswerCheck(req, res) {
   });
   console.info("[final-answer] request-complete", {
     requestId,
+    traceId,
+    modelCallCount,
     correct,
     elapsedMs: Date.now() - startedAt
   });
-}
-
-async function directFinalAnswerCheck(body, fallbackInfo = {}) {
-  const result = await callQwenMultimodalJson({
-    model: QWEN_GUIDE_MODEL,
-    schema: finalAnswerSchema,
-    instructions: [
-      FINAL_ANSWER_PROMPT,
-      ORDERED_PROPORTION_RULES,
-      "标准答案双重核验暂时不可用。你必须直接根据题目图片重新计算，并核对学生最后答案。若图片题意足够清楚，可以判断 correct=true/false；若题目关键条件看不清，才返回 correct=false 并说明需要补充清晰题图。不要因为缺少双重基线就拒绝核对。"
-    ].join("\n\n"),
-    content: [
-      {
-        type: "input_text",
-        text: JSON.stringify({
-          studentAnswer: String(body.answer || "").trim(),
-          lectureText: body.lectureText || "",
-          latestHandwritingResult: body.latestHandwritingResult || null,
-          knownProblemText: body.problemText || "",
-          fallbackReason: fallbackInfo.reason || "",
-          instruction:
-            "请先读题并独立计算，再判断 studentAnswer 是否正确。正确时 feedback 只说一句确认并提醒点击我讲完了；错误时 hint 必须指出具体错在哪里。"
-        })
-      },
-      { type: "input_image", label: "当前题目图片", image_url: body.questionImage, detail: "high" },
-      ...(body.boardImage ? [{ type: "input_image", label: "当前黑板图片", image_url: body.boardImage, detail: "high" }] : [])
-    ],
-    maxOutputTokens: 700,
-    signal: fallbackInfo.signal,
-    diagnostics: fallbackInfo.diagnostics || {}
+  logFinalCheckStage(traceId, "13_COMPLETED", {
+    requestId,
+    modelCallCount,
+    durationMs: Date.now() - startedAt
   });
-
-  const confidence = Number(result.confidence) || 0;
-  const correct = result.correct === true && confidence >= 0.72;
-  return {
-    ...result,
-    correct,
-    feedback: correct ? result.feedback || "最后答案核对正确。" : "",
-    hint: correct
-      ? ""
-      : result.hint || "我直接核对后还不能确认这个答案正确，请把最后一步运算或单位再检查一下。",
-    confidence,
-    verificationStatus: `direct-fallback:${fallbackInfo.status || "answer-key-unavailable"}`,
-    model: QWEN_GUIDE_MODEL,
-    provider: "qwen-direct-final-answer-fallback"
-  };
-}
-
-async function safeDirectFinalAnswerCheck(body, fallbackInfo = {}) {
-  try {
-    return await directFinalAnswerCheck(body, fallbackInfo);
-  } catch (error) {
-    console.warn(`[final-answer] direct fallback failed: ${error.message || error}`);
-    return {
-      correct: false,
-      finalAnswer: String(body.answer || "").trim(),
-      feedback: "",
-      hint:
-        "核对服务现在连接失败，可能是 API key、额度或模型权限问题。你刚才的答案已经收到，请先不要保存，稍后重试一次核对。",
-      confidence: 0,
-      serviceUnavailable: true,
-      retryable: true,
-      code: error.code || fallbackInfo.status || "qwen_error",
-      verificationStatus: `service-unavailable:${error.code || fallbackInfo.status || "qwen-error"}`,
-      model: QWEN_GUIDE_MODEL,
-      provider: "qwen-direct-final-answer-fallback"
-    };
-  }
 }
 
 function enforceOrderedProportionConvention(result, context = {}) {

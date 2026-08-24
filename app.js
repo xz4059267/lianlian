@@ -7497,13 +7497,33 @@ async function requestFinalAnswerCheck(answer, options = {}) {
   const question = currentPageQuestion();
   if (!question) throw new Error("没有当前题目");
   saveCurrentPage();
+  // Question Memory is created when the question is entered. The final check
+  // may happen before that request has settled, so wait for that existing
+  // request instead of sending null and receiving ANSWER_KEY_NOT_READY.
+  const questionMemory = await waitForEnteredQuestionMemory(question);
   const requestId = options.requestId || `final-answer:${question.id || "question"}:${Date.now()}`;
+  const traceId = options.traceId || `final-check:${question.id || "question"}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
   const requestBoardVersion = Number(options.boardVersion ?? getBoardVersion(question));
+  console.info(`[FINAL_CHECK][${traceId}] 01_TRIGGERED`, {
+    traceId,
+    requestId,
+    questionId: question.id || "",
+    boardVersion: requestBoardVersion
+  });
+  console.info(`[FINAL_CHECK][${traceId}] 02_INPUT_READY`, {
+    traceId,
+    requestId,
+    answerLength: String(answer || "").trim().length,
+    hasQuestionMemory: Boolean(questionMemory?.ready),
+    questionMemoryStatus: questionMemory?.status || "missing"
+  });
+  console.info(`[FINAL_CHECK][${traceId}] 03_REQUEST_SENT`, { traceId, requestId });
   const response = await fetch("/api/final-answer", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Lian-Request-Id": requestId
+      "X-Lian-Request-Id": requestId,
+      "X-Lian-Trace-Id": traceId
     },
     signal: options.signal,
     body: JSON.stringify({
@@ -7511,13 +7531,20 @@ async function requestFinalAnswerCheck(answer, options = {}) {
       boardImage: getBoardImageForGuide(),
       questionId: question.id || "",
       boardVersion: requestBoardVersion,
-      memoryId: state.questionMemoryIdsByQuestion[question.id] || "",
-      questionMemory: state.questionMemoriesByQuestion[question.id] || null,
+      memoryId: questionMemory?.memoryId || state.questionMemoryIdsByQuestion[question.id] || "",
+      questionMemory,
       answer,
       lectureText: dom.transcriptInput.value.trim(),
       latestHandwritingResult: state.latestHandwritingResult,
       problemText: question.problemText || ""
     })
+  });
+  console.info(`[FINAL_CHECK][${traceId}] 11_CLIENT_RESPONSE_RECEIVED`, {
+    traceId,
+    requestId,
+    status: response.status,
+    ok: response.ok,
+    headers: Object.fromEntries(response.headers.entries())
   });
   const rawResponse = await response.text();
   let result = {};
@@ -7531,6 +7558,14 @@ async function requestFinalAnswerCheck(answer, options = {}) {
       error.rawResponse = rawResponse.slice(0, 1200);
       error.status = response.status;
       error.requestId = requestId;
+      error.traceId = traceId;
+      error.errorType = "INVALID_JSON";
+      console.error(`[FINAL_CHECK][${traceId}] FAILED_AT=JSON_PARSE`, {
+        traceId,
+        requestId,
+        status: response.status,
+        parseError: parseError.message
+      });
       throw error;
     }
   } else {
@@ -7538,16 +7573,35 @@ async function requestFinalAnswerCheck(answer, options = {}) {
     error.code = "EMPTY_RESPONSE";
     error.status = response.status;
     error.requestId = requestId;
+    error.traceId = traceId;
+    error.errorType = "EMPTY_RESPONSE";
     throw error;
   }
-  if (!response.ok || result.serviceUnavailable === true || String(result.verificationStatus || "").startsWith("service-unavailable:")) {
-    const error = new Error(result.error || "最后答案核对服务暂时没有返回");
+  if (!response.ok || result.ok === false || result.serviceUnavailable === true || String(result.verificationStatus || "").startsWith("service-unavailable:")) {
+    const error = new Error(result.message || result.error || "最后答案核对失败");
     error.code = result.code || (response.status >= 500 ? "upstream_5xx" : `http_${response.status}`);
     error.status = response.status;
+    error.stage = result.stage || "UNKNOWN";
+    error.errorType = result.errorType || "MODEL_ERROR";
     error.retryable = result.retryable === true || response.status >= 500 || response.status === 429;
     error.requestId = result.requestId || requestId;
+    error.traceId = result.traceId || traceId;
+    error.modelCallCount = Number(result.modelCallCount || 0);
+    console.error(`[FINAL_CHECK][${error.traceId}] FAILED_AT=${error.stage}`, {
+      traceId: error.traceId,
+      requestId: error.requestId,
+      status: response.status,
+      errorType: error.errorType,
+      modelCallCount: error.modelCallCount
+    });
     throw error;
   }
+  console.info(`[FINAL_CHECK][${traceId}] 12_RESPONSE_READY`, {
+    traceId,
+    requestId,
+    modelCallCount: Number(result.modelCallCount || 0)
+  });
+  result.traceId = result.traceId || traceId;
   return result;
 }
 
@@ -7639,6 +7693,7 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
   const requestBoardVersion = getBoardVersion(question);
   const requestMeta = {
     requestId,
+    traceId: `final-check:${question.id || "question"}:${requestId}:${Math.random().toString(36).slice(2, 8)}`,
     questionId: question.id || "",
     boardVersion: requestBoardVersion,
     answer: normalizedAnswer,
@@ -7657,17 +7712,24 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
   dom.recognitionPill.textContent = "正在核对最后答案";
   dom.recognitionPill.classList.remove("hidden");
   if (!options.silentLog) addLog("我", normalizedAnswer);
+  console.info(`[FINAL_CHECK][${requestMeta.traceId}] 01_TRIGGERED`, requestMeta);
 
   try {
     const result = await requestFinalAnswerCheckWithRetry(normalizedAnswer, {
       requestId: `final-answer:${question.id || "question"}:${requestId}`,
+      traceId: requestMeta.traceId,
       boardVersion: requestBoardVersion,
       signal: requestController.signal
     });
     if (!isCurrentFinalAnswerRequest(requestMeta)) {
-      console.info("[final-answer] stale response ignored", requestMeta);
+      console.info(`[FINAL_CHECK][${requestMeta.traceId}] FAILED_AT=STALE_RESPONSE`, requestMeta);
       return;
     }
+    console.info(`[FINAL_CHECK][${requestMeta.traceId}] 12_UI_UPDATED`, {
+      traceId: requestMeta.traceId,
+      requestId: requestMeta.requestId,
+      modelCallCount: Number(result.modelCallCount || 0)
+    });
 
     if (result.correct) {
       state.finalAnswerVerified = true;
@@ -7736,12 +7798,19 @@ async function handleFinalAnswerSubmission(answer, options = {}) {
   } catch (error) {
     console.warn("Final answer check fallback:", error);
     if (!isCurrentFinalAnswerRequest(requestMeta)) {
-      console.info("[final-answer] stale failure ignored", {
+      console.info(`[FINAL_CHECK][${requestMeta.traceId}] FAILED_AT=STALE_RESPONSE`, {
         ...requestMeta,
         code: error?.code || "unknown"
       });
       return;
     }
+    console.error(`[FINAL_CHECK][${requestMeta.traceId}] FAILED_AT=${error?.stage || "CLIENT_RESPONSE"}`, {
+      ...requestMeta,
+      errorType: error?.errorType || error?.code || "CLIENT_RESPONSE_ERROR",
+      status: error?.status || 0,
+      modelCallCount: Number(error?.modelCallCount || 0),
+      message: error?.message || ""
+    });
     state.awaitingFinalAnswer = true;
     state.finalAnswerVerified = false;
     state.verifiedFinalAnswerText = "";

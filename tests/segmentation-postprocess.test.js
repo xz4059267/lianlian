@@ -54,7 +54,7 @@ test("classifies only retryable Qwen transport failures as transient", () => {
   assert.equal(isTransientQwenError({ code: "missing_qwen_api_key", statusCode: 503 }), false);
 });
 
-test("keeps answer-check failures recoverable without converting them into a wrong answer", () => {
+test("keeps final answer checking single-purpose and traceable", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const finalAnswerClient = appSource.slice(
@@ -65,20 +65,27 @@ test("keeps answer-check failures recoverable without converting them into a wro
     appSource.indexOf("async function handleFinalAnswerSubmission"),
     appSource.indexOf("async function saveCurrentQuestionAndContinue")
   );
-  const directFallback = serverSource.slice(
-    serverSource.indexOf("async function safeDirectFinalAnswerCheck"),
+  const finalAnswerHandler = serverSource.slice(
+    serverSource.indexOf("async function handleFinalAnswerCheck"),
     serverSource.indexOf("function enforceOrderedProportionConvention")
   );
 
-  assert.match(finalAnswerClient, /serviceUnavailable/);
+  assert.match(finalAnswerClient, /X-Lian-Trace-Id/);
   assert.match(finalAnswerClient, /X-Lian-Request-Id/);
+  assert.match(finalAnswerClient, /response\.status/);
+  assert.match(finalAnswerClient, /errorType/);
   assert.match(finalAnswerSubmission, /state\.pendingFinalAnswerText = normalizedAnswer/);
   assert.match(finalAnswerSubmission, /保留你的答案和板书/);
   assert.match(finalAnswerSubmission, /allowUnverified: true/);
-  assert.match(appSource, /answerVerificationStatus = "service-unavailable"/);
   assert.match(finalAnswerSubmission, /requestFinalAnswerCheckWithRetry/);
-  assert.match(directFallback, /serviceUnavailable: true/);
-  assert.match(directFallback, /retryable: true/);
+  assert.match(finalAnswerClient, /waitForEnteredQuestionMemory\(question\)/);
+  assert.match(finalAnswerClient, /questionMemory/);
+  assert.match(finalAnswerClient, /ANSWER_KEY_NOT_READY/);
+  assert.match(finalAnswerHandler, /ANSWER_KEY_NOT_READY/);
+  assert.match(finalAnswerHandler, /modelCallCount/);
+  assert.match(finalAnswerHandler, /disableModelFallback: true/);
+  assert.doesNotMatch(finalAnswerHandler, /getVerifiedAnswerKey\(/);
+  assert.doesNotMatch(finalAnswerHandler, /safeDirectFinalAnswerCheck|directFinalAnswerCheck/);
 });
 
 test("uses parallel model racing for guide requests", () => {
