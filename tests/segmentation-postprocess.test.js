@@ -298,7 +298,8 @@ test("handwriting sends the current blackboard image without client OCR", () => 
   assert.match(appHandwritingRun, /handleHandwritingAnswerVerification\(result\)/);
   assert.match(handlerSource, /verifiedAnswerReference: privateAnswerReference\(answerKey\)/);
   assert.match(handlerSource, /latestStudentSpeech/);
-  assert.match(handlerSource, /笔迹优先于 latestStudentSpeech/);
+  assert.match(handlerSource, /studentSpeechTranscript/);
+  assert.match(handlerSource, /笔迹优先于本题完整语音记录/);
   assert.match(serverSource, /题目图片中的印刷文字/);
   assert.match(handlerSource, /applyHandwritingAnswerVerification\(result, answerKey\)/);
   assert.match(appHandwritingRun, /finalAnswerCandidate/);

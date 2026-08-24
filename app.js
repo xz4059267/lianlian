@@ -3858,6 +3858,7 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
         reason,
         boardIdleSeconds,
         latestStudentSpeech: state.latestStudentSpeechText || "",
+        studentSpeechTranscript: dom.transcriptInput.value.trim(),
         hasBoardInk: Boolean(hasCurrentBoardInk(question)),
         handwritingDiagnostics: diagnostics
       }),

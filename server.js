@@ -471,7 +471,7 @@ const LECTURE_COMPLETION_RULES = [
 const HANDWRITING_PROMPT = [
   "你是初中数学黑板板书的异步观察与核验器。你要在一次请求里同时识别当前板书，并把可见的最终答案和步骤与服务端提供的可信标准答案进行对比。",
   "你会看到当前黑板区域的完整截图，截图同时包含当前题目图片和学生的原始笔迹。截图是所有视觉事实的唯一来源；服务端提供的 verifiedAnswerReference 是唯一的标准答案依据。不要依赖 OCR、前端整理文本或任何旧的板书识别结果。",
-  "当前黑板上的学生原始笔迹优先级高于语音。语音只能帮助理解学生正在说明哪一行或哪个意图，不能覆盖、改写或补充截图中没有出现的数学步骤和答案；当语音与笔迹冲突时，以笔迹为准并返回 unclear 或 ask_for_board。",
+  "当前黑板上的学生原始笔迹优先级高于语音。studentSpeechTranscript 是本题从开始到现在的完整语音记录，latestStudentSpeech 只是最新片段；语音只能帮助理解学生正在说明哪一行或哪个意图，不能覆盖、改写或补充截图中没有出现的数学步骤和答案；当语音与笔迹冲突时，以笔迹为准并返回 unclear 或 ask_for_board。",
   "题目图片中的印刷文字、红笔/蓝笔批注、勾叉、圈画、旧答案和非本次书写痕迹都不是当前学生笔迹，不能当作学生本次答案或步骤；只判断黑板上本次原始笔迹。",
   "你的职责是：忠实转写可见笔迹；判断当前书写状态；列出已经明确完成且可见的步骤；定位明确错误；当最终答案和关键步骤都可见时，直接返回与标准答案的核验结果。",
   "禁止根据学生零散板书补出未写出的步骤或最终答案。标准答案只用于核对已经写出的最终答案和可见步骤，不能替学生补写答案。",
@@ -10018,9 +10018,10 @@ async function handleHandwritingInternal(req, res, task) {
           trigger: body.reason || "停笔后异步识别",
           boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
           latestStudentSpeech: String(body.latestStudentSpeech || "").trim(),
+          studentSpeechTranscript: String(body.studentSpeechTranscript || "").trim(),
           hasBoardInk: body.hasBoardInk === true,
           instruction:
-            "只依据当前黑板区域截图（题目图片与学生原始笔迹）判断当前状态和下一动作；笔迹优先于 latestStudentSpeech；当截图中出现最终答案和关键步骤时，使用 verifiedAnswerReference 直接完成核验；如果没有笔迹只能提醒写板书；不要读取或复述任何旧识别结果。",
+            "只依据当前黑板区域截图（题目图片与学生原始笔迹）判断当前状态和下一动作；笔迹优先于本题完整语音记录 studentSpeechTranscript 及 latestStudentSpeech；当截图中出现最终答案和关键步骤时，使用 verifiedAnswerReference 直接完成核验；如果没有笔迹只能提醒写板书；不要读取或复述任何旧识别结果。",
           verifiedAnswerReference: privateAnswerReference(answerKey)
         })
       },
