@@ -5322,7 +5322,17 @@ async function correctLatestTranscript(text, options = {}) {
   const question = currentPageQuestion();
   if (!question || text.length < 4) return text;
   const requestId = ++state.transcriptCorrectionRequestId;
-  const boardImage = options.boardImage ?? (hasCurrentBoardInk(question) ? getBoardImageForGuide() : "");
+  const boardRecognitionPending = Boolean(
+    state.recognitionTimer ||
+    state.handwritingRequestInFlight ||
+    state.handwritingRetryPending ||
+    state.handwritingRetryTimer
+  );
+  const boardImage = options.boardImage ?? (
+    !boardRecognitionPending && hasCurrentBoardInk(question)
+      ? getBoardImageForGuide()
+      : ""
+  );
 
   try {
     const response = await fetch("/api/transcript-correct", {
@@ -6171,34 +6181,25 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     return false;
   }
   const handwritingPending = Boolean(
+    state.recognitionTimer ||
     state.handwritingRequestInFlight ||
     state.handwritingRetryPending ||
     state.handwritingRetryTimer
   );
-  // Board-first does not mean board-only. A fresh spoken explanation is
-  // valid evidence while the board request is still running; the guide API
-  // receives that speech and can respond from it. What must be blocked is a
-  // board-dependent silence guide with no new speech, because it would be
-  // forced to reason from an unfinished board snapshot.
-  if (handwritingPending && !hasNewStudentSpeech) {
+  // Never let a guide or transcript request capture the board while a fresh
+  // stroke is waiting for handwriting recognition. The recognition pill is
+  // the boundary: only that request may send the current blackboard image.
+  if (handwritingPending) {
     console.info("[guide] skipped while handwriting is pending", {
       eventType,
       inFlight: state.handwritingRequestInFlight,
+      recognitionTimer: Boolean(state.recognitionTimer),
       retryPending: state.handwritingRetryPending,
       hasRetryTimer: Boolean(state.handwritingRetryTimer),
       hasNewStudentSpeech,
-      evidence: "none"
+      evidence: "wait-for-handwriting-recognition"
     });
     return false;
-  }
-  if (handwritingPending && hasNewStudentSpeech) {
-    console.info("[guide] using speech while handwriting is pending", {
-      eventType,
-      inFlight: state.handwritingRequestInFlight,
-      retryPending: state.handwritingRetryPending,
-      hasRetryTimer: Boolean(state.handwritingRetryTimer),
-      evidence: "speech"
-    });
   }
   const activeRequest = state.guideRequestInFlight;
   const activeRequestIsCurrent = Boolean(

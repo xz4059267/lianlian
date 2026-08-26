@@ -287,17 +287,34 @@ test("guide receives one current blackboard image and ignores legacy handwriting
     appSource.indexOf("async function requestAIGuide"),
     appSource.indexOf("function shouldCompleteCurrentLecture")
   );
+  const guideGate = appSource.slice(
+    appSource.indexOf("async function requestSmartGuide"),
+    appSource.indexOf("async function requestAIGuide")
+  );
   const guideHandler = serverSource.slice(
     serverSource.indexOf("async function handleGuide"),
     serverSource.indexOf("async function handleHandwriting")
   );
   assert.match(guideRequest, /createCurrentBoardSnapshot/);
   assert.match(guideRequest, /boardImage/);
+  assert.match(guideGate, /state\.recognitionTimer/);
+  assert.match(guideGate, /wait-for-handwriting-recognition/);
   assert.doesNotMatch(guideRequest, /questionImage,|latestHandwritingResult:/);
   assert.match(guideHandler, /currentBoardImage/);
   assert.match(guideHandler, /当前黑板区域截图/);
   assert.match(guideHandler, /latestHandwritingResult: null/);
   assert.doesNotMatch(guideHandler, /latestHandwritingResult: body\.latestHandwritingResult/);
+});
+
+test("does not send a pre-recognition board image to transcript correction", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const transcriptSource = appSource.slice(
+    appSource.indexOf("async function correctLatestTranscript"),
+    appSource.indexOf("function commitCloudAsrText")
+  );
+  assert.match(transcriptSource, /const boardRecognitionPending = Boolean/);
+  assert.match(transcriptSource, /!boardRecognitionPending && hasCurrentBoardInk/);
+  assert.match(transcriptSource, /boardImage,/);
 });
 
 test("handwriting verification decides guide versus save from the same board request", () => {
