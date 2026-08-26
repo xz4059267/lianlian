@@ -335,6 +335,9 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /禁止任何形式的对错确认式提问/);
   assert.match(serverSource, /answerHint 必须具体指出错误的可见行、数字、符号、运算或选项/);
   assert.match(serverSource, /const concreteHint = errorLocation && errorEvidence/);
+  assert.match(serverSource, /function answerKeyCorrection\(answerKey\)/);
+  assert.match(serverSource, /正确选项应为：\$\{choice\.selectedOption\}/);
+  assert.match(serverSource, /guidance: `下一步直接做：\$\{nextMemoryStep\}`/);
   assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
   assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
   assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);

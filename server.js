@@ -491,6 +491,7 @@ const HANDWRITING_PROMPT = [
   "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，必须依据 verifiedAnswerReference 返回 answerVerificationStatus=correct 或 wrong，并将 answerFeedback 或 answerHint 填好；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；最终答案和关键步骤都明确且核验正确时返回 finished。",
   "当 finalAnswer 和关键步骤都可见时，禁止返回 continue_guidance 或 ask_for_board，禁止以任何形式询问学生是否正确或要求学生确认（包括‘对不对/正确吗/是不是/算对了吗/有没有错/你同意吗/你觉得呢/要不要检查’等同义表达，以及反问、选择问、确认式追问），必须直接完成核验；如果不正确，answerHint 必须具体指出错误的可见行、数字、符号、运算或选项，并同时填写 errorLocation 与 errorEvidence。",
   "选择题特别规则：如果当前截图已写出 A/B/C/D 选项或 I/II 等结论判定，并且至少有一条与题目相关的有效计算、代入、消元或反例步骤，必须将该步骤计入 completedSteps、boardComplete=true、nextAction=finished，并直接依据固定标准答案完成 answerVerificationStatus；不得因为没有写‘答案是’三个字而继续引导。",
+  "如果 calculationStatus=correct，completedSteps 中已有的内容只能视为已完成，guidance 必须直接给 verifiedGuideSteps 中尚未完成的下一步，禁止再让学生重写、复述或确认已完成步骤；如果 calculationStatus=wrong，必须在 guidance 或 answerHint 中同时说清‘错在何处’和‘正确应为’的具体内容，不能只说‘再检查一下’。",
   "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
   "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"，answerVerificationStatus=\"unclear\"；如果没有可见最终答案，answerVerificationStatus=\"not_present\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
@@ -9872,7 +9873,7 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   const memorySteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
     ? answerKey.solutionOutline.map((step) => String(step || "").trim()).filter(Boolean)
     : [];
-  const nextMemoryStep = memorySteps[Math.min(completedSteps.length, Math.max(0, memorySteps.length - 1))] || "";
+  const nextMemoryStep = memorySteps.find((step) => !completedSteps.some((item) => evidenceContainsStep(step, item))) || "";
   const latestVisibleStep = completedSteps.at(-1) || "";
   const output = {
     ...(result || {}),
@@ -9890,14 +9891,26 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
       ...output,
       hasPossibleIssue: true,
       boardComplete: false,
-      guidance: `先检查${errorLocation}：${errorEvidence}`
+      guidance: `先检查${errorLocation}：${errorEvidence}${answerKeyCorrection(answerKey)}`
     };
   }
 
-  // A structured handwriting result owns the next action. Do not recreate a
-  // stale local step from the answer key after the multimodal model has
-  // already decided whether to guide, request a board step, or verify.
+  // A structured handwriting result owns the next action. For a correct,
+  // already-progressing board, replace a repetitive model prompt with the
+  // next trusted step so completed work is never requested again.
   if (modelAction) {
+    if (
+      result?.calculationStatus === "correct" &&
+      completedSteps.length > 0 &&
+      ["continue_guidance", "ask_for_board"].includes(modelAction) &&
+      nextMemoryStep
+    ) {
+      return {
+        ...output,
+        guidance: `下一步直接做：${nextMemoryStep}`,
+        expectedNextStep: nextMemoryStep
+      };
+    }
     return output;
   }
 
@@ -9919,6 +9932,15 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   }
 
   return output;
+}
+
+function answerKeyCorrection(answerKey) {
+  const choice = normalizeChoiceAnalysis(answerKey?.choiceAnalysis);
+  if (choice.selectedOption && choice.selectedOptionText) {
+    return `正确选项应为：${choice.selectedOption}。${choice.selectedOptionText}`;
+  }
+  const canonical = String(answerKey?.canonicalAnswer || "").trim();
+  return canonical ? `正确答案应为：${canonical}` : "";
 }
 
 function applyHandwritingAnswerVerification(result, answerKey) {
@@ -9951,6 +9973,13 @@ function applyHandwritingAnswerVerification(result, answerKey) {
     : "";
   const modelHint = String(result?.answerHint || "").trim();
   const genericHint = /最终答案与标准答案不一致|检查最后一步|检查最后一步的计算或选项/.test(modelHint);
+  const expectedHint = answerKeyCorrection(answerKey);
+  const detailedHint = concreteHint && genericHint
+    ? concreteHint
+    : String(modelHint || concreteHint || result?.issueSummary || "最终答案与标准答案不一致，请检查最后一步。").trim();
+  const answerHintWithExpected = expectedHint && !/(?:正确应为|正确答案应为|正确选项应为|应选|应该是)/.test(detailedHint)
+    ? `${detailedHint}${expectedHint}`
+    : detailedHint;
   if (matches && status === "correct") {
     return {
       ...(result || {}),
@@ -9964,9 +9993,7 @@ function applyHandwritingAnswerVerification(result, answerKey) {
       ...(result || {}),
       answerVerificationStatus: "wrong",
       answerFeedback: "",
-      answerHint: concreteHint && genericHint
-        ? concreteHint
-        : String(modelHint || concreteHint || result?.issueSummary || "最终答案与标准答案不一致，请检查最后一步。").trim()
+      answerHint: answerHintWithExpected
     };
   }
   if (!matches && status === "correct") {
@@ -9974,7 +10001,7 @@ function applyHandwritingAnswerVerification(result, answerKey) {
       ...(result || {}),
       answerVerificationStatus: "wrong",
       answerFeedback: "",
-      answerHint: concreteHint || "最终答案与标准答案不一致，请检查最后一步的计算或选项。"
+      answerHint: answerHintWithExpected || `最终答案与标准答案不一致。${expectedHint}`
     };
   }
   return {
