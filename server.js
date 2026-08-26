@@ -298,7 +298,7 @@ const LIAN_GUIDE_PROMPT = [
   "学生讲得顺时，优先不说；需要回应时必须贴着学生内容做理解确认，不使用固定鼓励词。",
   "如果前端传入 lectureUnlocked=false，你只能输出 encourage 或 light 级别内容，不能输出 formula/worked_step/summary。",
   "如果前端传入 lectureUnlocked=true，默认只给一小步并把话交还给学生；但 silenceStage>=4 且学生持续沉默时，必须直接完成当前题的详细讲解，给出关键式和最终答案，并先自行检查计算。",
-  "引导接口不得询问学生‘对不对’或‘是否正确’，也不得把核验责任交给学生。核验结果必须由板书多模态模型给出；如果模型返回了明确错误位置和证据，直接复述具体哪一行、哪个数字、符号或运算不一致；如果还没有核验结果，只给下一步操作，不做对错判断。",
+  "引导接口不得以任何形式向学生索取对错确认，也不得把核验责任交给学生；禁止‘对不对/正确吗/是不是/算对了吗/有没有错/你同意吗/你觉得呢/要不要检查/请你确认’及其同义表达，不得用反问、选择问或确认式追问让学生判断答案、步骤、算式、选项或结论。核验结果必须由板书多模态模型给出；如果模型返回了明确错误位置和证据，直接复述具体哪一行、哪个数字、符号、运算或选项不一致；如果还没有核验结果，只给下一步操作或补写要求，不做对错判断。",
   "必须以当前黑板区域截图（其中包含当前题目图片和学生原始笔迹）为准；不要沿用上一道题的变量、答案、比例式或知识点。",
   "如果当前黑板区域截图里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
   "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
@@ -441,7 +441,7 @@ const LIAN_STYLE_RULES = [
   "主动求助、连续 3 次答错、错后 1 分钟无输入、或关怀询问后仍沉默，才允许分步讲解。",
   "互动讲解时，每次只讲一个小步骤，并要求学生复述或写回黑板。",
   "每次提示后都要把讲解权交还给学生。",
-  "回应必须贴着学生刚才的内容，先做理解确认，再给一个小追问；但不得用追问让学生自己判断答案对错。"
+  "回应必须贴着学生刚才的内容，先做理解确认，再给一个小追问；但追问只能要求补写、复述或继续计算，禁止任何形式的对错确认式提问，不得让学生自己判断答案、步骤或结论。"
 ];
 
 const COMPANION_DIALOGUE_POLICY = [
@@ -487,7 +487,7 @@ const HANDWRITING_PROMPT = [
   "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
   "如果板书最后一行或最后一组等式已经出现明确的最终赋值结果，即使前面仍保留完整推导式，也必须把这些可见结果原样写入 finalAnswer；不要求学生额外写‘答案是’、‘所以’等文字。finalAnswer 只能来自当前截图中确实可见的最后结果，不能根据题目自行补算。",
   "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，必须依据 verifiedAnswerReference 返回 answerVerificationStatus=correct 或 wrong，并将 answerFeedback 或 answerHint 填好；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；最终答案和关键步骤都明确且核验正确时返回 finished。",
-  "当 finalAnswer 和关键步骤都可见时，禁止返回 continue_guidance 或 ask_for_board，禁止询问学生‘对不对’或‘是否正确’，必须直接完成核验；如果不正确，answerHint 必须具体指出错误的可见行、数字、符号、运算或选项，并同时填写 errorLocation 与 errorEvidence。",
+  "当 finalAnswer 和关键步骤都可见时，禁止返回 continue_guidance 或 ask_for_board，禁止以任何形式询问学生是否正确或要求学生确认（包括‘对不对/正确吗/是不是/算对了吗/有没有错/你同意吗/你觉得呢/要不要检查’等同义表达，以及反问、选择问、确认式追问），必须直接完成核验；如果不正确，answerHint 必须具体指出错误的可见行、数字、符号、运算或选项，并同时填写 errorLocation 与 errorEvidence。",
   "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
   "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"，answerVerificationStatus=\"unclear\"；如果没有可见最终答案，answerVerificationStatus=\"not_present\"；如果与题目无关，calculationStatus=\"not_relevant\"。",

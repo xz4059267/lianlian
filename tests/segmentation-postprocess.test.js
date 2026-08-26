@@ -310,7 +310,9 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /answerVerificationStatus/);
   assert.match(serverSource, /privateAnswerReference\(answerKey\)/);
   assert.match(serverSource, /latestStudentSpeech/);
-  assert.match(serverSource, /引导接口不得询问学生.*对不对.*是否正确/);
+  assert.match(serverSource, /引导接口不得以任何形式向学生索取对错确认/);
+  assert.match(serverSource, /对不对\/正确吗\/是不是\/算对了吗\/有没有错/);
+  assert.match(serverSource, /禁止任何形式的对错确认式提问/);
   assert.match(serverSource, /answerHint 必须具体指出错误的可见行、数字、符号、运算或选项/);
   assert.match(serverSource, /const concreteHint = errorLocation && errorEvidence/);
   assert.match(appSource, /handwriting-answer-unclear/);
