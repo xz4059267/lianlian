@@ -4170,7 +4170,12 @@ function extractHandwritingFinalAnswerCandidate(result) {
   const modelFinalAnswer = String(result?.finalAnswer || "").normalize("NFKC").trim();
   if (
     modelFinalAnswer &&
-    (modelAction === "verify_answer" || modelAction === "finished")
+    (
+      modelAction === "verify_answer" ||
+      modelAction === "finished" ||
+      result?.boardComplete === true ||
+      (Array.isArray(result?.completedSteps) && result.completedSteps.length > 0)
+    )
   ) {
     return modelFinalAnswer;
   }
@@ -4193,7 +4198,36 @@ async function handleHandwritingAnswerVerification(result) {
   const question = currentPageQuestion();
   const status = String(result?.answerVerificationStatus || "").trim();
   const answer = extractHandwritingFinalAnswerCandidate(result);
-  if (!question || !answer || !["correct", "wrong"].includes(status)) return false;
+  const hasCompletedKeyStep = Array.isArray(result?.completedSteps) && result.completedSteps.length > 0;
+  const hasVisibleAnswerAndKeyStep = Boolean(
+    answer &&
+    (hasCompletedKeyStep || result?.boardComplete === true) &&
+    result?.isRelevant !== false
+  );
+  if (!question || !answer) return false;
+
+  if (hasVisibleAnswerAndKeyStep && !["correct", "wrong"].includes(status)) {
+    state.finalAnswerVerified = false;
+    state.verifiedFinalAnswerText = "";
+    state.awaitingFinalAnswer = true;
+    state.pendingFinalAnswerText = answer;
+    state.boardCompletionVerified = true;
+    state.currentQuestionCompleted = false;
+    dom.finishQuestionBtn.disabled = false;
+    setGuideState(GUIDE_STATES.INTERACTIVE);
+    await lianSpeak(
+      result.answerHint || "板书中的答案和关键步骤已经识别，但大模型暂时无法可靠完成核验，请稍后重试。",
+      {
+        dedupeKey: `handwriting-answer-unclear:${question.id}:${answer}`,
+        cooldownMs: 0,
+        allowRepeat: true
+      }
+    );
+    return true;
+  }
+
+  if (!hasVisibleAnswerAndKeyStep) return false;
+  if (!["correct", "wrong"].includes(status)) return false;
 
   if (status === "correct") {
     if (!isHandwritingCalculationCorrect(result) || !isModelBoardReadyForFinalCheck(result)) return false;
