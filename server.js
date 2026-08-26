@@ -489,6 +489,7 @@ const HANDWRITING_PROMPT = [
   "如果板书最后一行或最后一组等式已经出现明确的最终赋值结果，即使前面仍保留完整推导式，也必须把这些可见结果原样写入 finalAnswer；不要求学生额外写‘答案是’、‘所以’等文字。finalAnswer 只能来自当前截图中确实可见的最后结果，不能根据题目自行补算。",
   "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，必须依据 verifiedAnswerReference 返回 answerVerificationStatus=correct 或 wrong，并将 answerFeedback 或 answerHint 填好；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；最终答案和关键步骤都明确且核验正确时返回 finished。",
   "当 finalAnswer 和关键步骤都可见时，禁止返回 continue_guidance 或 ask_for_board，禁止以任何形式询问学生是否正确或要求学生确认（包括‘对不对/正确吗/是不是/算对了吗/有没有错/你同意吗/你觉得呢/要不要检查’等同义表达，以及反问、选择问、确认式追问），必须直接完成核验；如果不正确，answerHint 必须具体指出错误的可见行、数字、符号、运算或选项，并同时填写 errorLocation 与 errorEvidence。",
+  "选择题特别规则：如果当前截图已写出 A/B/C/D 选项或 I/II 等结论判定，并且至少有一条与题目相关的有效计算、代入、消元或反例步骤，必须将该步骤计入 completedSteps、boardComplete=true、nextAction=finished，并直接依据固定标准答案完成 answerVerificationStatus；不得因为没有写‘答案是’三个字而继续引导。",
   "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
   "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"，answerVerificationStatus=\"unclear\"；如果没有可见最终答案，answerVerificationStatus=\"not_present\"；如果与题目无关，calculationStatus=\"not_relevant\"。",

@@ -4240,12 +4240,17 @@ async function handleHandwritingAnswerVerification(result) {
     dom.finishQuestionBtn.disabled = false;
     setGuideState(GUIDE_STATES.INTERACTIVE);
     if (markCurrentQuestionComplete()) {
-      await lianSpeak(result.answerFeedback || "答案和板书步骤都核对正确了。", {
+      const feedback = result.answerFeedback || "答案和板书步骤都核对正确了。";
+      // Open the save confirmation immediately after the model verdict. Do not
+      // wait for TTS playback, which can otherwise leave an old guide bubble
+      // visible and make the save step appear stuck.
+      const savePromise = saveCurrentQuestionAndContinue({ feedback });
+      void lianSpeak(feedback, {
         dedupeKey: `handwriting-answer-correct:${question.id}:${answer}`,
         cooldownMs: 0,
         allowRepeat: true
       });
-      await saveCurrentQuestionAndContinue({ feedback: result.answerFeedback || "" });
+      await savePromise;
     }
     return true;
   }
@@ -6638,6 +6643,11 @@ function markCurrentQuestionComplete() {
   clearIssueTracking();
   clearSilenceFollowup();
   state.silenceGuidePending = false;
+  state.guideAbortController?.abort("question-completed");
+  state.guideAbortController = null;
+  state.guideRequestInFlight = null;
+  state.lianSpeechRequestId += 1;
+  stopLianSpeechOutput();
   state.activeGuideRequestId += 1;
   state.handwritingRequestId += 1;
   state.handwritingRetryCountByKey = {};

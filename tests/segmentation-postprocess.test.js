@@ -323,6 +323,8 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(appSource, /async function handleHandwritingAnswerVerification/);
   assert.match(appSource, /answerVerificationStatus === "correct"/);
   assert.match(appSource, /saveCurrentQuestionAndContinue\(\{ feedback/);
+  assert.match(appSource, /const savePromise = saveCurrentQuestionAndContinue\(\{ feedback \}\)/);
+  assert.match(appSource, /state\.guideAbortController\?\.abort\("question-completed"\)/);
   assert.match(appSource, /queueModelDecisionBeforeFinalCheck/);
   assert.match(serverSource, /answerVerificationStatus/);
   assert.match(serverSource, /privateAnswerReference\(answerKey\)/);
@@ -333,6 +335,7 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /answerHint 必须具体指出错误的可见行、数字、符号、运算或选项/);
   assert.match(serverSource, /const concreteHint = errorLocation && errorEvidence/);
   assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
+  assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
   assert.match(appSource, /handwriting-answer-unclear/);
   assert.match(appSource, /hasVisibleAnswerAndKeyStep/);
 });
