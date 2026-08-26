@@ -6165,6 +6165,20 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     console.warn("[guide] skipped", { eventType, reason: "no-current-question" });
     return false;
   }
+  const questionContext = `${question.problemType || question.questionType || question.type || ""} ${question.title || ""} ${question.problemText || ""}`;
+  const isChoiceQuestion = /选择题|判断题|单选|多选|下列.*(?:正确|错误)|正确的是|不正确的是|选项|结论\s*[一二三四IVX]/.test(questionContext);
+  if (isChoiceQuestion) {
+    const memory = getQuestionMemory(question) || await waitForEnteredQuestionMemory(question);
+    if (!memory?.ready || !memory.canonicalAnswer || !memory.choiceAnalysis?.selectedOption) {
+      console.info("[guide] skipped before fixed choice answer is ready", {
+        eventType,
+        questionId: question.id,
+        memoryStatus: memory?.status || "missing"
+      });
+      dom.lianState.textContent = "正在准备这道选择题的标准答案";
+      return false;
+    }
+  }
   const hasNewStudentSpeech = Boolean(String(latestStudentSpeech || "").trim());
   const guideFailureStillCooling =
     !options.retryAfterFailure &&

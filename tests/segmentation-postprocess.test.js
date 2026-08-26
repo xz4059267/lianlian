@@ -332,8 +332,21 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /禁止任何形式的对错确认式提问/);
   assert.match(serverSource, /answerHint 必须具体指出错误的可见行、数字、符号、运算或选项/);
   assert.match(serverSource, /const concreteHint = errorLocation && errorEvidence/);
+  assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
   assert.match(appSource, /handwriting-answer-unclear/);
   assert.match(appSource, /hasVisibleAnswerAndKeyStep/);
+});
+
+test("waits for a fixed choice answer before requesting guide output", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const guideGate = appSource.slice(
+    appSource.indexOf("async function requestSmartGuide"),
+    appSource.indexOf("async function requestAIGuide")
+  );
+  assert.match(guideGate, /const isChoiceQuestion =/);
+  assert.match(guideGate, /await waitForEnteredQuestionMemory\(question\)/);
+  assert.match(guideGate, /!memory\?\.ready \|\| !memory\.canonicalAnswer/);
+  assert.match(guideGate, /正在准备这道选择题的标准答案/);
 });
 
   test("does not treat a reviewable intermediate equation as a final answer", () => {
