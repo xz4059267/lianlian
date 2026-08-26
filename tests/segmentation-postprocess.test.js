@@ -297,12 +297,13 @@ test("guide receives one current blackboard image and ignores legacy handwriting
   );
   assert.match(guideRequest, /createCurrentBoardSnapshot/);
   assert.match(guideRequest, /boardImage/);
+  assert.match(guideRequest, /recognizedBoardProgress/);
   assert.match(guideGate, /state\.recognitionTimer/);
   assert.match(guideGate, /wait-for-handwriting-recognition/);
   assert.doesNotMatch(guideRequest, /questionImage,|latestHandwritingResult:/);
   assert.match(guideHandler, /currentBoardImage/);
   assert.match(guideHandler, /当前黑板区域截图/);
-  assert.match(guideHandler, /latestHandwritingResult: null/);
+  assert.match(guideHandler, /latestHandwritingResult: body\.recognizedBoardProgress \|\| null/);
   assert.doesNotMatch(guideHandler, /latestHandwritingResult: body\.latestHandwritingResult/);
 });
 
@@ -336,6 +337,7 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /const concreteHint = errorLocation && errorEvidence/);
   assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
   assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
+  assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);
   assert.match(appSource, /handwriting-answer-unclear/);
   assert.match(appSource, /hasVisibleAnswerAndKeyStep/);
 });

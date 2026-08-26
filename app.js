@@ -6398,6 +6398,22 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
   const trustedProblemText = memory?.ready && memory.problemText
     ? memory.problemText
     : question.problemText || "";
+  const hasFreshHandwritingResult = Boolean(
+    state.latestHandwritingResult &&
+    !state.recognitionTimer &&
+    !state.handwritingRequestInFlight &&
+    (state.lastHandwritingRecognizedAt || 0) >= (state.lastBoardWriteAt || 0)
+  );
+  const recognizedBoardProgress = hasFreshHandwritingResult
+    ? {
+        completedSteps: Array.isArray(state.latestHandwritingResult.completedSteps)
+          ? state.latestHandwritingResult.completedSteps.slice(0, 8)
+          : [],
+        boardComplete: state.latestHandwritingResult.boardComplete === true,
+        calculationStatus: String(state.latestHandwritingResult.calculationStatus || ""),
+        finalAnswer: String(state.latestHandwritingResult.finalAnswer || "")
+      }
+    : null;
   const requestControl = createBoundedAbortController(null, GUIDE_REQUEST_TIMEOUT_MS);
   const guideRequestId = Number(options.requestId || 0);
   const guideSessionId = Number(options.sessionId ?? options.responseToken?.sessionId ?? state.lectureSessionId ?? 0);
@@ -6466,6 +6482,10 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       knowledgePoints: question.knowledgePoints || [],
       boardImage,
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
+      // This is the structured result of the latest completed multimodal
+      // recognition, not client OCR. It lets the guide advance past steps
+      // already confirmed on the board instead of asking for them again.
+      recognizedBoardProgress,
       askedConcepts: state.askedConceptsByQuestion[question.id] || [],
       resolvedConcepts: state.resolvedConceptsByQuestion[question.id] || [],
       previousGuideQuestion: state.pendingLianQuestion?.text || "",
