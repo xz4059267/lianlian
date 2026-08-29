@@ -256,6 +256,13 @@ const QWEN_CONNECT_TIMEOUT_MS = Math.max(
   3000,
   Math.min(20000, Number(process.env.QWEN_CONNECT_TIMEOUT_MS || 20000))
 );
+// A connect timeout can be a transient egress/edge failure. Retry the same
+// configured model at most once within the existing request deadline; this is
+// deliberately not a model fallback and cannot create an unbounded loop.
+const QWEN_SAME_MODEL_RETRY_COUNT = Math.max(
+  0,
+  Math.min(1, Number(process.env.QWEN_SAME_MODEL_RETRY_COUNT || 1))
+);
 const QWEN_RESPONSE_TIMEOUT_MS = Math.max(
   3000,
   Math.min(20000, Number(process.env.QWEN_RESPONSE_TIMEOUT_MS || 15000))
@@ -3033,6 +3040,7 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true, options 
     ? Number(options.deadlineAt)
     : Date.now() + Math.max(1000, Number(options.timeoutMs) || QWEN_TOTAL_TIMEOUT_MS);
   let lastError = null;
+  let sameModelRetryCount = 0;
 
   for (let index = 0; index < candidates.length; index += 1) {
     const model = candidates[index];
@@ -3062,6 +3070,27 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true, options 
       return data;
     } catch (error) {
       lastError = error;
+      const connectionFailure = [
+        "qwen_connect_timeout",
+        "qwen_response_timeout",
+        "network_error"
+      ].includes(String(error?.code || "")) || isQwenNetworkError(error);
+      const canRetrySameModel =
+        connectionFailure &&
+        sameModelRetryCount < QWEN_SAME_MODEL_RETRY_COUNT &&
+        Date.now() < deadlineAt - 1000;
+      if (canRetrySameModel) {
+        sameModelRetryCount += 1;
+        console.warn("[qwen-retry] retrying the same model after connection failure", {
+          model,
+          retry: sameModelRetryCount,
+          maxRetries: QWEN_SAME_MODEL_RETRY_COUNT,
+          remainingMs: Math.max(0, deadlineAt - Date.now()),
+          code: error?.code || "",
+          message: error?.message || String(error)
+        });
+        continue;
+      }
       const canSwitch =
         index < candidates.length - 1 &&
         error?.code !== "qwen_total_timeout" &&
