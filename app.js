@@ -288,6 +288,7 @@ const state = {
   questionMemoriesByQuestion: {},
   questionMemoryFetchPromises: {},
   questionMemoryIdsByQuestion: {},
+  questionMemoryRetryCountByQuestion: {},
   currentQuestionCompleted: false,
   hasExplicitFinalAnswer: false,
   pendingLianQuestion: null,
@@ -2484,6 +2485,7 @@ function startLecture(queue) {
     delete state.questionMemoryStatusByQuestion[question.id];
     delete state.questionMemoriesByQuestion[question.id];
     delete state.questionMemoryFetchPromises[question.id];
+    delete state.questionMemoryRetryCountByQuestion[question.id];
     state.questionMemoryIdsByQuestion[question.id] = `qm:${state.answerSessionId}:${question.id}`;
   });
   state.lecture = queue.map((question, index) => ({
@@ -2926,9 +2928,25 @@ async function initializeQuestionMemory(question) {
 
 async function waitForEnteredQuestionMemory(question) {
   const memory = getQuestionMemory(question);
-  if (memory) return memory;
   const pending = question?.id ? state.questionMemoryFetchPromises[question.id] : null;
-  return pending ? await pending : null;
+  if (pending) return await pending;
+  if (memory?.ready) return memory;
+  // A failed/temporarily unavailable first lookup must not permanently poison
+  // the question for the rest of the lecture. Retry once at the moment a
+  // board or guide request needs the frozen answer key; subsequent failures
+  // still fail closed and never guess a standard answer.
+  if (
+    question?.id &&
+    memory &&
+    !memory.ready &&
+    Number(state.questionMemoryRetryCountByQuestion[question.id] || 0) < 1
+  ) {
+    state.questionMemoryRetryCountByQuestion[question.id] = 1;
+    delete state.questionMemoryStatusByQuestion[question.id];
+    delete state.questionMemoriesByQuestion[question.id];
+    return initializeQuestionMemory(question);
+  }
+  return memory || null;
 }
 
 function showBoardStatusPill(text, duration = 1200) {
