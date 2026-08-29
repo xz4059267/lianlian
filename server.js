@@ -9214,7 +9214,7 @@ function ensureConcreteGuideInstruction(result, context = {}) {
   const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
   const formula = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
   const action = String(output.studentAction || "").replace(/\s+/g, " ").trim();
-  const vague = /(?:确认(?:一下|下)|看看?怎么来|怎么来的|怎么得到|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看|最终答案或关键结论|最终答案.*(?:写在|写到).*(?:核验|检查)|关键结论.*(?:写在|写到).*(?:核验|检查))/i.test(speech);
+  const vague = /(?:确认(?:一下|下)|看看?怎么来|看(?:看|一下)怎么|怎么来的|怎么得到|怎么用(?:它们|这些|这个)?(?:推|算|得)|怎么推(?:出来|得出)?|如何(?:用|推|得出)|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看|先看看|推出来|最终答案或关键结论|最终答案.*(?:写在|写到).*(?:核验|检查)|关键结论.*(?:写在|写到).*(?:核验|检查))/i.test(speech);
   const hasConcreteRelation = /(?:=|＝|等于|成比例|比例|代入|相减|相加|消元|移项|乘以|除以|写出|算出|求得|得到)/i.test(`${formula} ${action}`);
   const hasFinalAnswer = Boolean(
     context.hasFinalAnswer ||
