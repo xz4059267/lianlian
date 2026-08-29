@@ -6612,7 +6612,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       // This is the structured result of the latest completed multimodal
       // recognition, not client OCR. It lets the guide advance past steps
       // already confirmed on the board instead of asking for them again.
-      recognizedBoardProgress,
+      // A cleared/empty board invalidates any older recognition snapshot. Do
+      // not let a previous answer make the model claim the student wrote it.
+      recognizedBoardProgress: hasCurrentBoardInk(question) ? recognizedBoardProgress : null,
       askedConcepts: state.askedConceptsByQuestion[question.id] || [],
       resolvedConcepts: state.resolvedConceptsByQuestion[question.id] || [],
       previousGuideQuestion: state.pendingLianQuestion?.text || "",

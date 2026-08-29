@@ -318,6 +318,7 @@ const HANDWRITING_CONSISTENCY_RULES = [
   "If calculationStatus is unclear or incomplete, avoid definitive claims and do not interrupt unless the student explicitly asks for help or is already in a stalled/silence event.",
   "The current screenshot has higher priority than speech for mathematical judgment; use speech only to understand the student's intended explanation.",
   "If hasBoardInk is false, speech alone is not evidence that any question's step or final answer is correct, including choice questions. Ask the student to write the key relation, option, or calculation on the board before checking it.",
+  "If hasBoardInk is false, never say or imply that the student has already written, listed, derived, calculated, or obtained any equation. Equations visible inside the embedded question image are printed problem conditions, not student handwriting. Address them as ‘题目给出的条件’ and ask the student to write the first exact relation on the board.",
   "If boardPendingRecognition is true, the board may have changed after the last recognition. Do not make a definitive judgment about the new strokes; ask the student to continue while recognition updates.",
   "When the screenshot and generated guidance conflict, prefer a short uncertainty response over guessing."
 ].join("\n");
@@ -9216,6 +9217,7 @@ function ensureConcreteGuideInstruction(result, context = {}) {
   const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
   const formula = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
   const action = String(output.studentAction || "").replace(/\s+/g, " ").trim();
+  const requiresExplicitStep = /^(?:active_help|stuck|silence|silence_followup|silence_escalation|error_silence|repeat_wrong|next_step|jump|check)$/.test(String(context.eventType || ""));
   const vague = /(?:确认(?:一下|下)|看看?怎么来|看(?:看|一下)怎么|怎么来的|怎么得到|怎么用(?:它们|这些|这个)?(?:推|算|得)|怎么推(?:出来|得出)?|如何(?:用|推|得出)|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看|先看看|推出来|最终答案或关键结论|最终答案.*(?:写在|写到).*(?:核验|检查)|关键结论.*(?:写在|写到).*(?:核验|检查))/i.test(speech);
   const hasConcreteRelation = /(?:=|＝|等于|成比例|比例|代入|相减|相加|消元|移项|乘以|除以|写出|算出|求得|得到)/i.test(`${formula} ${action} ${speech}`);
   const hasFinalAnswer = Boolean(
@@ -9224,7 +9226,21 @@ function ensureConcreteGuideInstruction(result, context = {}) {
     context.boardCompletionVerified ||
     String(context.recognizedBoardProgress?.finalAnswer || "").trim()
   );
-  if (!vague && hasConcreteRelation && formula) return output;
+  const claimsStudentBoardWork = /你(?:刚才|已经|先前)?(?:写出|写了|列出|列了|算出|推导出|得到|得出).{0,24}(?:式子|关系|方程|结果|答案)/i.test(speech);
+  if (context.hasBoardInk === false && claimsStudentBoardWork) {
+    return {
+      ...output,
+      shouldSpeak: false,
+      speech: "",
+      formulaOrStep: "",
+      askStudentToRepeat: false,
+      studentAction: "",
+      lectureComplete: false,
+      guideUnavailableReason: "model_misattributed_question_image"
+    };
+  }
+  const formulaAppearsInSpeech = Boolean(formula && speech.includes(formula));
+  if (!vague && hasConcreteRelation && formula && (!requiresExplicitStep || formulaAppearsInSpeech)) return output;
 
   // Guidance must come from Qwen. If the model returned an empty, generic,
   // or non-actionable response, suppress it instead of fabricating a local
@@ -9483,7 +9499,10 @@ async function handleGuide(req, res) {
     sessionId: guideSessionId
   });
 
+  guideResult = ensureConcreteSilenceGuide(guideResult, guideBody);
   guideResult = ensureConcreteGuideInstruction(guideResult, {
+    eventType: body.eventType || "normal",
+    hasBoardInk: body.hasBoardInk === true,
     guideProgress,
     silenceContextStep: guideBody.silenceContextStep,
     verifiedGuideSteps,

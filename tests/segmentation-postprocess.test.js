@@ -343,6 +343,8 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
   assert.match(serverSource, /HIGHEST PRIORITY SILENCE OVERRIDE/);
   assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);
+  assert.match(serverSource, /guideResult = ensureConcreteSilenceGuide\(guideResult, guideBody\)/);
+  assert.match(serverSource, /requiresExplicitStep/);
   assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);
   assert.match(appSource, /handwriting-answer-unclear/);
   assert.match(appSource, /hasVisibleAnswerAndKeyStep/);
