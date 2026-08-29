@@ -298,6 +298,7 @@ const state = {
   pendingLianOpeningText: "",
   askedConceptsByQuestion: {},
   resolvedConceptsByQuestion: {},
+  guideHistoryByQuestion: {},
   logItemsByKey: new Map(),
   lastSilentNoticeAtByKey: new Map(),
   promptVariantLastByKey: new Map(),
@@ -2506,6 +2507,7 @@ function startLecture(queue) {
   state.boardHistories = {};
   state.boardImageStates = {};
   state.boardHeights = {};
+  state.guideHistoryByQuestion = {};
   state.handwritingResults = {};
   state.transcriptsByQuestion = {};
   state.awaitingFinalAnswer = false;
@@ -3311,6 +3313,8 @@ dom.nextPageBtn.addEventListener("click", () => {
 
 function resetQuestionGuideState(options = {}) {
   const now = Date.now();
+  const resetQuestionId = currentPageQuestion()?.id || "";
+  if (resetQuestionId) delete state.guideHistoryByQuestion[resetQuestionId];
   clearTimeout(state.openingSpeechWatchdogTimer);
   state.openingSpeechWatchdogTimer = null;
   state.lectureSessionId += 1;
@@ -6450,6 +6454,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
 
     if (hasStudentInputSince(guideInputSnapshot)) return false;
     const silenceStage = Number(options.silenceStage || state.silenceGuideStage || 0);
+    rememberGuideResult(questionId, result, { eventType, silenceStage });
     const guideFormula = /silence/.test(eventType)
       ? extractConcreteMathRelation(String(result?.formulaOrStep || ""))
       : "";
@@ -6669,6 +6674,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       recognizedBoardProgress: hasCurrentBoardInk(question) ? recognizedBoardProgress : null,
       askedConcepts: state.askedConceptsByQuestion[question.id] || [],
       resolvedConcepts: state.resolvedConceptsByQuestion[question.id] || [],
+      recentGuideHistory: getRecentGuideHistory(question.id),
       previousGuideQuestion: state.pendingLianQuestion?.text || "",
       // The server/model reads progress from the current blackboard image;
       // never send a step reconstructed from an older handwriting result.
@@ -7106,6 +7112,41 @@ function getGuidanceDedupeKey(text, options = {}) {
   const questionId = options.questionId || currentPageQuestion()?.id || "global";
   const contentKey = options.dedupeKey || normalizeGuidanceFingerprint(text);
   return contentKey ? `${questionId}:${contentKey}` : "";
+}
+
+function getRecentGuideHistory(questionId = currentPageQuestion()?.id || "") {
+  if (!questionId) return [];
+  const history = state.guideHistoryByQuestion[questionId];
+  return Array.isArray(history) ? history.slice(-8) : [];
+}
+
+function rememberGuideResult(questionId, result, meta = {}) {
+  if (!questionId || !result || typeof result !== "object") return;
+  const speech = String(result.speech || "").replace(/\s+/g, " ").trim();
+  const formulaOrStep = String(result.formulaOrStep || "").replace(/\s+/g, " ").trim();
+  const studentAction = String(result.studentAction || "").replace(/\s+/g, " ").trim();
+  if (!speech && !formulaOrStep && !studentAction) return;
+  const entry = {
+    eventType: String(meta.eventType || ""),
+    silenceStage: Number(meta.silenceStage || 0),
+    speech,
+    formulaOrStep,
+    studentAction,
+    at: Date.now()
+  };
+  const history = getRecentGuideHistory(questionId);
+  const fingerprint = normalizeGuidanceFingerprint(
+    [formulaOrStep, studentAction, speech].filter(Boolean).join("|")
+  );
+  const previous = history.at(-1);
+  const previousFingerprint = previous
+    ? normalizeGuidanceFingerprint(
+        [previous.formulaOrStep, previous.studentAction, previous.speech].filter(Boolean).join("|")
+      )
+    : "";
+  if (fingerprint && fingerprint === previousFingerprint) return;
+  history.push(entry);
+  state.guideHistoryByQuestion[questionId] = history.slice(-8);
 }
 
 function lianSpeechLooksLikeQuestion(text) {

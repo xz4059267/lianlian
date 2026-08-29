@@ -34,6 +34,7 @@ const {
   applyLatestHandwritingConsistency,
   ensureConcreteSilenceGuide,
   ensureConcreteGuideInstruction,
+  guideResultRepeatsRecentInstruction,
   ensureGuideFormulaMatchesTrustedSteps,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
@@ -135,6 +136,30 @@ test("rejects vague variable-representation guidance but accepts an explicit con
   );
   assert.equal(method.shouldSpeak, true);
   assert.equal(method.studentAction, "先用x和2y按题目关系做差，把结果记为m。");
+});
+
+test("rejects a repeated guidance operation and leaves later steps available", () => {
+  const recent = [
+    {
+      speech: "先读取指向m的两个量，按关系做差。",
+      formulaOrStep: "",
+      studentAction: "先用x和2y按题目关系做差，把结果记为m。"
+    }
+  ];
+  assert.equal(
+    guideResultRepeatsRecentInstruction(
+      { speech: "换句话说，先把x和2y相减，结果记到m。", studentAction: "把x和2y相减后写成m。" },
+      recent
+    ),
+    true
+  );
+  assert.equal(
+    guideResultRepeatsRecentInstruction(
+      { speech: "接下来把m代入第二个关系，求出n。", studentAction: "把m代入第二个关系求n。" },
+      recent
+    ),
+    false
+  );
 });
 
 test("allows stage-4 silence to explain without a standard-answer key", async () => {

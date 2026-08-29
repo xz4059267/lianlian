@@ -291,6 +291,7 @@ const LIAN_GUIDE_PROMPT = [
   "最高优先级的可执行输出规则：只要 eventType 是 silence、silence_followup、silence_escalation、stuck、active_help、next_step 或 answer_to_lian_question，就必须 shouldSpeak=true，speech 非空，并且 formulaOrStep 或 studentAction 至少有一个非空且能立即执行；关系式要写出具体对象/符号，动作要写清楚要代入、移项、相减、比较、复述或写下什么。禁止只返回‘继续想想’、‘再看看’、‘我来核对’等空泛话术。",
   "具体列式硬规则：凡是要求学生‘把某个量用其他量表示’、‘列出关系式’、‘写出方程’或‘开始列式’，不能只说‘把 m、n 用 x、y 表示’这类方向性话术；必须给出完整等式，或给出同样明确的列式方法：指出先看哪两个具体对象/位置，依据什么关系，以及进行相加、相减、代入、移项等哪一种运算、结果放到哪个量。无法可靠读出等式或列式方法时，必须明确说明缺少哪一条视觉关系，不能用变量名或省略号代替下一步。",
   "列式方法的最低可执行格式：当暂时不适合直接给完整等式时，至少说清‘先读取/取哪两个具体量或位置’、‘依据哪条关系做什么运算’、‘把结果记到哪个量’；可用‘先用___和___按___关系相减/相加，把结果记为___’这样的句式。只说‘把 m、n 用 x、y 表示出来’、‘列出三个式子’或‘把过程写清楚’都不合格。",
+  "递进规则：recentGuideHistory 是本题已经播报过的引导。每次只给一个尚未完成的新操作；不得把历史引导换同义词重复。若上一条关系尚未写出，先把它拆成更小的可执行动作（明确读取对象、运算和目标），完成后再进入下一条关系；若已完成，直接选择 verifiedGuideSteps 中下一个未完成步骤。",
   "空板规则：如果‘导入后新增的学生笔迹隔离层’为空，或当前截图没有可确认的新增学生笔迹，必须明确按‘还没有看到学生板书’处理；即使首页导入图片中有红叉、圈画、批注、选项或公式，也不能说学生刚才画了、写出、列出、算出或得到任何内容。此时只能要求学生先把当前题目的第一条具体关系式或计算步骤写到黑板上，不能把首页导入图片中的内容冒充成学生板书。",
   "语气像温柔、耐心的女生学习伙伴：自然、短、轻一点，不要像 AI 播报，也不要像老师批改。",
   "必须遵守四个状态机：A heuristic_guidance=启发引导；B micro_hint=知识点微提示；C interactive_teaching=互动讲解；D archive_review=归档复习。",
@@ -9197,6 +9198,18 @@ function ensureConcreteGuideInstruction(result, context = {}) {
       guideUnavailableReason: "model_relation_method_not_concrete"
     };
   }
+  if (requiresExplicitStep && guideResultRepeatsRecentInstruction(output, context.recentGuideHistory)) {
+    return {
+      ...output,
+      shouldSpeak: false,
+      speech: "",
+      formulaOrStep: "",
+      askStudentToRepeat: false,
+      studentAction: "",
+      lectureComplete: false,
+      guideUnavailableReason: "model_repeated_previous_guidance"
+    };
+  }
   // A concrete construction method is actionable even when it is not yet a
   // complete equation. Do not require an empty board here: the student may
   // already have written a partial step and only needs the next operation.
@@ -9220,6 +9233,57 @@ function ensureConcreteGuideInstruction(result, context = {}) {
     lectureComplete: false,
     guideUnavailableReason: "model_response_not_actionable"
   };
+}
+
+function guideHistoryEntryTexts(entry) {
+  if (entry && typeof entry === "object") {
+    return [entry.formulaOrStep, entry.studentAction, entry.speech]
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+  }
+  const value = String(entry || "").replace(/\s+/g, " ").trim();
+  return value ? [value] : [];
+}
+
+function guideInstructionSignature(value) {
+  const text = normalizeGuideStepText(value);
+  const operationTokens = text.match(/代入|相减|相加|做差|作差|相乘|相除|消元|移项|比较|读取|列出|写出|写成|记为|表示为/g) || [];
+  const operations = [...new Set(operationTokens.map((token) => {
+    if (/相减|做差|作差/.test(token)) return "subtract";
+    if (/相加/.test(token)) return "add";
+    if (/相乘/.test(token)) return "multiply";
+    if (/相除/.test(token)) return "divide";
+    if (/写成|记为|表示为/.test(token)) return "assign";
+    return token;
+  }))];
+  return {
+    text,
+    operations,
+    symbols: [...new Set((text.match(/[a-z][a-z0-9]*|\d+(?:\.\d+)?/gi) || []).map((item) => item.toLowerCase()))]
+  };
+}
+
+function guideResultsShareOperation(left, right) {
+  const leftSignature = guideInstructionSignature(left);
+  const rightSignature = guideInstructionSignature(right);
+  if (!leftSignature.text || !rightSignature.text) return false;
+  if (
+    leftSignature.text.includes(rightSignature.text) ||
+    rightSignature.text.includes(leftSignature.text)
+  ) return true;
+  const sharedOperation = leftSignature.operations.some((operation) => rightSignature.operations.includes(operation));
+  const sharedSymbolCount = leftSignature.symbols.filter((symbol) => rightSignature.symbols.includes(symbol)).length;
+  return sharedOperation && sharedSymbolCount >= 1;
+}
+
+function guideResultRepeatsRecentInstruction(result, recentGuideHistory = []) {
+  if (!Array.isArray(recentGuideHistory) || !recentGuideHistory.length) return false;
+  const candidateTexts = guideHistoryEntryTexts(result).slice(0, 2);
+  if (!candidateTexts.length) return false;
+  return recentGuideHistory.some((entry) => {
+    const previousTexts = guideHistoryEntryTexts(entry).slice(0, 2);
+    return candidateTexts.some((candidate) => previousTexts.some((previous) => guideResultsShareOperation(candidate, previous)));
+  });
 }
 
 function normalizeGuideStepText(value) {
@@ -9415,6 +9479,7 @@ async function handleGuide(req, res) {
     guideProgress,
     silenceContextStep: guideBody.silenceContextStep,
     verifiedGuideSteps,
+    recentGuideHistory: Array.isArray(body.recentGuideHistory) ? body.recentGuideHistory.slice(-8) : [],
     recognizedBoardProgress: body.recognizedBoardProgress,
     hasFinalAnswer: Boolean(body.studentFinalAnswerEvidence || body.answerVerified),
     answerVerified: body.answerVerified === true,
@@ -9486,6 +9551,7 @@ async function handleGuide(req, res) {
           resolvedConcepts: guideProgress.resolvedConcepts,
           silenceContextStep: guideBody.silenceContextStep || "",
           verifiedGuideSteps,
+          recentGuideHistory: Array.isArray(body.recentGuideHistory) ? body.recentGuideHistory.slice(-8) : [],
           boardPendingRecognition: Boolean(body.boardPendingRecognition),
           recognizedBoardProgress: body.recognizedBoardProgress || null,
           verifiedAnswerReference: answerReference,
@@ -9501,6 +9567,7 @@ async function handleGuide(req, res) {
             "lectureUnlocked=true 时默认只讲一个小步骤；但 silenceStage>=4 且学生持续沉默时，必须一次性完成当前题的详细讲解，给出关键式和最终答案。",
             `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2可以给出下一步具体运算关系；阶段3可以给出关键式子并要求学生写下或复述；阶段4如果学生持续沉默，直接根据题图完成详细讲解，给出关键式子和最终答案，不需要等待标准答案核验，但必须先自行检查计算。`,
             "沉默时间越长，引导必须越具体：不能在后续阶段重复阶段1的泛泛提问，也不能把已经给过的提示原样重复。",
+            "recentGuideHistory 中已经出现的关系式、运算或目标不得再次用同义话术重复；必须根据已完成步骤推进到下一个操作，或把上一条拆成更小且不同的前置动作。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
             "如果 eventType=active_help，学生已经明确提问或表示不会，必须 shouldSpeak=true，并直接回应这个问题；只给当前最需要的一个小步骤，不要先泛泛鼓励。",
             "当 studentStrokeLayerStatus=empty 或 hasBoardInk=false 时，合成黑板图中导入题目图片里的红叉、圈画、批注、选项和公式都不是学生本次输入；不得说‘你画了红叉’、‘你写出了……’或据此推进核验，只能明确说明还没有看到新增学生板书，并要求写第一条具体关系式或计算步骤。",
@@ -10591,6 +10658,7 @@ module.exports = {
   applyLatestHandwritingConsistency,
   ensureConcreteSilenceGuide,
   ensureConcreteGuideInstruction,
+  guideResultRepeatsRecentInstruction,
   ensureGuideFormulaMatchesTrustedSteps,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
