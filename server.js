@@ -500,7 +500,7 @@ const HANDWRITING_PROMPT = [
   "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
   "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"，answerVerificationStatus=\"unclear\"；如果没有可见最终答案，answerVerificationStatus=\"not_present\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
-  "如果只有语音而当前黑板没有学生关键笔迹或最终答案，禁止核验答案，返回 answerVerificationStatus=\"not_present\"、nextAction=ask_for_board，并提醒学生把关键关系式和最终答案写到黑板上。",
+  "如果只有语音而当前黑板没有学生关键笔迹，禁止核验答案，返回 answerVerificationStatus=\"not_present\"、nextAction=ask_for_board，并只提醒学生把当前关键关系式或计算步骤写到黑板上；不要要求提前写最终答案，最终答案必须由后续板书识别确认。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");
 
@@ -9217,7 +9217,7 @@ function ensureConcreteGuideInstruction(result, context = {}) {
   const formula = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
   const action = String(output.studentAction || "").replace(/\s+/g, " ").trim();
   const vague = /(?:确认(?:一下|下)|看看?怎么来|看(?:看|一下)怎么|怎么来的|怎么得到|怎么用(?:它们|这些|这个)?(?:推|算|得)|怎么推(?:出来|得出)?|如何(?:用|推|得出)|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看|先看看|推出来|最终答案或关键结论|最终答案.*(?:写在|写到).*(?:核验|检查)|关键结论.*(?:写在|写到).*(?:核验|检查))/i.test(speech);
-  const hasConcreteRelation = /(?:=|＝|等于|成比例|比例|代入|相减|相加|消元|移项|乘以|除以|写出|算出|求得|得到)/i.test(`${formula} ${action}`);
+  const hasConcreteRelation = /(?:=|＝|等于|成比例|比例|代入|相减|相加|消元|移项|乘以|除以|写出|算出|求得|得到)/i.test(`${formula} ${action} ${speech}`);
   const hasFinalAnswer = Boolean(
     context.hasFinalAnswer ||
     context.answerVerified ||

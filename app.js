@@ -6358,19 +6358,15 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     const lectureComplete = shouldCompleteCurrentLecture(result, latestStudentSpeech);
     // Only Qwen may provide guide speech. Local formula/generic fallbacks are disabled.
     const speech = formatGuideSpeech(result);
-    if (result.shouldSpeak === false && !options.force) {
+    if (!speech) {
+      // The model owns the decision to stay silent. The client only renders
+      // text that the model actually returned and never turns a silent result
+      // into a local guide message.
       dom.lianState.textContent = guideIdleText();
       if (result.guideUnavailableReason === "model_response_not_actionable") {
         dom.lianState.textContent = "大模型没有返回明确下一步";
-        lianSilentNotice("这次大模型没有返回可执行的下一步，未生成本地引导；请稍后重试。", {
-          key: `guide-not-actionable:${questionId}`,
-          cooldownMs: 60000
-        });
       }
       if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
-      return false;
-    }
-    if (!speech) {
       console.warn("[guide] Qwen returned no speech; local fallback is disabled", {
         eventType,
         requestId,
@@ -6378,10 +6374,6 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
         provider: result?.provider || "qwen-structured-answer-guidance"
       });
       dom.lianState.textContent = "大模型没有返回引导";
-      lianSilentNotice("这次引导没有拿到可用回复，请继续说或写下当前步骤。", {
-        key: `guide-empty:${questionId}`,
-        cooldownMs: 60000
-      });
       state.guideUnavailableAt = Date.now();
       state.guideUnavailableQuestionId = questionId;
       state.guideUnavailableUntil = Date.now() + 60000;
