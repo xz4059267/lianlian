@@ -327,6 +327,7 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(appSource, /const savePromise = saveCurrentQuestionAndContinue\(\{ feedback \}\)/);
   assert.match(appSource, /state\.guideAbortController\?\.abort\("question-completed"\)/);
   assert.match(appSource, /queueModelDecisionBeforeFinalCheck/);
+  assert.match(appSource, /hasExplicitHandwritingFinality\(result, pendingAnswer\)/);
   assert.match(serverSource, /answerVerificationStatus/);
   assert.match(serverSource, /privateAnswerReference\(answerKey\)/);
   assert.match(serverSource, /latestStudentSpeech/);
@@ -360,7 +361,7 @@ test("waits for a fixed choice answer before requesting guide output", () => {
   test("does not treat a reviewable intermediate equation as a final answer", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const gateSource = appSource.slice(
-    appSource.indexOf("function extractHandwritingFinalAnswerCandidate"),
+    appSource.indexOf("function hasExplicitHandwritingFinality"),
     appSource.indexOf("function normalizeBoardMathText")
   );
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
@@ -370,8 +371,9 @@ test("waits for a fixed choice answer before requesting guide output", () => {
   );
 
   assert.match(gateSource, /modelAction === "verify_answer"/);
-  assert.doesNotMatch(gateSource, /hasExplicitHandwritingFinality/);
-  assert.doesNotMatch(gateSource, /standaloneAssignment/);
+  assert.match(gateSource, /hasExplicitHandwritingFinality/);
+  assert.match(gateSource, /getVisibleHandwritingEvidence/);
+  assert.match(gateSource, /Bare numbers or relations are ambiguous/);
   assert.doesNotMatch(gateSource, /hasReviewableBoardStep\(result\)/);
   assert.match(promptSource, /boardComplete=true 仅表示存在可核验关键步骤/);
     assert.match(promptSource, /x-2y=m、m-n=8/);

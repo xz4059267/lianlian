@@ -3640,7 +3640,11 @@ async function runHandwritingRecognition(reason) {
       }
       const pendingAnswer = state.pendingFinalAnswerText;
       const modelAction = String(result?.nextAction || "").trim();
-      if (pendingAnswer && isModelBoardReadyForFinalCheck(result)) {
+      if (
+        pendingAnswer &&
+        isModelBoardReadyForFinalCheck(result) &&
+        hasExplicitHandwritingFinality(result, pendingAnswer)
+      ) {
         state.waitingForBoardBeforeFinalAnswer = false;
         state.pendingFinalAnswerText = "";
         dom.recognitionPill.textContent = "正在核对最后答案";
@@ -4190,11 +4194,50 @@ function getHandwritingAnswerEvidence(result) {
     .normalize("NFKC");
 }
 
+function hasExplicitHandwritingFinality(result, finalAnswer) {
+  const answer = normalizeBoardMathText(finalAnswer);
+  const visibleEvidence = getVisibleHandwritingEvidence(result).normalize("NFKC");
+  const evidence = normalizeBoardMathText(visibleEvidence);
+  if (!answer || !evidence) return false;
+
+  // The model may see a printed option or answer in the question image and
+  // accidentally copy it into finalAnswer.  Only accept a choice when the
+  // same option is explicitly present in the handwriting transcription.
+  const choiceMatch = answer.match(/(?:^|[^A-Z])([A-D])(?:$|[^A-Z])/i);
+  if (choiceMatch && /(?:^|[^A-Z])([A-D])(?:$|[^A-Z])/i.test(answer)) {
+    const option = choiceMatch[1].toUpperCase();
+    const optionPattern = new RegExp(`(?:^|[^A-Z])${option}(?:$|[^A-Z]|项|选项)`, "i");
+    if (!optionPattern.test(evidence)) return false;
+  }
+
+  const hasFinalMarker = /(?:答案|结果|结论|选择|选项|故选|因此|所以)/.test(evidence);
+  const assignments = answer.match(/[a-zA-Z]\s*(?:=|＝|等于)\s*[-+]?\d+(?:\.\d+)?/g) || [];
+  if (assignments.length > 0) {
+    const allVisible = assignments.every((assignment) =>
+      evidence.includes(normalizeBoardMathText(assignment))
+    );
+    if (!allVisible) return false;
+    return true;
+  }
+
+  // Bare numbers or relations are ambiguous: m-n=8 and x-y=2 are often
+  // intermediate work, not a final answer. Require a visible conclusion
+  // marker or a standalone handwritten line before accepting them.
+  if (!hasFinalMarker) {
+    const standalone = visibleEvidence
+      .split(/\r?\n/)
+      .some((line) => normalizeBoardMathText(line) === answer);
+    if (!standalone) return false;
+  }
+  return true;
+}
+
 function extractHandwritingFinalAnswerCandidate(result) {
   const modelAction = String(result?.nextAction || "").trim();
   const modelFinalAnswer = String(result?.finalAnswer || "").normalize("NFKC").trim();
   if (
     modelFinalAnswer &&
+    hasExplicitHandwritingFinality(result, modelFinalAnswer) &&
     (
       modelAction === "verify_answer" ||
       modelAction === "finished" ||
