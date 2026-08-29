@@ -50,8 +50,12 @@ function parseQwenModelList(value) {
 }
 
 const QWEN_FALLBACK_MODELS = parseQwenModelList(
-  process.env.QWEN_FALLBACK_MODELS ||
-    "qwen3.8-max,qwen3.5-omni-flash-2026-03-15,qwen3-omni-flash,qwen3-omni-flash-2025-12-01"
+  process.env.QWEN_FALLBACK_MODELS === undefined
+    ? "qwen3.8-max,qwen3.5-omni-flash-2026-03-15,qwen3-omni-flash,qwen3-omni-flash-2025-12-01"
+    : process.env.QWEN_FALLBACK_MODELS
+);
+const QWEN_ONLY_MODEL = !["0", "false", "off"].includes(
+  String(process.env.QWEN_ONLY_MODEL || "1").toLowerCase()
 );
 const QWEN_GUIDE_MODEL_CANDIDATES = [...new Set([
   QWEN_GUIDE_MODEL,
@@ -2961,6 +2965,7 @@ async function requestQwenChatCompletionOnce(
 
 function getQwenModelCandidates(model, explicitCandidates = []) {
   const configured = String(model || "").trim();
+  if (QWEN_ONLY_MODEL) return configured ? [configured] : [];
   const explicit = Array.isArray(explicitCandidates) ? explicitCandidates : [];
   const byPurpose = configured === QWEN_HANDWRITING_MODEL
     ? QWEN_HANDWRITING_MODEL_CANDIDATES
