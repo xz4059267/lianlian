@@ -82,7 +82,7 @@ const QWEN_REQUEST_TIMEOUT_MS = Math.max(
 // request into several minutes of serial waiting.
 const QWEN_TOTAL_TIMEOUT_MS = Math.max(
   12000,
-  Math.min(55000, Number(process.env.QWEN_TOTAL_TIMEOUT_MS || 45000))
+  Math.min(55000, Number(process.env.QWEN_TOTAL_TIMEOUT_MS || 55000))
 );
 // Guidance is a short interactive turn. It should not consume the longer
 // handwriting/answer budget while the student is waiting for a response.
@@ -250,7 +250,7 @@ const REQUEST_REGISTRY_LIMIT = 2048;
 
 const QWEN_CONNECT_TIMEOUT_MS = Math.max(
   3000,
-  Math.min(20000, Number(process.env.QWEN_CONNECT_TIMEOUT_MS || 12000))
+  Math.min(20000, Number(process.env.QWEN_CONNECT_TIMEOUT_MS || 20000))
 );
 const QWEN_RESPONSE_TIMEOUT_MS = Math.max(
   3000,
@@ -303,6 +303,8 @@ const LIAN_GUIDE_PROMPT = [
   "如果 recognizedBoardProgress.completedSteps 中已经列出某个板书步骤，视为该步骤已写出并由最近一次板书识别确认；不得再次询问学生写出、说明或确认这一条，必须直接引导到 verifiedGuideSteps 中尚未完成的下一步。",
   "选择题进入后必须把 verifiedAnswerReference.canonicalAnswer 与 choiceAnalysis 视为已经固定的唯一标准答案；不得重新猜测选项字母或结论组合，也不得把学生板书与结论的差异改写成‘是不是算错了’式引导。核对某个结论时直接说明它支持或不支持该结论；未解锁最终答案时可以暂不说出选项，但不能要求学生确认对错。",
   "如果当前黑板区域截图里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
+  "每次需要引导时，必须给出一个学生立刻能执行的单一步骤：明确写出要使用的关系式、要代入的数、要移项/消元的对象，或要计算的等式两边，并在 studentAction 中说明写什么。禁止只说‘请把当前这一步写出来’、‘继续下一步’、‘再看看怎么来’等没有对象和操作的空泛话术。",
+  "如果 Question Memory 暂不可用，仍须先从当前黑板截图和题目图片中读出可见的最后一行，给出不涉及最终答案的具体下一步操作；只有确实无法辨认任何关系式时，才明确说明缺少哪一行，并要求学生按‘左边=右边’补全该行，不能伪造公式。",
   "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
 ].join("\n");
 
@@ -9245,18 +9247,18 @@ function ensureConcreteGuideInstruction(result, context = {}) {
     };
   }
 
-  // If Question Memory is temporarily unavailable, still give an actionable
-  // writing instruction instead of a confirmation question. Do not invent an
-  // equation or answer when no trusted step is available.
+  // If neither the model nor the trusted step list supplied a concrete
+  // relation, do not let a vague placeholder reach the student. Ask for the
+  // exact visible line needed to continue, without inventing mathematics.
   if (vague || !hasConcreteRelation) {
     return {
       ...output,
       shouldSpeak: true,
-      speech: "请把当前这一步的等式变形和计算结果写在黑板上，再继续下一步。",
+      speech: "请把黑板上最后一行按‘左边=右边’完整写清，并标出要代入的已知数；写好后我会直接给出下一步。",
       hintLevel: "light",
       formulaOrStep: "",
       askStudentToRepeat: false,
-      studentAction: "请写出等式变形、代入或计算结果。",
+      studentAction: "补全最后一行等式，写出已知数代入位置。",
       lectureComplete: false
     };
   }
@@ -9420,7 +9422,7 @@ async function handleGuide(req, res) {
       STATEMENT_EVALUATION_RULES,
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
-      "Concrete guidance source: use verifiedGuideSteps and verifiedAnswerReference.solutionOutline as the only source for relations and formulas. Never copy equations from raw OCR or an unverified handwriting fragment into silenceContextStep.",
+      "Concrete guidance source: prefer verifiedGuideSteps and verifiedAnswerReference.solutionOutline. When Question Memory is unavailable, derive only one non-final next operation from the current screenshot's visible equation and the question image; never copy an unverified OCR fragment or invent a relation that is not visible.",
     `SILENCE POLICY OVERRIDE: stage ${silenceStage}. The first automatic silence response is stage 2 at 60 seconds; do not give the vague stage-1 care prompt. Stage 2 must give the first concrete problem-specific relation or operation; stage 3 gives the next key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
     ].join("\n\n"),
     content: [

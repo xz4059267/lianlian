@@ -3486,6 +3486,13 @@ function explainHandwritingError(error) {
       pauseMs: 0
     };
   }
+  if (/^qwen_(?:connect|response|parse)_timeout$/.test(code)) {
+    return {
+      pill: "Qwen连接超时",
+      log: `Qwen ${stage || code.replace(/^qwen_|_timeout$/g, "")} 阶段超过等待时间，接口没有返回；系统已保留板书并尝试备用模型，下一次停笔会继续重试。`,
+      pauseMs: 0
+    };
+  }
   if (code === "qwen_total_timeout") {
     return {
       pill: "识别请求超时",
