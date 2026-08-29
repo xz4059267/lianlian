@@ -6317,6 +6317,13 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     const speech = formatGuideSpeech(result);
     if (result.shouldSpeak === false && !options.force) {
       dom.lianState.textContent = guideIdleText();
+      if (result.guideUnavailableReason === "model_response_not_actionable") {
+        dom.lianState.textContent = "大模型没有返回明确下一步";
+        lianSilentNotice("这次大模型没有返回可执行的下一步，未生成本地引导；请稍后重试。", {
+          key: `guide-not-actionable:${questionId}`,
+          cooldownMs: 60000
+        });
+      }
       if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
       return false;
     }

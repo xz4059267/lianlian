@@ -9224,45 +9224,21 @@ function ensureConcreteGuideInstruction(result, context = {}) {
     context.boardCompletionVerified ||
     String(context.recognizedBoardProgress?.finalAnswer || "").trim()
   );
-  const candidateSteps = [
-    context.guideProgress?.currentStep,
-    ...(Array.isArray(context.verifiedGuideSteps) ? context.verifiedGuideSteps : []),
-    context.silenceContextStep
-  ]
-    .map((step) => String(step || "").replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-  const nextStep = candidateSteps.find((step) => hasFinalAnswer || !/(?:最终答案|最终结果|关键结论|答案(?:是|为|等于))/i.test(step)) || "";
-
   if (!vague && hasConcreteRelation && formula) return output;
-  if (nextStep) {
-    return {
-      ...output,
-      shouldSpeak: true,
-      speech: `下一步直接做：${nextStep}。请把这一步写在黑板上，再继续计算。`,
-      hintLevel: output.hintLevel === "worked_step" ? output.hintLevel : "light",
-      formulaOrStep: nextStep,
-      askStudentToRepeat: false,
-      studentAction: `请把${nextStep}写在黑板上，再继续下一步。`,
-      lectureComplete: false
-    };
-  }
 
-  // If neither the model nor the trusted step list supplied a concrete
-  // relation, do not let a vague placeholder reach the student. Ask for the
-  // exact visible line needed to continue, without inventing mathematics.
-  if (vague || !hasConcreteRelation) {
-    return {
-      ...output,
-      shouldSpeak: true,
-      speech: "请把黑板上最后一行按‘左边=右边’完整写清，并标出要代入的已知数；写好后我会直接给出下一步。",
-      hintLevel: "light",
-      formulaOrStep: "",
-      askStudentToRepeat: false,
-      studentAction: "补全最后一行等式，写出已知数代入位置。",
-      lectureComplete: false
-    };
-  }
-  return output;
+  // Guidance must come from Qwen. If the model returned an empty, generic,
+  // or non-actionable response, suppress it instead of fabricating a local
+  // mathematical instruction from Question Memory or OCR fragments.
+  return {
+    ...output,
+    shouldSpeak: false,
+    speech: "",
+    formulaOrStep: "",
+    askStudentToRepeat: false,
+    studentAction: "",
+    lectureComplete: false,
+    guideUnavailableReason: "model_response_not_actionable"
+  };
 }
 
 function getSilenceGuidePolicy(stage) {
@@ -9529,9 +9505,9 @@ async function handleGuide(req, res) {
     return;
   }
 
-  // Model-only guide mode: return Qwen's structured response unchanged.
-  // Local formula builders and speech rewriters are intentionally bypassed so
-  // stale board context cannot masquerade as fresh model guidance.
+  // Model-only guide mode: only an actionable Qwen speech is returned.
+  // Local code may reject a vague response, but it never writes replacement
+  // mathematics or speech into the model result.
   console.info("[guide] qwen response accepted without local post-processing", {
     eventType: body.eventType || "",
     silenceStage: Number(body.silenceStage) || 0,
@@ -9551,7 +9527,7 @@ async function handleGuide(req, res) {
     answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
     provider: "qwen-structured-answer-guidance",
     fallbackFrom: "",
-    localPostProcessing: false
+    guideSpeechSource: "qwen"
   });
 }
 
