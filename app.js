@@ -6427,9 +6427,18 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
         completedSteps: Array.isArray(state.latestHandwritingResult.completedSteps)
           ? state.latestHandwritingResult.completedSteps.slice(0, 8)
           : [],
+        // Preserve the model's complete current-board transcription so the
+        // guide can recognize assignments/choices that were visible but not
+        // promoted into completedSteps by a single handwriting response.
+        detectedWriting: String(state.latestHandwritingResult.detectedWriting || ""),
+        recognizedText: String(state.latestHandwritingResult.recognizedText || ""),
+        mathExpression: String(state.latestHandwritingResult.mathExpression || ""),
+        boardText: String(state.latestHandwritingResult.boardText || ""),
+        writingState: String(state.latestHandwritingResult.writingState || ""),
         boardComplete: state.latestHandwritingResult.boardComplete === true,
         calculationStatus: String(state.latestHandwritingResult.calculationStatus || ""),
-        finalAnswer: String(state.latestHandwritingResult.finalAnswer || "")
+        finalAnswer: String(state.latestHandwritingResult.finalAnswer || ""),
+        answerVerificationStatus: String(state.latestHandwritingResult.answerVerificationStatus || "")
       }
     : null;
   const requestControl = createBoundedAbortController(null, GUIDE_REQUEST_TIMEOUT_MS);
