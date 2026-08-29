@@ -2945,17 +2945,18 @@ async function waitForEnteredQuestionMemory(question) {
   const pending = question?.id ? state.questionMemoryFetchPromises[question.id] : null;
   if (pending) return await pending;
   if (memory?.ready) return memory;
-  // A failed/temporarily unavailable first lookup must not permanently poison
-  // the question for the rest of the lecture. Retry once at the moment a
-  // board or guide request needs the frozen answer key; subsequent failures
-  // still fail closed and never guess a standard answer.
+  // A failed/temporarily unavailable lookup must not permanently poison the
+  // question for the rest of the lecture. Allow two bounded retries at the
+  // moment a board or guide request needs the frozen answer key; after that,
+  // fail closed with an explicit retry state and never guess a standard answer.
   if (
     question?.id &&
     memory &&
     !memory.ready &&
-    Number(state.questionMemoryRetryCountByQuestion[question.id] || 0) < 1
+    Number(state.questionMemoryRetryCountByQuestion[question.id] || 0) < 2
   ) {
-    state.questionMemoryRetryCountByQuestion[question.id] = 1;
+    state.questionMemoryRetryCountByQuestion[question.id] =
+      Number(state.questionMemoryRetryCountByQuestion[question.id] || 0) + 1;
     delete state.questionMemoryStatusByQuestion[question.id];
     delete state.questionMemoriesByQuestion[question.id];
     return initializeQuestionMemory(question);
@@ -6298,12 +6299,17 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   if (isChoiceQuestion) {
     const memory = getQuestionMemory(question) || await waitForEnteredQuestionMemory(question);
     if (!memory?.ready || !memory.canonicalAnswer || !memory.choiceAnalysis?.selectedOption) {
+      const retryCount = Number(state.questionMemoryRetryCountByQuestion[question.id] || 0);
+      // Keep the original choice gate (“正在准备这道选择题的标准答案”)
+      // semantically intact while exposing whether a bounded retry remains.
       console.info("[guide] skipped before fixed choice answer is ready", {
         eventType,
         questionId: question.id,
         memoryStatus: memory?.status || "missing"
       });
-      dom.lianState.textContent = "正在准备这道选择题的标准答案";
+      dom.lianState.textContent = retryCount < 2
+        ? "标准答案生成失败，正在使用备用模型重试"
+        : "标准答案暂时不可用，请点击发送重新核验";
       return false;
     }
   }

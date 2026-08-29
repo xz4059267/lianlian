@@ -8145,27 +8145,8 @@ function setCachedAnswerKey(key, value) {
   }
 }
 
-async function solveAndVerifyAnswerKey(questionImage, context = {}) {
-  const startedAt = Date.now();
-  const solver = await callQwenMultimodalJson({
-    model: QWEN_GUIDE_MODEL,
-    schema: answerKeySolverSchema,
-    instructions: FLAT_ANSWER_KEY_SOLVER_PROMPT,
-    content: [
-      {
-        type: "input_text",
-        text: JSON.stringify({
-          knownProblemText: context.problemText || "",
-          instruction: "独立求解并生成标准答案。不要采用图片中的学生作答或批改结论。"
-        })
-      },
-      { type: "input_image", label: "当前题目图片", image_url: questionImage, detail: "high" }
-    ],
-    maxOutputTokens: 1400,
-    signal: context.signal,
-    diagnostics: context.diagnostics || {}
-  });
-
+function normalizeAnswerKeySolver(solver, context = {}) {
+  if (!solver || typeof solver !== "object") return {};
   solver.finalAnswer = String(solver.finalAnswer || solver.canonicalAnswer || "").trim();
   solver.canonicalAnswer = String(solver.canonicalAnswer || solver.finalAnswer || "").trim();
   solver.givenConditions = normalizeGivenConditions(solver.givenConditions);
@@ -8186,6 +8167,67 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
   if ((solver.verification?.isSolved === false || solver.isSolved === false) && solver.status === "solved") {
     solver.status = "ambiguous";
   }
+  return solver;
+}
+
+function answerKeySolverHasMinimumEvidence(solver) {
+  const normalized = normalizeAnswerKeySolver(solver);
+  const hasVerifiableWork = normalized.solutionOutline.length > 0 && normalized.verificationChecks.length > 0;
+  if (
+    normalized.status !== "solved" ||
+    Number(normalized.confidence) < ANSWER_KEY_MIN_CONFIDENCE ||
+    !normalized.canonicalAnswer ||
+    !hasVerifiableWork
+  ) return false;
+  const isChoiceAnswer = isChoiceQuestionContext(normalized) || normalized.choiceAnalysis.options.length >= 2;
+  return !isChoiceAnswer || choiceAnalysisIsUsable(normalized.choiceAnalysis);
+}
+
+async function solveAndVerifyAnswerKey(questionImage, context = {}) {
+  const startedAt = Date.now();
+  const answerKeyOptions = {
+    model: QWEN_GUIDE_MODEL,
+    schema: answerKeySolverSchema,
+    instructions: FLAT_ANSWER_KEY_SOLVER_PROMPT,
+    content: [
+      {
+        type: "input_text",
+        text: JSON.stringify({
+          knownProblemText: context.problemText || "",
+          instruction: "独立求解并生成标准答案。不要采用图片中的学生作答或批改结论。"
+        })
+      },
+      { type: "input_image", label: "当前题目图片", image_url: questionImage, detail: "high" }
+    ],
+    // The answer key contains the problem interpretation, option semantics,
+    // solution outline, and verification checks. 1400 tokens was frequently
+    // cut off mid-JSON, which made Question Memory permanently unreadable.
+    maxOutputTokens: 2400,
+    signal: context.signal,
+    diagnostics: context.diagnostics || {}
+  };
+
+  // Generate the frozen answer key through the same bounded candidate race as
+  // guidance/handwriting. A model that times out or returns truncated JSON is
+  // not allowed to win; the next configured Qwen model gets a chance within
+  // the same wall-clock budget.
+  const solver = await raceQwenStructuredModels({
+    options: answerKeyOptions,
+    models: getQwenModelCandidates(QWEN_GUIDE_MODEL, process.env.QWEN_ANSWER_KEY_FALLBACK_MODELS
+      ? parseQwenModelList(process.env.QWEN_ANSWER_KEY_FALLBACK_MODELS)
+      : []),
+    isValid: (candidate) => {
+      const normalized = normalizeAnswerKeySolver(candidate, context);
+      return answerKeySolverHasMinimumEvidence(normalized);
+    },
+    diagnostics: { ...(context.diagnostics || {}), eventType: "answer_key" },
+    label: "answer-key"
+  });
+
+  normalizeAnswerKeySolver(solver, context);
+
+  // Normalization is idempotent and is deliberately shared by the race
+  // validator and the final trusted-answer construction below.
 
   const hasVerifiableWork = solver.solutionOutline.length > 0 && solver.verificationChecks.length > 0;
   if (
