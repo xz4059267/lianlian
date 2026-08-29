@@ -493,6 +493,7 @@ const HANDWRITING_PROMPT = [
   "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，必须依据 verifiedAnswerReference 返回 answerVerificationStatus=correct 或 wrong，并将 answerFeedback 或 answerHint 填好；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；最终答案和关键步骤都明确且核验正确时返回 finished。",
   "当 finalAnswer 和关键步骤都可见时，禁止返回 continue_guidance 或 ask_for_board，禁止以任何形式询问学生是否正确或要求学生确认（包括‘对不对/正确吗/是不是/算对了吗/有没有错/你同意吗/你觉得呢/要不要检查’等同义表达，以及反问、选择问、确认式追问），必须直接完成核验；如果不正确，answerHint 必须具体指出错误的可见行、数字、符号、运算或选项，并同时填写 errorLocation 与 errorEvidence。",
   "选择题特别规则：如果当前截图已写出 A/B/C/D 选项或 I/II 等结论判定，并且至少有一条与题目相关的有效计算、代入、消元或反例步骤，必须将该步骤计入 completedSteps、boardComplete=true、nextAction=finished，并直接依据固定标准答案完成 answerVerificationStatus；不得因为没有写‘答案是’三个字而继续引导。",
+  "当前截图没有 finalAnswer 时，只能继续引导当前关系式、代入、消元、计算或推理步骤；禁止出现‘请将最终答案或关键结论写在黑板上，以便核验’以及任何要求提前写最终答案/关键结论的同义话术。只有截图已明确出现 finalAnswer 后，才允许进入最终答案核验。",
   "如果 calculationStatus=correct，completedSteps 中已有的内容只能视为已完成，guidance 必须直接给 verifiedGuideSteps 中尚未完成的下一步，禁止再让学生重写、复述或确认已完成步骤；如果 calculationStatus=wrong，必须在 guidance 或 answerHint 中同时说清‘错在何处’和‘正确应为’的具体内容，不能只说‘再检查一下’。",
   "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
   "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
@@ -9213,13 +9214,22 @@ function ensureConcreteGuideInstruction(result, context = {}) {
   const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
   const formula = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
   const action = String(output.studentAction || "").replace(/\s+/g, " ").trim();
-  const vague = /(?:确认(?:一下|下)|看看?怎么来|怎么来的|怎么得到|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看)/i.test(speech);
+  const vague = /(?:确认(?:一下|下)|看看?怎么来|怎么来的|怎么得到|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看|最终答案或关键结论|最终答案.*(?:写在|写到).*(?:核验|检查)|关键结论.*(?:写在|写到).*(?:核验|检查))/i.test(speech);
   const hasConcreteRelation = /(?:=|＝|等于|成比例|比例|代入|相减|相加|消元|移项|乘以|除以|写出|算出|求得|得到)/i.test(`${formula} ${action}`);
-  const nextStep = String(
-    context.guideProgress?.currentStep ||
-    context.silenceContextStep ||
-    ""
-  ).replace(/\s+/g, " ").trim();
+  const hasFinalAnswer = Boolean(
+    context.hasFinalAnswer ||
+    context.answerVerified ||
+    context.boardCompletionVerified ||
+    String(context.recognizedBoardProgress?.finalAnswer || "").trim()
+  );
+  const candidateSteps = [
+    context.guideProgress?.currentStep,
+    ...(Array.isArray(context.verifiedGuideSteps) ? context.verifiedGuideSteps : []),
+    context.silenceContextStep
+  ]
+    .map((step) => String(step || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const nextStep = candidateSteps.find((step) => hasFinalAnswer || !/(?:最终答案|最终结果|关键结论|答案(?:是|为|等于))/i.test(step)) || "";
 
   if (!vague && hasConcreteRelation && formula) return output;
   if (nextStep) {
@@ -9497,7 +9507,12 @@ async function handleGuide(req, res) {
 
   guideResult = ensureConcreteGuideInstruction(guideResult, {
     guideProgress,
-    silenceContextStep: guideBody.silenceContextStep
+    silenceContextStep: guideBody.silenceContextStep,
+    verifiedGuideSteps,
+    recognizedBoardProgress: body.recognizedBoardProgress,
+    hasFinalAnswer: Boolean(body.studentFinalAnswerEvidence || body.answerVerified),
+    answerVerified: body.answerVerified === true,
+    boardCompletionVerified: body.boardCompletionVerified === true
   });
 
   if (!isLatestGuideRequest(guideSessionId, guideQuestionId, guideRequestId)) {
