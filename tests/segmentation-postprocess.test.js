@@ -341,13 +341,17 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /guidance: `下一步直接做：\$\{nextMemoryStep\}`/);
   assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
   assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
+  assert.match(serverSource, /HIGHEST PRIORITY SILENCE OVERRIDE/);
+  assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);
   assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);
   assert.match(appSource, /handwriting-answer-unclear/);
   assert.match(appSource, /hasVisibleAnswerAndKeyStep/);
   assert.doesNotMatch(appSource, /result\.shouldSpeak === false && !options\.force/);
   assert.match(appSource, /The model owns the decision to stay silent/);
   assert.doesNotMatch(serverSource, /提醒学生把关键关系式和最终答案写到黑板上/);
-  assert.match(appSource, /A silent\/empty model result must not permanently consume the silence/);
+  assert.match(appSource, /A silent\/empty model result gets only the remaining bounded stage/);
+  assert.match(appSource, /MAX_SILENCE_AUTO_ATTEMPTS/);
+  assert.match(appSource, /silence retry limit reached/);
   assert.match(appSource, /if \(isSilenceGuide && !state\.silenceGuidanceExhausted\) resetSilenceTimer\(false\)/);
   assert.match(appSource, /const guideFailureStillCooling =\s*!isSilenceGuide/);
 });

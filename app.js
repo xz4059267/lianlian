@@ -151,6 +151,9 @@ const LIAN_TEXT_PUBLISH_WATCHDOG_MS = 10000;
 // Each additional full idle interval moves the guide closer to a concrete
 // equation and the verified answer. Student input resets the level.
 const MAX_SILENCE_GUIDE_STAGE = 4;
+// Silence guidance is bounded. A missing model response must never create an
+// unbounded retry loop; at most one request is made for each active stage.
+const MAX_SILENCE_AUTO_ATTEMPTS = MAX_SILENCE_GUIDE_STAGE - 1;
 const ERROR_SILENCE_MS = 60000;
 const BOARD_RECOGNITION_DELAY_MS = 6500;
 const THOUGHT_PAUSE_MS = 8000;
@@ -353,6 +356,7 @@ const state = {
   silenceCareAskedAt: 0,
   awaitingSilenceFollowup: false,
   silenceGuideStage: 0,
+  silenceGuideAttempts: 0,
   silenceGuidanceExhausted: false,
   interactiveStepCount: 0,
   activeGuideRequestId: 0,
@@ -790,6 +794,7 @@ function clearSilenceFollowup() {
   state.awaitingSilenceFollowup = false;
   state.silenceCareAskedAt = 0;
   state.silenceGuideStage = 0;
+  state.silenceGuideAttempts = 0;
   state.silenceGuidanceExhausted = false;
 }
 
@@ -6228,16 +6233,30 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   }
   const targetGuideState = options.guideState || state.guideState;
   const isSilenceGuide = /silence/.test(eventType);
-  if (isSilenceGuide && state.silenceGuidePending) {
-    console.info("[guide] skipped", { eventType, reason: "silence-request-pending" });
-    return false;
-  }
-
   const question = currentPageQuestion();
   if (!question) {
     console.warn("[guide] skipped", { eventType, reason: "no-current-question" });
     return false;
   }
+  if (isSilenceGuide && Number(state.silenceGuideAttempts || 0) >= MAX_SILENCE_AUTO_ATTEMPTS) {
+    clearTimeout(state.silenceTimer);
+    state.silenceTimer = null;
+    state.silenceGuidanceExhausted = true;
+    state.awaitingSilenceFollowup = false;
+    dom.lianState.textContent = "自动引导已停止，请继续书写或手动点击发送";
+    console.warn("[guide] silence retry limit reached", {
+      eventType,
+      questionId: question?.id || "",
+      attempts: state.silenceGuideAttempts,
+      limit: MAX_SILENCE_AUTO_ATTEMPTS
+    });
+    return false;
+  }
+  if (isSilenceGuide && state.silenceGuidePending) {
+    console.info("[guide] skipped", { eventType, reason: "silence-request-pending" });
+    return false;
+  }
+
   const questionContext = `${question.problemType || question.questionType || question.type || ""} ${question.title || ""} ${question.problemText || ""}`;
   const isChoiceQuestion = /选择题|判断题|单选|多选|下列.*(?:正确|错误)|正确的是|不正确的是|选项|结论\s*[一二三四IVX]/.test(questionContext);
   if (isChoiceQuestion) {
@@ -6308,6 +6327,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     return false;
   }
   const requestId = ++state.activeGuideRequestId;
+  if (isSilenceGuide) state.silenceGuideAttempts = Number(state.silenceGuideAttempts || 0) + 1;
   const guideGeneration = state.guideGeneration;
   const questionId = question?.id || "";
   const guideInputSnapshot = getStudentInputSnapshot();
@@ -6374,10 +6394,22 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
         questionId,
         provider: result?.provider || "qwen-structured-answer-guidance"
       });
-      dom.lianState.textContent = "大模型没有返回引导";
-      // A silent/empty model result must not permanently consume the silence
-      // timer. Re-arm the next escalation window and let Qwen try again later.
-      if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
+      dom.lianState.textContent = isSilenceGuide && state.silenceGuidanceExhausted
+        ? "自动引导已停止，请继续书写或手动点击发送"
+        : "大模型没有返回引导";
+      // A silent/empty model result gets only the remaining bounded stage
+      // attempts. It must never create an unbounded retry loop.
+      if (isSilenceGuide && !state.silenceGuidanceExhausted) {
+        if (state.silenceGuideAttempts < MAX_SILENCE_AUTO_ATTEMPTS) {
+          resetSilenceTimer(false);
+        } else {
+          state.silenceGuidanceExhausted = true;
+          state.awaitingSilenceFollowup = false;
+          clearTimeout(state.silenceTimer);
+          state.silenceTimer = null;
+          dom.lianState.textContent = "自动引导已停止，请继续书写或手动点击发送";
+        }
+      }
       state.guideUnavailableAt = Date.now();
       state.guideUnavailableQuestionId = questionId;
       state.guideUnavailableUntil = Date.now() + 60000;
@@ -6435,11 +6467,25 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     state.guideUnavailableAt = Date.now();
     state.guideUnavailableQuestionId = questionId;
     state.guideUnavailableUntil = Date.now() + 60000;
-    if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
-    lianSilentNotice("自动引导请求未返回，稍后会按沉默阶段重新尝试。", {
+    if (isSilenceGuide && !state.silenceGuidanceExhausted) {
+      if (state.silenceGuideAttempts < MAX_SILENCE_AUTO_ATTEMPTS) {
+        resetSilenceTimer(false);
+      } else {
+        state.silenceGuidanceExhausted = true;
+        state.awaitingSilenceFollowup = false;
+        clearTimeout(state.silenceTimer);
+        state.silenceTimer = null;
+      }
+    }
+    lianSilentNotice(
+      isSilenceGuide && state.silenceGuidanceExhausted
+        ? "自动引导接口未返回，已停止自动重试，请继续书写或手动点击发送。"
+        : "本阶段引导接口未返回，将只在下一静默阶段再尝试一次。",
+      {
       key: `guide-failed:${questionId}`,
       cooldownMs: 60000
-    });
+      }
+    );
     return false;
   } finally {
     if (isSilenceGuide) state.silenceGuidePending = false;

@@ -451,7 +451,7 @@ const LIAN_STYLE_RULES = [
 const COMPANION_DIALOGUE_POLICY = [
   "你不是一个不停回应的 AI。你更像坐在学生旁边陪伴学习的人。",
   "你的首要任务不是一直说话，而是判断现在是否应该说话。",
-  "默认行为是 Listening：学生思考或连续表达时保持安静，shouldSpeak=false，speech 留空。",
+  "默认行为是 Listening：仅在 eventType=normal 或 thought_complete 且学生仍在思考/连续表达时保持安静，shouldSpeak=false，speech 留空；silence、silence_followup、silence_escalation、active_help、next_step 等主动引导事件不适用此规则。",
   "不要因为识别到一句完整的话就立即回复；只有学生明显完成一段思路、停顿等待反馈、提出问题、明显卡住，或思路明显错误且继续推导会偏离时，才回应。",
   "如果 eventType=thought_complete，只表示学生停顿了 2 到 3 秒；你仍要先判断这是否真是一段完整思路。若只是半句话、过渡句、还在铺垫，shouldSpeak=false。",
   "回应时先用一句话证明你听懂了学生刚才的思路，再给一个很小的追问或检查点。",
@@ -9399,7 +9399,7 @@ async function handleGuide(req, res) {
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
       "Concrete guidance source: prefer verifiedGuideSteps and verifiedAnswerReference.solutionOutline. When Question Memory is unavailable, derive only one non-final next operation from the current screenshot's visible equation and the question image; never copy an unverified OCR fragment or invent a relation that is not visible.",
-    `SILENCE POLICY OVERRIDE: stage ${silenceStage}. The first automatic silence response is stage 2 at 60 seconds; do not give the vague stage-1 care prompt. Stage 2 must give the first concrete problem-specific relation or operation; stage 3 gives the next key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
+    `HIGHEST PRIORITY SILENCE OVERRIDE: eventType=${body.eventType || "normal"}, stage ${silenceStage}. For silence, silence_followup, silence_escalation, active_help, or next_step, ignore the default Listening rule: return shouldSpeak=true with non-empty Chinese speech and either a concrete formulaOrStep or a concrete studentAction. Stage 2 must give the first problem-specific relation or operation; stage 3 gives the next key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
     ].join("\n\n"),
     content: [
       {
