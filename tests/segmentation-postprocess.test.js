@@ -33,6 +33,7 @@ const {
   applyStatementEvaluationSafety,
   applyLatestHandwritingConsistency,
   ensureConcreteSilenceGuide,
+  ensureGuideFormulaMatchesTrustedSteps,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
   questionMemoryToAnswerKey,
@@ -139,6 +140,26 @@ test("restores the concrete Question Memory step after guide safety filtering", 
   assert.match(result.speech, /x - 2y = 3/);
   assert.match(result.studentAction, /x - 2y = 3/);
   assert.equal(result.lectureComplete, false);
+});
+
+test("rejects a guide equation that is not present in the trusted question relations", () => {
+  const result = ensureGuideFormulaMatchesTrustedSteps(
+    {
+      shouldSpeak: true,
+      speech: "先用 x-y=8 继续计算。",
+      formulaOrStep: "x-y=8",
+      studentAction: "写出 x-y=8",
+      lectureComplete: false
+    },
+    {
+      givenConditions: ["x-2y=m", "2y-3x=n", "m-n=8"],
+      verifiedGuideSteps: ["4x-4y=8", "x-y=2"]
+    }
+  );
+
+  assert.equal(result.shouldSpeak, false);
+  assert.equal(result.speech, "");
+  assert.equal(result.guideUnavailableReason, "model_formula_not_in_verified_steps");
 });
 
 test("captures one standard-answer result as a reusable Question Memory snapshot", () => {
@@ -342,8 +363,10 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
   assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
   assert.match(serverSource, /HIGHEST PRIORITY SILENCE OVERRIDE/);
+  assert.match(serverSource, /ARROW_DIAGRAM_RULES/);
   assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);
   assert.match(serverSource, /guideResult = ensureConcreteSilenceGuide\(guideResult, guideBody\)/);
+  assert.match(serverSource, /ensureGuideFormulaMatchesTrustedSteps/);
   assert.match(serverSource, /requiresExplicitStep/);
   assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);
   assert.match(appSource, /handwriting-answer-unclear/);

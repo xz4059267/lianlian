@@ -340,6 +340,12 @@ const STATEMENT_EVALUATION_RULES = [
   "Do not reuse variables, equations, proportions, answer choices, or conclusions from another problem."
 ].join("\n");
 
+const ARROW_DIAGRAM_RULES = [
+  "箭头关系题必须逐条读取箭头方向：只有箭头直接共同指向同一个下方节点的相邻上方两个数，才能组成‘左数−右数=该下方节点’；不能把末端节点的数值分别套给每个上方节点。",
+  "先列出每条边的来源节点和目标节点，再按题干的‘相邻左数与右数之差’逐条建立等式；没有直接箭头支持的等式不得写入 givenConditions、solutionOutline 或引导。",
+  "如果题图中的箭头拓扑与文字关系无法可靠辨认，返回 ambiguous/unreadable，不要根据变量名称或历史题目猜式子。"
+].join("\n");
+
 function deterministicArrowDifferenceAnswerKey(problemText = "") {
   // Disabled: answer keys must come from the generic multimodal solver/verifier,
   // not a local override for one specific problem pattern.
@@ -7968,7 +7974,8 @@ const ANSWER_KEY_SOLVER_PROMPT = [
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "solutionOutline 和 verificationChecks 只写简洁、可核验的关键步骤，不写冗长推理。",
   "如果题图不完整、题意存在多解或无法可靠读取，status 必须为 ambiguous 或 unreadable，不能猜答案。",
-  ORDERED_PROPORTION_RULES
+  ORDERED_PROPORTION_RULES,
+  ARROW_DIAGRAM_RULES
 ].join("\n");
 
 const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
@@ -7986,7 +7993,8 @@ const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
   "verification.checks 写代入检查或计算核验过程。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，verification.isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verification.checks 中说明原因。",
   "只返回符合 schema 的 JSON，不要返回 Markdown，不要在 JSON 外输出任何文字。",
-  ORDERED_PROPORTION_RULES
+  ORDERED_PROPORTION_RULES,
+  ARROW_DIAGRAM_RULES
 ].join("\n");
 
 const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
@@ -8002,7 +8010,8 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
   "givenConditions 必须覆盖题干、图片、图形箭头、表格、坐标和定义中所有直接给出的事实；题目直接给出的 m-n=8 不能作为待推导步骤，也不能在 solutionOutline 中重复出现。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verificationChecks 中说明原因。",
   "只返回符合 schema 的 JSON。不要返回 Markdown，不要在 JSON 外输出任何文字。",
-  ORDERED_PROPORTION_RULES
+  ORDERED_PROPORTION_RULES,
+  ARROW_DIAGRAM_RULES
 ].join("\n");
 
 const ANSWER_KEY_VERIFIER_PROMPT = [
@@ -8013,7 +8022,8 @@ const ANSWER_KEY_VERIFIER_PROMPT = [
   "不要采用候选答案的计算过程，也不要自行补充题目文本中不存在的条件。",
   "如果题目依赖图形或表格，而清洗后的题目文本没有包含关键关系，verified 必须为 false，不能猜。",
   "只有独立结果与候选标准答案数学等价时 verified 才能为 true；有任何冲突或题图不清都返回 false。",
-  ORDERED_PROPORTION_RULES
+  ORDERED_PROPORTION_RULES,
+  ARROW_DIAGRAM_RULES
 ].join("\n");
 
 const GUIDE_MATH_AUDIT_PROMPT = [
@@ -9257,6 +9267,48 @@ function ensureConcreteGuideInstruction(result, context = {}) {
   };
 }
 
+function normalizeGuideStepText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[−﹣－]/g, "-")
+    .replace(/[＝]/g, "=")
+    .replace(/[：]/g, ":")
+    .replace(/[，。；、,;\s]/g, "")
+    .toLowerCase();
+}
+
+function ensureGuideFormulaMatchesTrustedSteps(result, context = {}) {
+  const output = result && typeof result === "object" ? { ...result } : {};
+  const formula = String(output.formulaOrStep || "").trim();
+  const trustedSteps = [
+    ...(Array.isArray(context.givenConditions) ? context.givenConditions : []),
+    ...(Array.isArray(context.verifiedGuideSteps) ? context.verifiedGuideSteps : [])
+  ].map((step) => String(step || "").trim()).filter(Boolean);
+  if (!formula || !trustedSteps.length) return output;
+
+  const normalizedFormula = normalizeGuideStepText(formula);
+  const isAnchored = trustedSteps.some((step) => {
+    const normalizedStep = normalizeGuideStepText(step);
+    return normalizedStep.includes(normalizedFormula) || normalizedFormula.includes(normalizedStep);
+  });
+  if (isAnchored) return output;
+
+  console.warn("[guide-safety] rejected formula outside trusted question steps", {
+    formula,
+    trustedStepCount: trustedSteps.length
+  });
+  return {
+    ...output,
+    shouldSpeak: false,
+    speech: "",
+    formulaOrStep: "",
+    askStudentToRepeat: false,
+    studentAction: "",
+    lectureComplete: false,
+    guideUnavailableReason: "model_formula_not_in_verified_steps"
+  };
+}
+
 function getSilenceGuidePolicy(stage) {
   const level = Math.max(0, Math.min(4, Number(stage) || 0));
   return {
@@ -9411,6 +9463,7 @@ async function handleGuide(req, res) {
       LIAN_GUIDE_PROMPT,
       HANDWRITING_CONSISTENCY_RULES,
       ORDERED_PROPORTION_RULES,
+      ARROW_DIAGRAM_RULES,
       STATEMENT_EVALUATION_RULES,
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
@@ -9500,6 +9553,10 @@ async function handleGuide(req, res) {
   });
 
   guideResult = ensureConcreteSilenceGuide(guideResult, guideBody);
+  guideResult = ensureGuideFormulaMatchesTrustedSteps(guideResult, {
+    givenConditions: guideProgress.givenConditions,
+    verifiedGuideSteps
+  });
   guideResult = ensureConcreteGuideInstruction(guideResult, {
     eventType: body.eventType || "normal",
     hasBoardInk: body.hasBoardInk === true,
@@ -10519,6 +10576,7 @@ module.exports = {
   applyStatementEvaluationSafety,
   applyLatestHandwritingConsistency,
   ensureConcreteSilenceGuide,
+  ensureGuideFormulaMatchesTrustedSteps,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
   questionMemoryToAnswerKey,
