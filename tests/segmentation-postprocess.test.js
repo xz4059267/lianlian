@@ -33,6 +33,7 @@ const {
   applyStatementEvaluationSafety,
   applyLatestHandwritingConsistency,
   ensureConcreteSilenceGuide,
+  ensureConcreteGuideInstruction,
   ensureGuideFormulaMatchesTrustedSteps,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
@@ -105,6 +106,35 @@ test("starts the first silence interval with stage-one guidance", () => {
   assert.match(firstSilenceStart, /guideState: GUIDE_STATES\.MICRO_HINT/);
   assert.match(firstSilenceStart, /buildSilenceEscalationFallback\(1\)/);
   assert.doesNotMatch(firstSilenceStart, /Skip the vague first-stage care prompt/);
+});
+
+test("rejects vague variable-representation guidance but accepts an explicit construction method", () => {
+  const context = { eventType: "silence", hasBoardInk: true };
+  const vague = ensureConcreteGuideInstruction(
+    {
+      shouldSpeak: true,
+      speech: "我们先试着把m和n用x、y表示出来。",
+      formulaOrStep: "",
+      studentAction: "把m和n用x、y表示出来。",
+      lectureComplete: false
+    },
+    context
+  );
+  assert.equal(vague.shouldSpeak, false);
+  assert.equal(vague.guideUnavailableReason, "model_relation_method_not_concrete");
+
+  const method = ensureConcreteGuideInstruction(
+    {
+      shouldSpeak: true,
+      speech: "把m用x和2y表示：先读取指向m的两个量，按题目关系做差，把结果记为m。",
+      formulaOrStep: "",
+      studentAction: "先用x和2y按题目关系做差，把结果记为m。",
+      lectureComplete: false
+    },
+    context
+  );
+  assert.equal(method.shouldSpeak, true);
+  assert.equal(method.studentAction, "先用x和2y按题目关系做差，把结果记为m。");
 });
 
 test("allows stage-4 silence to explain without a standard-answer key", async () => {
