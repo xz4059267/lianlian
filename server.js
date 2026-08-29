@@ -9273,7 +9273,10 @@ function guideResultsShareOperation(left, right) {
   ) return true;
   const sharedOperation = leftSignature.operations.some((operation) => rightSignature.operations.includes(operation));
   const sharedSymbolCount = leftSignature.symbols.filter((symbol) => rightSignature.symbols.includes(symbol)).length;
-  return sharedOperation && sharedSymbolCount >= 1;
+  // One shared variable is common across adjacent steps (for example,
+  // substituting the same x into two different equations). Require at least
+  // two shared symbols before treating different wording as the same step.
+  return sharedOperation && sharedSymbolCount >= 2;
 }
 
 function guideResultRepeatsRecentInstruction(result, recentGuideHistory = []) {
