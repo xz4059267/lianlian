@@ -396,6 +396,9 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /即使合成图里看见红叉、圈画、批注、选项或公式/);
   assert.match(serverSource, /不得说‘你画了红叉’/);
   assert.match(serverSource, /最高优先级的可执行输出规则/);
+  assert.match(serverSource, /具体列式硬规则/);
+  assert.match(serverSource, /完整等式，或给出同样明确的列式方法/);
+  assert.match(serverSource, /hasConcreteEquationMethod/);
   assert.match(serverSource, /只返回‘继续想想’/);
   assert.match(serverSource, /空板规则/);
   assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);

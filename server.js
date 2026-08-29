@@ -289,6 +289,7 @@ const LIAN_GUIDE_PROMPT = [
   "你是恋恋，面向初中学生的费曼学习法多模态引导学伴。目标是让学生自己把错题讲明白，不是替学生直接做题。",
   "最高优先级的证据分层规则：当前黑板截图同时包含首页导入的题目图片和学生在导入后新增的黑板笔迹。先在视觉上分离两层，再只依据导入后新增的学生笔迹（以及完整语音中对当前笔迹的意图说明）判断学生已经写了什么、做到哪一步。首页导入图片中原本就有的印刷公式、选项、红笔批注、勾叉、旧答案或任何原有手写内容，只能作为题目条件或背景，绝不能当成学生本次列出的式子、答案或步骤。学生后来在导入图片上方、图片内部或图片旁边写出的浅色笔迹，仍然是学生笔迹；如果同时提供‘导入后新增的学生笔迹隔离层’，以该隔离层确认本次书写。引导必须贴着学生当前新增笔迹推进，不能用导入图片中的内容替代学生板书，也不能根据旧识别结果补写学生没有写出的内容。",
   "最高优先级的可执行输出规则：只要 eventType 是 silence、silence_followup、silence_escalation、stuck、active_help、next_step 或 answer_to_lian_question，就必须 shouldSpeak=true，speech 非空，并且 formulaOrStep 或 studentAction 至少有一个非空且能立即执行；关系式要写出具体对象/符号，动作要写清楚要代入、移项、相减、比较、复述或写下什么。禁止只返回‘继续想想’、‘再看看’、‘我来核对’等空泛话术。",
+  "具体列式硬规则：凡是要求学生‘把某个量用其他量表示’、‘列出关系式’、‘写出方程’或‘开始列式’，不能只说‘把 m、n 用 x、y 表示’这类方向性话术；必须给出完整等式，或给出同样明确的列式方法：指出先看哪两个具体对象/位置，依据什么关系，以及进行相加、相减、代入、移项等哪一种运算、结果放到哪个量。无法可靠读出等式或列式方法时，必须明确说明缺少哪一条视觉关系，不能用变量名或省略号代替下一步。",
   "空板规则：如果‘导入后新增的学生笔迹隔离层’为空，或当前截图没有可确认的新增学生笔迹，必须明确按‘还没有看到学生板书’处理；即使首页导入图片中有红叉、圈画、批注、选项或公式，也不能说学生刚才画了、写出、列出、算出或得到任何内容。此时只能要求学生先把当前题目的第一条具体关系式或计算步骤写到黑板上，不能把首页导入图片中的内容冒充成学生板书。",
   "语气像温柔、耐心的女生学习伙伴：自然、短、轻一点，不要像 AI 播报，也不要像老师批改。",
   "必须遵守四个状态机：A heuristic_guidance=启发引导；B micro_hint=知识点微提示；C interactive_teaching=互动讲解；D archive_review=归档复习。",
@@ -9149,6 +9150,24 @@ function ensureConcreteGuideInstruction(result, context = {}) {
     /(?:写出|写下|代入|移项|消元|相加|相减|相乘|相除|计算|整理|列出|比较|读取|对应|复述)/i.test(action) &&
     !/(?:继续下一步|再想想|看一看|检查一下)/i.test(action)
   );
+  const requestsVariableExpression = /(?:用.{0,16}(?:表示|表达)|列(?:出|写).{0,12}(?:关系式|方程|式子)|开始列式)/i.test(`${speech} ${action}`);
+  const hasExplicitEquation = /[A-Za-z][A-Za-z0-9()\s+\-*/]*\s*[=＝]\s*[^。！？!?，,；;]+/.test(`${formula} ${speech} ${action}`);
+  const hasConcreteEquationMethod = Boolean(
+    /(?:先看|找到|取|对应|上方|下方|左边|右边|相邻|共同指向|两数|两个量|哪两个)/i.test(`${speech} ${action}`) &&
+    /(?:相加|相减|相乘|相除|代入|移项|消元|作差|求和|按左数|按右数|结果放到|得到|等于)/i.test(`${speech} ${action}`)
+  );
+  if (requestsVariableExpression && !hasExplicitEquation && !hasConcreteEquationMethod) {
+    return {
+      ...output,
+      shouldSpeak: false,
+      speech: "",
+      formulaOrStep: "",
+      askStudentToRepeat: false,
+      studentAction: "",
+      lectureComplete: false,
+      guideUnavailableReason: "model_relation_method_not_concrete"
+    };
+  }
   const canUseActionWithoutFormula = context.hasBoardInk === false && actionIsConcrete;
   if (
     !vague &&
