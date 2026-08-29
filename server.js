@@ -9180,7 +9180,13 @@ function ensureGuideFormulaMatchesTrustedSteps(result, context = {}) {
   const normalizedFormula = normalizeGuideStepText(formula);
   const isAnchored = trustedSteps.some((step) => {
     const normalizedStep = normalizeGuideStepText(step);
-    return normalizedStep.includes(normalizedFormula) || normalizedFormula.includes(normalizedStep);
+    if (normalizedStep.includes(normalizedFormula) || normalizedFormula.includes(normalizedStep)) return true;
+    // Accept equivalent equation forms such as `y = x - 2` and
+    // `x - y = 2`, while still requiring the relation to come from a
+    // trusted question condition or verified step.
+    const formulaEquation = extractLinearEquationText(formula);
+    const stepEquation = extractLinearEquationText(step);
+    return Boolean(formulaEquation && stepEquation && equationsEquivalent(formulaEquation, stepEquation));
   });
   if (isAnchored) return output;
 

@@ -162,6 +162,24 @@ test("rejects a guide equation that is not present in the trusted question relat
   assert.equal(result.guideUnavailableReason, "model_formula_not_in_verified_steps");
 });
 
+test("accepts an equivalent rearrangement of a trusted guide equation", () => {
+  const result = ensureGuideFormulaMatchesTrustedSteps(
+    {
+      shouldSpeak: true,
+      speech: "下一步使用 y=x-2。",
+      formulaOrStep: "y = x - 2",
+      studentAction: "代入这个关系式",
+      lectureComplete: false
+    },
+    {
+      givenConditions: ["x-y=2"]
+    }
+  );
+
+  assert.equal(result.guideUnavailableReason, undefined);
+  assert.equal(result.formulaOrStep, "y = x - 2");
+});
+
 test("captures one standard-answer result as a reusable Question Memory snapshot", () => {
   const memory = buildQuestionMemory("q-1", {
     trusted: true,
