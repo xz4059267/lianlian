@@ -389,6 +389,11 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /HIGHEST PRIORITY SILENCE OVERRIDE/);
   assert.match(serverSource, /VISUAL_RELATION_RULES/);
   assert.match(serverSource, /图形、箭头、表格、坐标/);
+  assert.match(serverSource, /最高优先级的证据分层规则/);
+  assert.match(serverSource, /题目图片里的印刷公式、选项、红笔批注/);
+  assert.match(serverSource, /最高优先级的可执行输出规则/);
+  assert.match(serverSource, /只返回‘继续想想’/);
+  assert.match(serverSource, /空板规则/);
   assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);
   assert.match(serverSource, /guideResult = ensureConcreteSilenceGuide\(guideResult, guideBody\)/);
   assert.match(serverSource, /ensureGuideFormulaMatchesTrustedSteps/);

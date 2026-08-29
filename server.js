@@ -287,6 +287,9 @@ const OCR_GROUPING_PROMPT =
 
 const LIAN_GUIDE_PROMPT = [
   "你是恋恋，面向初中学生的费曼学习法多模态引导学伴。目标是让学生自己把错题讲明白，不是替学生直接做题。",
+  "最高优先级的证据分层规则：当前黑板截图同时包含题目印刷图片和学生原始笔迹。先在视觉上分离两层，再只依据学生原始笔迹（以及完整语音中对当前笔迹的意图说明）判断学生已经写了什么、做到哪一步。题目图片里的印刷公式、选项、红笔批注、勾叉和旧答案只能作为题目条件或标准答案背景，绝不能当成学生已经列出的式子、答案或步骤。引导必须贴着学生当前可见笔迹推进，不能用题目图片中的式子替代学生板书，也不能根据旧识别结果补写学生没有写出的内容。",
+  "最高优先级的可执行输出规则：只要 eventType 是 silence、silence_followup、silence_escalation、stuck、active_help、next_step 或 answer_to_lian_question，就必须 shouldSpeak=true，speech 非空，并且 formulaOrStep 或 studentAction 至少有一个非空且能立即执行；关系式要写出具体对象/符号，动作要写清楚要代入、移项、相减、比较、复述或写下什么。禁止只返回‘继续想想’、‘再看看’、‘我来核对’等空泛话术。",
+  "空板规则：如果当前截图没有学生原始笔迹，必须明确按‘还没有看到学生板书’处理，不能说学生刚才写出、列出、算出或得到任何式子；此时只能要求学生先把当前题目的第一条具体关系式或计算步骤写到黑板上，不能把题目图片中的公式冒充成学生板书。",
   "语气像温柔、耐心的女生学习伙伴：自然、短、轻一点，不要像 AI 播报，也不要像老师批改。",
   "必须遵守四个状态机：A heuristic_guidance=启发引导；B micro_hint=知识点微提示；C interactive_teaching=互动讲解；D archive_review=归档复习。",
   "A 启发引导：学生正在尝试讲题时，优先追问、提问或保持安静；不能主动给最终答案、中间完整算式或完整解题步骤。",
@@ -9141,7 +9144,17 @@ function ensureConcreteGuideInstruction(result, context = {}) {
     };
   }
   const formulaAppearsInSpeech = Boolean(formula && speech.includes(formula));
-  if (!vague && hasConcreteRelation && formula && (!requiresExplicitStep || formulaAppearsInSpeech)) return output;
+  const actionIsConcrete = Boolean(
+    action &&
+    /(?:写出|写下|代入|移项|消元|相加|相减|相乘|相除|计算|整理|列出|比较|读取|对应|复述)/i.test(action) &&
+    !/(?:继续下一步|再想想|看一看|检查一下)/i.test(action)
+  );
+  const canUseActionWithoutFormula = context.hasBoardInk === false && actionIsConcrete;
+  if (
+    !vague &&
+    hasConcreteRelation &&
+    ((formula && (!requiresExplicitStep || formulaAppearsInSpeech)) || canUseActionWithoutFormula)
+  ) return output;
 
   // Guidance must come from Qwen. If the model returned an empty, generic,
   // or non-actionable response, suppress it instead of fabricating a local
