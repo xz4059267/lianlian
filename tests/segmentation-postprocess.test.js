@@ -97,6 +97,16 @@ test("escalates silence guidance from a concrete entry point to a complete answe
   assert.equal(getSilenceGuidePolicy(99).stage, 4);
 });
 
+test("starts the first silence interval with stage-one guidance", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const firstSilenceStart = appSource.slice(appSource.indexOf("// The first silence interval is a real guidance stage"));
+  assert.match(firstSilenceStart, /state\.silenceGuideStage = 1/);
+  assert.match(firstSilenceStart, /requestSmartGuide\("silence", "",/);
+  assert.match(firstSilenceStart, /guideState: GUIDE_STATES\.MICRO_HINT/);
+  assert.match(firstSilenceStart, /buildSilenceEscalationFallback\(1\)/);
+  assert.doesNotMatch(firstSilenceStart, /Skip the vague first-stage care prompt/);
+});
+
 test("allows stage-4 silence to explain without a standard-answer key", async () => {
   const detailed = await auditGuideMath(
     {

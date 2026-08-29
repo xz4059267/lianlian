@@ -5705,30 +5705,31 @@ function handleSilenceTimeout() {
     return;
   }
 
-  // Skip the vague first-stage care prompt. The first silence escalation
-  // should use the concrete guidance that previously appeared at 120s.
-  setGuideState(GUIDE_STATES.INTERACTIVE);
-  state.silenceGuideStage = 2;
+  // The first silence interval is a real guidance stage. Do not skip it or
+  // jump directly to stage 2: the model should get one chance to provide a
+  // small, problem-specific entry point before escalation becomes stronger.
+  setGuideState(GUIDE_STATES.MICRO_HINT);
+  state.silenceGuideStage = 1;
   state.silenceGuidanceExhausted = false;
   state.awaitingSilenceFollowup = true;
   state.silenceCareAskedAt = now;
   console.info("[silence-guide] start", {
-    stage: 2,
+    stage: 1,
     silenceSeconds: Math.round(idleMs / 1000),
     allowConcreteStep: true,
     allowFormula: true,
     allowFinalAnswer: false
   });
-  requestSmartGuide("silence_followup", "", {
+  requestSmartGuide("silence", "", {
     force: true,
-    guideState: GUIDE_STATES.INTERACTIVE,
-    silenceStage: 2,
+    guideState: GUIDE_STATES.MICRO_HINT,
+    silenceStage: 1,
     allowConcreteStep: true,
     allowFormula: true,
     allowFinalAnswer: false,
     allowUnverifiedFinalAnswer: false,
     silenceSeconds: Math.round(idleMs / 1000),
-    fallbackText: buildSilenceEscalationFallback(2)
+    fallbackText: buildSilenceEscalationFallback(1)
   });
 }
 
