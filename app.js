@@ -6418,15 +6418,16 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       console.info("[guide] result-discarded", { eventType, requestId, reason: "new-student-input" });
       return false;
     }
-    const lectureComplete = shouldCompleteCurrentLecture(result, latestStudentSpeech);
+    const selectedResult = selectGuidanceCandidate(result, questionId);
+    const lectureComplete = shouldCompleteCurrentLecture(selectedResult, latestStudentSpeech);
     // Only Qwen may provide guide speech. Local formula/generic fallbacks are disabled.
-    const speech = formatGuideSpeech(result);
+    const speech = formatGuideSpeech(selectedResult);
     if (!speech) {
       // The model owns the decision to stay silent. The client only renders
       // text that the model actually returned and never turns a silent result
       // into a local guide message.
       dom.lianState.textContent = guideIdleText();
-      if (result.guideUnavailableReason === "model_response_not_actionable") {
+      if (selectedResult.guideUnavailableReason === "model_response_not_actionable") {
         dom.lianState.textContent = "大模型没有返回明确下一步";
       }
       if (lectureComplete && !state.hasExplicitFinalAnswer) askForFinalAnswer();
@@ -6434,7 +6435,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
         eventType,
         requestId,
         questionId,
-        provider: result?.provider || "qwen-structured-answer-guidance"
+        provider: selectedResult?.provider || "qwen-structured-answer-guidance"
       });
       dom.lianState.textContent = isSilenceGuide && state.silenceGuidanceExhausted
         ? "自动引导已停止，请继续书写或手动点击发送"
@@ -6460,9 +6461,9 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
 
     if (hasStudentInputSince(guideInputSnapshot)) return false;
     const silenceStage = Number(options.silenceStage || state.silenceGuideStage || 0);
-    rememberGuideResult(questionId, result, { eventType, silenceStage });
+    rememberGuideResult(questionId, selectedResult, { eventType, silenceStage });
     const guideFormula = /silence/.test(eventType)
-      ? extractConcreteMathRelation(String(result?.formulaOrStep || ""))
+      ? extractConcreteMathRelation(String(selectedResult?.formulaOrStep || ""))
       : "";
     const speechDedupeKey = guideFormula
       ? `step:${guideFormula}`
@@ -7124,6 +7125,42 @@ function getRecentGuideHistory(questionId = currentPageQuestion()?.id || "") {
   if (!questionId) return [];
   const history = state.guideHistoryByQuestion[questionId];
   return Array.isArray(history) ? history.slice(-8) : [];
+}
+
+function selectGuidanceCandidate(result, questionId = currentPageQuestion()?.id || "") {
+  if (!result || typeof result !== "object" || !Array.isArray(result.guidanceCandidates) || result.guidanceCandidates.length !== 3) {
+    return result;
+  }
+  const recent = getRecentGuideHistory(questionId);
+  const recentKeys = new Set(recent.map((entry) => normalizeGuidanceFingerprint(
+    [entry?.formulaOrStep, entry?.studentAction, entry?.speech].filter(Boolean).join("|")
+  )).filter(Boolean));
+  const ranked = result.guidanceCandidates
+    .map((candidate, index) => {
+      const normalized = {
+        speech: String(candidate?.speech || "").replace(/\s+/g, " ").trim(),
+        formulaOrStep: String(candidate?.formulaOrStep || "").replace(/\s+/g, " ").trim(),
+        studentAction: String(candidate?.studentAction || "").replace(/\s+/g, " ").trim()
+      };
+      const key = normalizeGuidanceFingerprint(
+        [normalized.formulaOrStep, normalized.studentAction, normalized.speech].filter(Boolean).join("|")
+      );
+      return {
+        index,
+        normalized,
+        score: (recentKeys.has(key) ? -100 : 0) +
+          (normalized.formulaOrStep ? 3 : 0) +
+          (normalized.studentAction ? 2 : 0) - index * 0.01
+      };
+    })
+    .sort((left, right) => right.score - left.score);
+  const selected = ranked[0];
+  if (!selected?.normalized.speech) return result;
+  return {
+    ...result,
+    ...selected.normalized,
+    selectedGuidanceIndex: selected.index
+  };
 }
 
 function rememberGuideResult(questionId, result, meta = {}) {

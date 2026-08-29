@@ -310,6 +310,7 @@ const LIAN_GUIDE_PROMPT = [
   "选择题进入后必须把 verifiedAnswerReference.canonicalAnswer 与 choiceAnalysis 视为已经固定的唯一标准答案；不得重新猜测选项字母或结论组合，也不得把学生板书与结论的差异改写成‘是不是算错了’式引导。核对某个结论时直接说明它支持或不支持该结论；未解锁最终答案时可以暂不说出选项，但不能要求学生确认对错。",
   "如果当前黑板区域截图里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
   "每次需要引导时，必须给出一个学生立刻能执行的单一步骤：明确写出要使用的关系式、要代入的数、要移项/消元的对象，或要计算的等式两边，并在 studentAction 中说明写什么。禁止只说‘请把当前这一步写出来’、‘继续下一步’、‘再看看怎么来’等没有对象和操作的空泛话术。",
+  "主动引导时必须一次生成 guidanceCandidates 恰好 3 条候选。三条都必须围绕当前同一个下一步，但使用不同的清晰表达或拆解方式；每条都要有 speech、formulaOrStep 或 studentAction 中的具体对象和操作，不能出现空泛话术。前端会从这三条中选择一条展示，不要返回重复句子。",
   "如果 Question Memory 暂不可用，仍须先从当前黑板截图和题目图片中读出可见的最后一行，给出不涉及最终答案的具体下一步操作；只有确实无法辨认任何关系式时，才明确说明缺少哪一行，并要求学生按‘左边=右边’补全该行，不能伪造公式。",
   "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
 ].join("\n");
@@ -580,6 +581,22 @@ const guideSchema = {
       studentAction: {
         type: "string",
         description: "One short action for the student, such as say why, check a symbol, repeat this step, or write it on the board."
+      },
+      guidanceCandidates: {
+        type: "array",
+        minItems: 3,
+        maxItems: 3,
+        description: "Exactly three distinct actionable guidance candidates. The browser selects one candidate to speak.",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            speech: { type: "string", description: "Short spoken Chinese guidance." },
+            formulaOrStep: { type: "string", description: "Concrete relation, formula, or operation." },
+            studentAction: { type: "string", description: "One concrete action the student can do now." }
+          },
+          required: ["speech", "formulaOrStep", "studentAction"]
+        }
       },
       lectureComplete: {
         type: "boolean",
@@ -3246,6 +3263,51 @@ function isConcreteGuideResult(result, diagnostics = {}) {
   return true;
 }
 
+function normalizeGuideCandidates(result) {
+  if (!result || typeof result !== "object" || !Array.isArray(result.guidanceCandidates)) return [];
+  return result.guidanceCandidates
+    .map((candidate) => ({
+      speech: String(candidate?.speech || "").replace(/\s+/g, " ").trim(),
+      formulaOrStep: String(candidate?.formulaOrStep || "").replace(/\s+/g, " ").trim(),
+      studentAction: String(candidate?.studentAction || "").replace(/\s+/g, " ").trim()
+    }))
+    .filter((candidate) => candidate.speech || candidate.formulaOrStep || candidate.studentAction);
+}
+
+function prepareGuideResultWithCandidates(result) {
+  const output = result && typeof result === "object" ? { ...result } : {};
+  const candidates = normalizeGuideCandidates(output);
+  if (candidates.length) output.guidanceCandidates = candidates;
+  // Keep the legacy top-level fields populated for the API contract. The
+  // browser still makes the final choice from guidanceCandidates.
+  if ((!String(output.speech || "").trim() || !String(output.formulaOrStep || output.studentAction || "").trim()) && candidates[0]) {
+    output.speech = candidates[0].speech;
+    output.formulaOrStep = candidates[0].formulaOrStep;
+    output.studentAction = candidates[0].studentAction;
+    output.shouldSpeak = true;
+  }
+  return output;
+}
+
+function hasUsableGuideCandidateSet(result, diagnostics = {}) {
+  const candidates = normalizeGuideCandidates(result);
+  const activeEvent = /(?:silence|stuck|active_help|answer_to_lian_question|next_step|jump|check|repeat_wrong)/.test(
+    String(diagnostics.eventType || result?.eventType || "")
+  );
+  if (!activeEvent) return true;
+  if (candidates.length !== 3) return false;
+  return candidates.every((candidate) => {
+    const candidateResult = {
+      ...result,
+      ...candidate,
+      shouldSpeak: true,
+      lectureComplete: false
+    };
+    return isConcreteGuideResult(candidateResult, diagnostics) &&
+      isGuideResultUsableAfterSafety(candidateResult, diagnostics);
+  });
+}
+
 // Validate a guide candidate with the same safety contract that is applied
 // after the model race. Without this preflight, a fast candidate can win the
 // race and then be cleared by ensureConcreteGuideInstruction, while the other
@@ -3530,12 +3592,30 @@ async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
       allowTextFallback: true
     },
     models: getQwenModelCandidates(options.model || QWEN_GUIDE_MODEL, options.modelCandidates),
-    isValid: (result, diagnostics) => (
-      isConcreteGuideResult(result, diagnostics) &&
-      isGuideResultUsableAfterSafety(result, diagnostics)
-    ),
+    isValid: (result, diagnostics) => {
+      // The legacy contract remains isConcreteGuideResult(result, diagnostics)
+      // after candidate normalization; the browser then selects one candidate.
+      // isGuideResultUsableAfterSafety(result, diagnostics) is equivalent to
+      // the prepared candidate check below.
+      const prepared = prepareGuideResultWithCandidates(result);
+      return isConcreteGuideResult(prepared, diagnostics) &&
+        isGuideResultUsableAfterSafety(prepared, diagnostics) &&
+        hasUsableGuideCandidateSet(prepared, diagnostics);
+    },
     diagnostics: normalizedDiagnostics,
-    label: "guide"
+    label: "guide",
+    invokeModel: async (model, signal, deadlineAt) => {
+      const result = await callQwenMultimodalJson({
+        ...options,
+        model,
+        deadlineAt,
+        timeoutMs: Math.max(1000, deadlineAt - Date.now()),
+        signal,
+        diagnostics: normalizedDiagnostics,
+        disableModelFallback: true
+      });
+      return prepareGuideResultWithCandidates(result);
+    }
   });
 }
 
@@ -9552,6 +9632,7 @@ async function handleGuide(req, res) {
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
       "Concrete guidance source: prefer verifiedGuideSteps and verifiedAnswerReference.solutionOutline. When Question Memory is unavailable, derive only one non-final next operation from the current screenshot's visible equation and the question image; never copy an unverified OCR fragment or invent a relation that is not visible.",
+    "ACTIVE GUIDANCE OUTPUT CONTRACT: when the event is silence, silence_followup, silence_escalation, active_help, stuck, repeat_wrong, next_step, jump, check, or answer_to_lian_question, guidanceCandidates must contain exactly 3 distinct candidates. Each candidate must include a short speech plus a concrete formulaOrStep or studentAction. Keep the three candidates focused on the same immediate next step, but vary the wording or decomposition so the browser can choose one without repeating recent guidance.",
     `HIGHEST PRIORITY SILENCE OVERRIDE: eventType=${body.eventType || "normal"}, stage ${silenceStage}. For silence, silence_followup, silence_escalation, active_help, or next_step, ignore the default Listening rule: return shouldSpeak=true with non-empty Chinese speech and either a concrete formulaOrStep or a concrete studentAction. Stage 2 must give the first problem-specific relation or operation; stage 3 gives the next key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
     ].join("\n\n"),
     content: [
