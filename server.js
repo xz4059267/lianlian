@@ -9206,6 +9206,53 @@ function ensureConcreteSilenceGuide(result, body = {}) {
   };
 }
 
+function ensureConcreteGuideInstruction(result, context = {}) {
+  const output = result && typeof result === "object" ? { ...result } : {};
+  if (output.shouldSpeak === false || output.lectureComplete === true) return output;
+
+  const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
+  const formula = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
+  const action = String(output.studentAction || "").replace(/\s+/g, " ").trim();
+  const vague = /(?:确认(?:一下|下)|看看?怎么来|怎么来的|怎么得到|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看)/i.test(speech);
+  const hasConcreteRelation = /(?:=|＝|等于|成比例|比例|代入|相减|相加|消元|移项|乘以|除以|写出|算出|求得|得到)/i.test(`${formula} ${action}`);
+  const nextStep = String(
+    context.guideProgress?.currentStep ||
+    context.silenceContextStep ||
+    ""
+  ).replace(/\s+/g, " ").trim();
+
+  if (!vague && hasConcreteRelation && formula) return output;
+  if (nextStep) {
+    return {
+      ...output,
+      shouldSpeak: true,
+      speech: `下一步直接做：${nextStep}。请把这一步写在黑板上，再继续计算。`,
+      hintLevel: output.hintLevel === "worked_step" ? output.hintLevel : "light",
+      formulaOrStep: nextStep,
+      askStudentToRepeat: false,
+      studentAction: `请把${nextStep}写在黑板上，再继续下一步。`,
+      lectureComplete: false
+    };
+  }
+
+  // If Question Memory is temporarily unavailable, still give an actionable
+  // writing instruction instead of a confirmation question. Do not invent an
+  // equation or answer when no trusted step is available.
+  if (vague || !hasConcreteRelation) {
+    return {
+      ...output,
+      shouldSpeak: true,
+      speech: "请把当前这一步的等式变形和计算结果写在黑板上，再继续下一步。",
+      hintLevel: "light",
+      formulaOrStep: "",
+      askStudentToRepeat: false,
+      studentAction: "请写出等式变形、代入或计算结果。",
+      lectureComplete: false
+    };
+  }
+  return output;
+}
+
 function getSilenceGuidePolicy(stage) {
   const level = Math.max(0, Math.min(4, Number(stage) || 0));
   return {
@@ -9446,6 +9493,11 @@ async function handleGuide(req, res) {
     eventType: body.eventType || "",
     requestId: guideRequestId,
     sessionId: guideSessionId
+  });
+
+  guideResult = ensureConcreteGuideInstruction(guideResult, {
+    guideProgress,
+    silenceContextStep: guideBody.silenceContextStep
   });
 
   if (!isLatestGuideRequest(guideSessionId, guideQuestionId, guideRequestId)) {
