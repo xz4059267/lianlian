@@ -5638,7 +5638,7 @@ function resetSilenceTimer(updateSpeechAt = true) {
 
 function isGuideRequestRetryable(error) {
   if (!error || error.name === "AbortError") return false;
-  if (["qwen_timeout", "request_aborted", "stale_request"].includes(error.code)) return false;
+  if (["qwen_timeout", "request_aborted", "stale_request", "guide_contract_violation"].includes(error.code)) return false;
   // A network failure has already failed before a usable response exists.
   // Retrying here duplicated the same expensive guide request and produced
   // repeated notices while leaving the save action blocked.
@@ -6492,6 +6492,20 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
       !isCurrentInteraction(responseToken) ||
       hasStudentInputSince(guideInputSnapshot)
     ) {
+      return false;
+    }
+    if (error?.code === "guide_contract_violation") {
+      dom.lianState.textContent = "模型返回的引导格式不合格，请点击发送重试";
+      if (isSilenceGuide) {
+        state.silenceGuidanceExhausted = true;
+        state.awaitingSilenceFollowup = false;
+        clearTimeout(state.silenceTimer);
+        state.silenceTimer = null;
+      }
+      lianSilentNotice("模型返回了无效引导，已停止自动重试。点击发送可重新请求。", {
+        key: `guide-contract-failed:${questionId}`,
+        cooldownMs: 60000
+      });
       return false;
     }
     dom.lianState.textContent = "自动引导暂时不可用，但仍可继续核对和保存";

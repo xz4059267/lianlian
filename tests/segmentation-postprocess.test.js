@@ -74,7 +74,8 @@ test("uses parallel model racing for guide requests", () => {
     serverSource.indexOf("function summarizeHandwritingDiagnostics")
   );
   assert.match(guideSource, /raceQwenStructuredModels/);
-  assert.match(guideSource, /isValid: isConcreteGuideResult/);
+  assert.match(guideSource, /isConcreteGuideResult\(result, diagnostics\)/);
+  assert.match(guideSource, /isGuideResultUsableAfterSafety\(result, diagnostics\)/);
   assert.doesNotMatch(guideSource, /const maxAttempts = 1/);
 });
 
@@ -404,6 +405,10 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);
   assert.match(serverSource, /guideResult = ensureConcreteSilenceGuide\(guideResult, guideBody\)/);
   assert.match(serverSource, /ensureGuideFormulaMatchesTrustedSteps/);
+  assert.match(serverSource, /isGuideResultUsableAfterSafety/);
+  assert.match(serverSource, /guideValidationContext/);
+  assert.match(serverSource, /final contract violation/);
+  assert.match(serverSource, /guide_contract_violation/);
   assert.match(serverSource, /requiresExplicitStep/);
   assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);
   assert.match(appSource, /createCurrentStudentStrokeSnapshot/);
@@ -417,6 +422,8 @@ test("handwriting verification decides guide versus save from the same board req
   assert.doesNotMatch(serverSource, /提醒学生把关键关系式和最终答案写到黑板上/);
   assert.match(appSource, /A silent\/empty model result gets only the remaining bounded stage/);
   assert.match(appSource, /MAX_SILENCE_AUTO_ATTEMPTS/);
+  assert.match(appSource, /guide_contract_violation/);
+  assert.match(appSource, /已停止自动重试/);
   assert.match(appSource, /silence retry limit reached/);
   assert.match(appSource, /if \(isSilenceGuide && !state\.silenceGuidanceExhausted\) resetSilenceTimer\(false\)/);
   assert.match(appSource, /const guideFailureStillCooling =\s*!isSilenceGuide/);

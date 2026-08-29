@@ -3244,6 +3244,30 @@ function isConcreteGuideResult(result, diagnostics = {}) {
   return true;
 }
 
+// Validate a guide candidate with the same safety contract that is applied
+// after the model race. Without this preflight, a fast candidate can win the
+// race and then be cleared by ensureConcreteGuideInstruction, while the other
+// candidate has already been aborted. Active guidance must never be allowed to
+// disappear at that boundary.
+function isGuideResultUsableAfterSafety(result, diagnostics = {}) {
+  const context = diagnostics.guideValidationContext;
+  if (!context) return true;
+  const checked = ensureConcreteGuideInstruction(result, context);
+  const anchored = ensureGuideFormulaMatchesTrustedSteps(checked, {
+    givenConditions: context.guideProgress?.givenConditions,
+    verifiedGuideSteps: context.verifiedGuideSteps
+  });
+  const activeEvent = /^(?:active_help|stuck|silence|silence_followup|silence_escalation|error_silence|repeat_wrong|next_step|jump|check|answer_to_lian_question)$/.test(
+    String(context.eventType || "")
+  );
+  if (!activeEvent) return true;
+  return Boolean(
+    anchored.shouldSpeak !== false &&
+    String(anchored.speech || "").trim() &&
+    (String(anchored.formulaOrStep || "").trim() || String(anchored.studentAction || "").trim())
+  );
+}
+
 function isValidHandwritingResult(result) {
   if (!result || typeof result !== "object") return false;
   const writingState = String(result.writingState || "").trim().toLowerCase();
@@ -3504,7 +3528,10 @@ async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
       allowTextFallback: true
     },
     models: getQwenModelCandidates(options.model || QWEN_GUIDE_MODEL, options.modelCandidates),
-    isValid: isConcreteGuideResult,
+    isValid: (result, diagnostics) => (
+      isConcreteGuideResult(result, diagnostics) &&
+      isGuideResultUsableAfterSafety(result, diagnostics)
+    ),
     diagnostics: normalizedDiagnostics,
     label: "guide"
   });
@@ -9377,13 +9404,25 @@ async function handleGuide(req, res) {
     verifiedGuideSteps,
     guideProgress
   };
+  const guideValidationContext = {
+    eventType: body.eventType || "normal",
+    hasBoardInk: body.hasBoardInk === true,
+    guideProgress,
+    silenceContextStep: guideBody.silenceContextStep,
+    verifiedGuideSteps,
+    recognizedBoardProgress: body.recognizedBoardProgress,
+    hasFinalAnswer: Boolean(body.studentFinalAnswerEvidence || body.answerVerified),
+    answerVerified: body.answerVerified === true,
+    boardCompletionVerified: body.boardCompletionVerified === true
+  };
 
   const guideRequestStartedAt = Date.now();
   console.info("[guide] payload-images", {
     questionId: body.questionId || "",
     questionImageChars: 0,
     boardImageChars: String(currentBoardImage).length,
-    totalImageChars: String(currentBoardImage).length
+    studentStrokeImageChars: String(body.studentStrokeImage || "").length,
+    totalImageChars: String(currentBoardImage).length + String(body.studentStrokeImage || "").length
   });
   let guideResult = await callGuideQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
@@ -9489,7 +9528,8 @@ async function handleGuide(req, res) {
     questionId: guideQuestionId,
     eventType: body.eventType || "",
     requestId: guideRequestId,
-    sessionId: guideSessionId
+    sessionId: guideSessionId,
+    guideValidationContext
   });
 
   guideResult = ensureConcreteSilenceGuide(guideResult, guideBody);
@@ -9497,17 +9537,7 @@ async function handleGuide(req, res) {
     givenConditions: guideProgress.givenConditions,
     verifiedGuideSteps
   });
-  guideResult = ensureConcreteGuideInstruction(guideResult, {
-    eventType: body.eventType || "normal",
-    hasBoardInk: body.hasBoardInk === true,
-    guideProgress,
-    silenceContextStep: guideBody.silenceContextStep,
-    verifiedGuideSteps,
-    recognizedBoardProgress: body.recognizedBoardProgress,
-    hasFinalAnswer: Boolean(body.studentFinalAnswerEvidence || body.answerVerified),
-    answerVerified: body.answerVerified === true,
-    boardCompletionVerified: body.boardCompletionVerified === true
-  });
+  guideResult = ensureConcreteGuideInstruction(guideResult, guideValidationContext);
 
   if (!isLatestGuideRequest(guideSessionId, guideQuestionId, guideRequestId)) {
     sendJson(res, 409, {
@@ -9522,17 +9552,39 @@ async function handleGuide(req, res) {
   }
 
   // Model-only guide mode: only an actionable Qwen speech is returned.
-  // Local code may reject a vague response, but it never writes replacement
-  // mathematics or speech into the model result.
-  console.info("[guide] qwen response accepted without local post-processing", {
+  // The preflight validator used by the model race applies the same safety
+  // contract as this final pass, so a candidate cannot win and then vanish.
+  const activeGuideEvent = /^(?:active_help|stuck|silence|silence_followup|silence_escalation|error_silence|repeat_wrong|next_step|jump|check|answer_to_lian_question)$/.test(
+    String(body.eventType || "")
+  );
+  const finalGuideSpeech = String(guideResult?.speech || "").trim();
+  const finalGuideAction = String(guideResult?.formulaOrStep || guideResult?.studentAction || "").trim();
+  console.info("[guide] qwen response final contract", {
     eventType: body.eventType || "",
     silenceStage: Number(body.silenceStage) || 0,
-    hasSpeech: Boolean(String(guideResult?.speech || "").trim()),
-    hasFormula: Boolean(String(guideResult?.formulaOrStep || "").trim()),
+    hasSpeech: Boolean(finalGuideSpeech),
+    hasFormulaOrAction: Boolean(finalGuideAction),
     shouldSpeak: guideResult?.shouldSpeak !== false,
+    activeGuideEvent,
+    guideUnavailableReason: guideResult?.guideUnavailableReason || "",
     lectureComplete: guideResult?.lectureComplete === true,
     elapsedMs: Date.now() - guideRequestStartedAt
   });
+  if (activeGuideEvent && (!finalGuideSpeech || !finalGuideAction || guideResult?.shouldSpeak === false)) {
+    console.error("[guide] final contract violation", {
+      eventType: body.eventType || "",
+      reason: guideResult?.guideUnavailableReason || "empty_or_non_actionable_model_result"
+    });
+    sendJson(res, 502, {
+      error: "模型返回的引导不符合主动引导格式",
+      code: "guide_contract_violation",
+      guideUnavailableReason: guideResult?.guideUnavailableReason || "empty_or_non_actionable_model_result",
+      requestId: guideRequestId,
+      sessionId: guideSessionId,
+      questionId: guideQuestionId
+    });
+    return;
+  }
   sendJson(res, 200, {
     ...guideResult,
     progress: guideProgress,
