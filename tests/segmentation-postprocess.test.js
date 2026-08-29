@@ -344,6 +344,12 @@ test("guide receives one current blackboard image and ignores legacy handwriting
   assert.match(guideHandler, /当前黑板区域截图/);
   assert.match(guideHandler, /latestHandwritingResult: body\.recognizedBoardProgress \|\| null/);
   assert.doesNotMatch(guideHandler, /latestHandwritingResult: body\.latestHandwritingResult/);
+  const boardInkSource = appSource.slice(
+    appSource.indexOf("function hasCurrentBoardInk"),
+    appSource.indexOf("function markCurrentBoardInk")
+  );
+  assert.match(boardInkSource, /const hasInk = canvasHasVisibleInk\(\)/);
+  assert.doesNotMatch(boardInkSource, /Boolean\(state\.boardInkByQuestion\[question\.id\]\) \|\|/);
 });
 
 test("does not send a pre-recognition board image to transcript correction", () => {

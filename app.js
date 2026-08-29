@@ -2759,7 +2759,14 @@ function canvasHasVisibleInk() {
 
 function hasCurrentBoardInk(question = currentPageQuestion()) {
   if (!question) return false;
-  return Boolean(state.boardInkByQuestion[question.id]) || canvasHasVisibleInk();
+  // The per-question flag is only a cache. It can outlive a cleared canvas
+  // after navigation or page restore, so never let it claim that stale strokes
+  // are still visible in the current board snapshot.
+  const hasInk = canvasHasVisibleInk();
+  if (state.boardInkByQuestion[question.id] !== hasInk) {
+    state.boardInkByQuestion[question.id] = hasInk;
+  }
+  return hasInk;
 }
 
 function markCurrentBoardInk(question = currentPageQuestion()) {
