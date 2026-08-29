@@ -3846,6 +3846,10 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     maxSide: HANDWRITING_IMAGE_MAX_SIDE,
     quality: HANDWRITING_IMAGE_JPEG_QUALITY
   });
+  const studentStrokeImage = await createCurrentStudentStrokeSnapshot({
+    maxSide: HANDWRITING_IMAGE_MAX_SIDE,
+    quality: HANDWRITING_IMAGE_JPEG_QUALITY
+  });
   const boardIdleSeconds = Math.max(0, Math.round((Date.now() - (state.lastBoardWriteAt || Date.now())) / 1000));
   const diagnostics = {
     requestId,
@@ -3857,6 +3861,7 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     canvasWidth: Number(dom.canvas.width || 0),
     canvasHeight: Number(dom.canvas.height || 0),
     boardImageBytes: String(boardImage || "").length,
+    studentStrokeImageBytes: String(studentStrokeImage || "").length,
     capturedAt: new Date().toISOString()
   };
   console.log("[handwriting] request snapshot", diagnostics);
@@ -3874,6 +3879,7 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
         memoryId: requestMeta.memoryId,
         questionMemory,
         boardImage,
+        studentStrokeImage,
         reason,
         boardIdleSeconds,
         latestStudentSpeech: state.latestStudentSpeechText || "",
@@ -3957,6 +3963,24 @@ async function createCurrentBoardSnapshot(options = {}) {
     getSnapshotImageState(question.id)
   );
   return prepareGuideImage(snapshot, {
+    maxSide: options.maxSide || HANDWRITING_IMAGE_MAX_SIDE,
+    quality: options.quality || HANDWRITING_IMAGE_JPEG_QUALITY
+  });
+}
+
+// The flattened board snapshot is useful for spatial context, but it cannot
+// tell the model whether a mark was already inside the imported question image
+// or was drawn by the student after import. Send the transparent canvas layer
+// separately so post-import handwriting remains identifiable even when it is
+// written directly over the imported image.
+async function createCurrentStudentStrokeSnapshot(options = {}) {
+  const question = currentPageQuestion();
+  if (!question || !hasCurrentBoardInk(question)) return "";
+  saveCurrentPage();
+  const pages = pagesForQuestion(question.id);
+  const strokes = pages[0] || getBoardImageForGuide();
+  if (!strokes) return "";
+  return prepareGuideImage(strokes, {
     maxSide: options.maxSide || HANDWRITING_IMAGE_MAX_SIDE,
     quality: options.quality || HANDWRITING_IMAGE_JPEG_QUALITY
   });
@@ -6582,6 +6606,10 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       maxSide: GUIDE_IMAGE_MAX_SIDE,
       quality: GUIDE_IMAGE_JPEG_QUALITY
     });
+    const studentStrokeImage = await createCurrentStudentStrokeSnapshot({
+      maxSide: GUIDE_IMAGE_MAX_SIDE,
+      quality: GUIDE_IMAGE_JPEG_QUALITY
+    });
     if (!markGuideRequestActive()) {
       const staleError = new Error("stale guide request");
       staleError.name = "AbortError";
@@ -6594,7 +6622,8 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       sessionId: guideSessionId,
       questionImageChars: 0,
       boardImageChars: boardImage.length,
-      totalImageChars: boardImage.length
+      studentStrokeImageChars: studentStrokeImage.length,
+      totalImageChars: boardImage.length + studentStrokeImage.length
     });
     while (true) {
       requestAttempt += 1;
@@ -6615,6 +6644,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       questionType: question.problemType || question.questionType || question.type || "",
       knowledgePoints: question.knowledgePoints || [],
       boardImage,
+      studentStrokeImage,
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
       // This is the structured result of the latest completed multimodal
       // recognition, not client OCR. It lets the guide advance past steps

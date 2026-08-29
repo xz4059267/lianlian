@@ -287,9 +287,9 @@ const OCR_GROUPING_PROMPT =
 
 const LIAN_GUIDE_PROMPT = [
   "你是恋恋，面向初中学生的费曼学习法多模态引导学伴。目标是让学生自己把错题讲明白，不是替学生直接做题。",
-  "最高优先级的证据分层规则：当前黑板截图同时包含题目印刷图片和学生原始笔迹。先在视觉上分离两层，再只依据学生原始笔迹（以及完整语音中对当前笔迹的意图说明）判断学生已经写了什么、做到哪一步。题目图片里的印刷公式、选项、红笔批注、勾叉和旧答案只能作为题目条件或标准答案背景，绝不能当成学生已经列出的式子、答案或步骤。引导必须贴着学生当前可见笔迹推进，不能用题目图片中的式子替代学生板书，也不能根据旧识别结果补写学生没有写出的内容。",
+  "最高优先级的证据分层规则：当前黑板截图同时包含首页导入的题目图片和学生在导入后新增的黑板笔迹。先在视觉上分离两层，再只依据导入后新增的学生笔迹（以及完整语音中对当前笔迹的意图说明）判断学生已经写了什么、做到哪一步。首页导入图片中原本就有的印刷公式、选项、红笔批注、勾叉、旧答案或任何原有手写内容，只能作为题目条件或背景，绝不能当成学生本次列出的式子、答案或步骤。学生后来在导入图片上方、图片内部或图片旁边写出的浅色笔迹，仍然是学生笔迹；如果同时提供‘导入后新增的学生笔迹隔离层’，以该隔离层确认本次书写。引导必须贴着学生当前新增笔迹推进，不能用导入图片中的内容替代学生板书，也不能根据旧识别结果补写学生没有写出的内容。",
   "最高优先级的可执行输出规则：只要 eventType 是 silence、silence_followup、silence_escalation、stuck、active_help、next_step 或 answer_to_lian_question，就必须 shouldSpeak=true，speech 非空，并且 formulaOrStep 或 studentAction 至少有一个非空且能立即执行；关系式要写出具体对象/符号，动作要写清楚要代入、移项、相减、比较、复述或写下什么。禁止只返回‘继续想想’、‘再看看’、‘我来核对’等空泛话术。",
-  "空板规则：如果当前截图没有学生原始笔迹，必须明确按‘还没有看到学生板书’处理，不能说学生刚才写出、列出、算出或得到任何式子；此时只能要求学生先把当前题目的第一条具体关系式或计算步骤写到黑板上，不能把题目图片中的公式冒充成学生板书。",
+  "空板规则：如果‘导入后新增的学生笔迹隔离层’为空，或当前截图没有可确认的新增学生笔迹，必须明确按‘还没有看到学生板书’处理，不能说学生刚才写出、列出、算出或得到任何式子；此时只能要求学生先把当前题目的第一条具体关系式或计算步骤写到黑板上，不能把首页导入图片中的公式冒充成学生板书。",
   "语气像温柔、耐心的女生学习伙伴：自然、短、轻一点，不要像 AI 播报，也不要像老师批改。",
   "必须遵守四个状态机：A heuristic_guidance=启发引导；B micro_hint=知识点微提示；C interactive_teaching=互动讲解；D archive_review=归档复习。",
   "A 启发引导：学生正在尝试讲题时，优先追问、提问或保持安静；不能主动给最终答案、中间完整算式或完整解题步骤。",
@@ -387,8 +387,8 @@ const HANDWRITING_PROMPT = [
   "你是初中数学黑板板书的异步观察与核验器。你要在一次请求里同时识别当前板书，并把可见的最终答案和步骤与服务端提供的可信标准答案进行对比。",
   "你会看到当前黑板区域的完整截图，截图同时包含当前题目图片和学生的原始笔迹。截图是所有视觉事实的唯一来源；服务端提供的 verifiedAnswerReference 是唯一的标准答案依据。不要依赖 OCR、前端整理文本或任何旧的板书识别结果。",
   "当前黑板上的学生原始笔迹优先级高于语音。studentSpeechTranscript 是本题从开始到现在的完整语音记录，latestStudentSpeech 只是最新片段；语音只能帮助理解学生正在说明哪一行或哪个意图，不能覆盖、改写或补充截图中没有出现的数学步骤和答案；当语音与笔迹冲突时，以笔迹为准并返回 unclear 或 ask_for_board。",
-  "题目图片中的印刷文字、红笔/蓝笔批注、勾叉、圈画、旧答案和非本次书写痕迹都不是当前学生笔迹，不能当作学生本次答案或步骤；只判断黑板上本次原始笔迹。",
-  "识别时先区分图层：题目图片通常位于黑板左上或被白框包住，里面印刷的 A/B/C/D、I/II、红笔标记一律忽略；黑板书写区里由浅色笔迹写出的内容才是学生输入。若黑板书写区单独出现大写 A/B/C/D 或 I/II 判定，它就是学生写出的选项/结论，即使题图里也有同样字母，也必须把黑板笔迹记录进 detectedWriting、completedSteps 或 finalAnswer。",
+  "题目图片中的印刷文字、红笔/蓝笔批注、勾叉、圈画、旧答案、原有手写内容和非本次书写痕迹都不是当前学生笔迹，不能当作学生本次答案或步骤；只判断导入后新增的黑板笔迹。学生在导入图片上方、图片内部或图片旁边新增的笔迹都属于本次书写。",
+  "识别时先区分图层：先看‘导入后新增的学生笔迹隔离层’确认本次书写，再用合成黑板截图确定这些笔迹对应的位置和题目上下文。若没有隔离层，则只能把合成图中明显位于导入图片之外、且符合黑板书写笔迹的新增内容作为候选；无法区分时返回 unclear，不得猜测。首页导入图片里的 A/B/C/D、I/II、红笔标记一律忽略；如果这些字母出现在新增笔迹隔离层中，才记录为学生写出的选项/结论。",
   "不要因为题图覆盖在左上角而漏读黑板其余区域；必须扫描整张当前截图的所有原始笔迹，尤其是黑板中央、右侧和底部的等式、赋值、选项字母。只要这些笔迹清晰可见，就必须在结构化结果中忠实转写，不能返回与当前截图无关的旧引导。",
   "你的职责是：忠实转写可见笔迹；判断当前书写状态；列出已经明确完成且可见的步骤；定位明确错误；当最终答案和关键步骤都可见时，直接返回与标准答案的核验结果。",
   "禁止根据学生零散板书补出未写出的步骤或最终答案。标准答案只用于核对已经写出的最终答案和可见步骤，不能替学生补写答案。",
@@ -789,8 +789,8 @@ const handwritingAuditSchema = {
 
 const HANDWRITING_AUDIT_PROMPT = [
   "你是初中数学板书观察结果的安全审校员，不负责重新解题或生成教学反馈。",
-  "你会看到当前黑板区域完整截图，其中同时包含题目图片和学生原始笔迹。当前截图是唯一视觉事实来源；不要采用 OCR、前端整理文本或任何旧识别结果。",
-  "请独立检查截图中的题目与当前笔迹，不要补写学生没有写出的步骤，也不要根据截图外的历史内容推断。",
+  "你会看到当前黑板区域完整截图，其中同时包含首页导入题目图片和导入后新增的学生笔迹；有一张‘导入后新增的学生笔迹隔离层’时，它是确认本次书写的优先证据。首页导入图片原本包含的印刷、批注或手写内容都不是本次笔迹。不要采用 OCR、前端整理文本或任何旧识别结果。",
+  "请独立检查截图中的题目与导入后新增的当前笔迹，不要补写学生没有写出的步骤，也不要根据截图外的历史内容推断。",
   "completedSteps 只能保留板书上明确可见且已经完成的步骤。",
   "如果当前截图不能同时支持题意和笔迹的判断，必须返回 unclear。",
   "如果判断为 wrong，必须同时给出具体 errorLocation 和来自当前截图的 errorEvidence，否则降级为 unclear 或 incomplete。",
@@ -9453,7 +9453,15 @@ async function handleGuide(req, res) {
           styleRules: LIAN_STYLE_RULES
         })
       },
-      { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: currentBoardImage, detail: "high" }
+      { type: "input_image", label: "当前黑板区域截图（首页导入题图+导入后合成画布）", image_url: currentBoardImage, detail: "high" },
+      ...(body.studentStrokeImage
+        ? [{
+            type: "input_image",
+            label: "导入后新增的学生笔迹隔离层（唯一的本次书写证据）",
+            image_url: body.studentStrokeImage,
+            detail: "high"
+          }]
+        : [])
     ],
     maxOutputTokens: 1200
   }, {
@@ -9724,11 +9732,19 @@ async function handleHandwritingInternal(req, res, task) {
           studentSpeechTranscript: String(body.studentSpeechTranscript || "").trim(),
           hasBoardInk: body.hasBoardInk === true,
           instruction:
-            "只依据当前黑板区域截图（题目图片与学生原始笔迹）判断当前状态和下一动作；笔迹优先于本题完整语音记录 studentSpeechTranscript 及 latestStudentSpeech；当截图中出现最终答案和关键步骤时，使用 verifiedAnswerReference 直接完成核验；如果没有笔迹只能提醒写板书；不要读取或复述任何旧识别结果。",
+            "只依据当前黑板区域截图和‘导入后新增的学生笔迹隔离层’判断当前状态和下一动作；首页导入图片里的原有内容不算本次笔迹，学生后来写在图片上、图片内或图片旁边的新增笔迹算本次笔迹；笔迹优先于本题完整语音记录 studentSpeechTranscript 及 latestStudentSpeech；当截图中出现最终答案和关键步骤时，使用 verifiedAnswerReference 直接完成核验；如果新增笔迹隔离层为空只能提醒写板书；不要读取或复述任何旧识别结果。",
           verifiedAnswerReference: privateAnswerReference(answerKey)
         })
       },
-      { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: boardImage, detail: "high" }
+      { type: "input_image", label: "当前黑板区域截图（首页导入题图+导入后合成画布）", image_url: boardImage, detail: "high" },
+      ...(body.studentStrokeImage
+        ? [{
+            type: "input_image",
+            label: "导入后新增的学生笔迹隔离层（唯一的本次书写证据）",
+            image_url: body.studentStrokeImage,
+            detail: "high"
+          }]
+        : [])
     ],
     maxOutputTokens: 700,
     signal: task.abortController.signal,
@@ -10145,11 +10161,19 @@ async function auditHandwritingResult(result, answerKey, body, boardImage, contr
             trigger: body.reason || "",
             boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
             instruction:
-              "只根据当前黑板区域截图独立审校可见步骤，并参考 verifiedAnswerReference 审校可见最终答案。不得读取旧识别结果、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和来自截图的证据。",
+              "只根据当前黑板区域截图和导入后新增的学生笔迹隔离层独立审校可见步骤，并参考 verifiedAnswerReference 审校可见最终答案。首页导入图片中的原有内容不是本次笔迹；不得读取旧识别结果、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和来自新增笔迹的证据。",
             verifiedAnswerReference: privateAnswerReference(answerKey)
           })
         },
-        { type: "input_image", label: "当前黑板区域截图（题目与原始笔迹）", image_url: boardImage, detail: "high" }
+        { type: "input_image", label: "当前黑板区域截图（首页导入题图+导入后合成画布）", image_url: boardImage, detail: "high" },
+        ...(body.studentStrokeImage
+          ? [{
+              type: "input_image",
+              label: "导入后新增的学生笔迹隔离层（唯一的本次书写证据）",
+              image_url: body.studentStrokeImage,
+              detail: "high"
+            }]
+          : [])
       ],
       maxOutputTokens: 500,
       signal: control.signal || null,

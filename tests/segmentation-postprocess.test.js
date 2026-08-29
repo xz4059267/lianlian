@@ -390,7 +390,9 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /VISUAL_RELATION_RULES/);
   assert.match(serverSource, /图形、箭头、表格、坐标/);
   assert.match(serverSource, /最高优先级的证据分层规则/);
-  assert.match(serverSource, /题目图片里的印刷公式、选项、红笔批注/);
+  assert.match(serverSource, /首页导入图片中原本就有的印刷公式、选项、红笔批注/);
+  assert.match(serverSource, /导入后新增的学生笔迹隔离层/);
+  assert.match(serverSource, /学生后来写在图片上、图片内或图片旁边的新增笔迹算本次笔迹/);
   assert.match(serverSource, /最高优先级的可执行输出规则/);
   assert.match(serverSource, /只返回‘继续想想’/);
   assert.match(serverSource, /空板规则/);
@@ -399,6 +401,10 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /ensureGuideFormulaMatchesTrustedSteps/);
   assert.match(serverSource, /requiresExplicitStep/);
   assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);
+  assert.match(appSource, /createCurrentStudentStrokeSnapshot/);
+  assert.match(appSource, /studentStrokeImage/);
+  assert.match(serverSource, /唯一的本次书写证据/);
+  assert.match(serverSource, /首页导入图片原本包含的印刷、批注或手写内容都不是本次笔迹/);
   assert.match(appSource, /handwriting-answer-unclear/);
   assert.match(appSource, /hasVisibleAnswerAndKeyStep/);
   assert.doesNotMatch(appSource, /result\.shouldSpeak === false && !options\.force/);
