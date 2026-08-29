@@ -438,6 +438,9 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /不得说‘你画了红叉’/);
   assert.match(serverSource, /最高优先级的可执行输出规则/);
   assert.match(serverSource, /具体列式硬规则/);
+  assert.match(serverSource, /列式方法的最低可执行格式/);
+  assert.match(serverSource, /只能让学生复述或写回黑板，不得要求学生确认对错/);
+  assert.doesNotMatch(serverSource, /每步后必须让学生确认、复述或写回黑板/);
   assert.match(serverSource, /完整等式，或给出同样明确的列式方法/);
   assert.match(serverSource, /hasConcreteEquationMethod/);
   assert.match(serverSource, /只返回‘继续想想’/);
