@@ -6254,6 +6254,7 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   }
   const hasNewStudentSpeech = Boolean(String(latestStudentSpeech || "").trim());
   const guideFailureStillCooling =
+    !isSilenceGuide &&
     !options.retryAfterFailure &&
     !hasNewStudentSpeech &&
     state.guideUnavailableQuestionId === question.id &&
@@ -6374,6 +6375,9 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
         provider: result?.provider || "qwen-structured-answer-guidance"
       });
       dom.lianState.textContent = "大模型没有返回引导";
+      // A silent/empty model result must not permanently consume the silence
+      // timer. Re-arm the next escalation window and let Qwen try again later.
+      if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
       state.guideUnavailableAt = Date.now();
       state.guideUnavailableQuestionId = questionId;
       state.guideUnavailableUntil = Date.now() + 60000;
@@ -6431,7 +6435,8 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     state.guideUnavailableAt = Date.now();
     state.guideUnavailableQuestionId = questionId;
     state.guideUnavailableUntil = Date.now() + 60000;
-    lianSilentNotice("自动引导暂时没有返回，但不影响继续核对。若已经说出答案，请点击保存至错题本继续。", {
+    if (isSilenceGuide && !state.silenceGuidanceExhausted) resetSilenceTimer(false);
+    lianSilentNotice("自动引导请求未返回，稍后会按沉默阶段重新尝试。", {
       key: `guide-failed:${questionId}`,
       cooldownMs: 60000
     });

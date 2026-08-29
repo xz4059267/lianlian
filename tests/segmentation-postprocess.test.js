@@ -347,6 +347,9 @@ test("handwriting verification decides guide versus save from the same board req
   assert.doesNotMatch(appSource, /result\.shouldSpeak === false && !options\.force/);
   assert.match(appSource, /The model owns the decision to stay silent/);
   assert.doesNotMatch(serverSource, /提醒学生把关键关系式和最终答案写到黑板上/);
+  assert.match(appSource, /A silent\/empty model result must not permanently consume the silence/);
+  assert.match(appSource, /if \(isSilenceGuide && !state\.silenceGuidanceExhausted\) resetSilenceTimer\(false\)/);
+  assert.match(appSource, /const guideFailureStillCooling =\s*!isSilenceGuide/);
 });
 
 test("waits for a fixed choice answer before requesting guide output", () => {
