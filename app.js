@@ -4225,8 +4225,8 @@ function hasExplicitHandwritingFinality(result, finalAnswer) {
     return true;
   }
 
-  // Bare numbers or relations are ambiguous: m-n=8 and x-y=2 are often
-  // intermediate work, not a final answer. Require a visible conclusion
+  // Bare numbers or relations are ambiguous: they are often intermediate
+  // work, not a final answer. Require a visible conclusion
   // marker or a standalone handwritten line before accepting them.
   if (!hasFinalMarker) {
     const standalone = visibleEvidence

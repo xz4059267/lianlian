@@ -340,110 +340,11 @@ const STATEMENT_EVALUATION_RULES = [
   "Do not reuse variables, equations, proportions, answer choices, or conclusions from another problem."
 ].join("\n");
 
-const ARROW_DIAGRAM_RULES = [
-  "箭头关系题必须逐条读取箭头方向：只有箭头直接共同指向同一个下方节点的相邻上方两个数，才能组成‘左数−右数=该下方节点’；不能把末端节点的数值分别套给每个上方节点。",
-  "先列出每条边的来源节点和目标节点，再按题干的‘相邻左数与右数之差’逐条建立等式；没有直接箭头支持的等式不得写入 givenConditions、solutionOutline 或引导。",
-  "如果题图中的箭头拓扑与文字关系无法可靠辨认，返回 ambiguous/unreadable，不要根据变量名称或历史题目猜式子。"
+const VISUAL_RELATION_RULES = [
+  "凡是依赖图形、箭头、表格、坐标或布局的题，先读取可见对象、标签、连接关系和方向，再建立等式或结论；不能只根据变量名称、位置或历史题目猜关系。",
+  "任何给出的公式或结论都必须能在题干文字或当前图形结构中找到直接依据；没有视觉证据支持的关系不得写入 givenConditions、solutionOutline 或引导。",
+  "如果视觉结构、方向、标签或对应关系无法可靠辨认，返回 ambiguous/unreadable，并说明缺少的视觉证据，不要补猜公式。"
 ].join("\n");
-
-function deterministicArrowDifferenceAnswerKey(problemText = "") {
-  // Disabled: answer keys must come from the generic multimodal solver/verifier,
-  // not a local override for one specific problem pattern.
-  return null;
-  const compact = String(problemText || "").normalize("NFKC").replace(/\s+/g, "");
-  const hasRelation =
-    /上方相邻/.test(compact) &&
-    /左数/.test(compact) &&
-    /右数/.test(compact) &&
-    /差/.test(compact) &&
-    /下方箭头/.test(compact) &&
-    /共同指向/.test(compact);
-  const hasKnownDiagramLabels =
-    /x/.test(compact) &&
-    /2y/i.test(compact) &&
-    /3x/i.test(compact) &&
-    /m/.test(compact) &&
-    /n/.test(compact) &&
-    /8/.test(compact);
-  const hasClaims =
-    /m.{0,8}3/.test(compact) &&
-    /y.{0,8}4/.test(compact) &&
-    /x-y/.test(compact) &&
-    /一定为?2/.test(compact);
-  if (!hasRelation || !hasKnownDiagramLabels || !hasClaims) return null;
-  return {
-    trusted: true,
-    status: "verified",
-    canonicalAnswer: "C",
-    acceptedAnswers: ["C", "选C", "C选项", "I不对，II对", "结论I不正确，结论II正确"],
-    problemText: String(problemText || "").trim(),
-    questionType: "选择题",
-    solutionOutline: [
-      "按题意列式：x-2y=m，2y-3x=n，m-n=8。",
-      "若 m=3，则 x-2y=3，且 2y-3x=-5，解得 y=-1，所以结论 I 错。",
-      "由 m=x-2y、n=2y-3x、m-n=8 可得 4x-4y=8，即 x-y=2，所以结论 II 对。",
-      "因此应选 C。"
-    ],
-    verificationChecks: [
-      "m=3 代入验算得到 y=-1，不是 4。",
-      "消元验算得到 x-y=2 恒成立。",
-      "选项对应为 I 不对、II 对。"
-    ],
-    confidence: 0.99,
-    reason: "本地代数规则校验通过",
-    elapsedMs: 0,
-    deterministic: true
-  };
-}
-
-function normalizeMathForLocalAudit(value = "") {
-  return String(value || "")
-    .normalize("NFKC")
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/[＝]/g, "=")
-    .replace(/[−－–—]/g, "-")
-    .replace(/[×]/g, "*")
-    .replace(/[，。；、]/g, "");
-}
-
-function deterministicArrowHandwritingAudit(result = {}, answerKey = null) {
-  // Disabled: handwriting judgment must use the generic verified-answer audit,
-  // not a local override for one specific problem pattern.
-  return null;
-  if (!answerKey?.deterministic && !deterministicArrowDifferenceAnswerKey(answerKey?.problemText || "")) return null;
-  const text = normalizeMathForLocalAudit([
-    result.detectedWriting,
-    result.mathExpression,
-    result.calculationCheck
-  ].filter(Boolean).join(" "));
-  if (!text) return null;
-
-  const hasFirstRelation = /x-?2y=m/.test(text) || /m=x-?2y/.test(text);
-  const hasSecondRelation = /2y-?3x=n/.test(text) || /n=2y-?3x/.test(text);
-  const hasDifferenceRelation = /m-n=8/.test(text) || /m=8\+n/.test(text);
-  const hasConclusion = /x-y=2/.test(text) || /4x-4y=8/.test(text);
-  const hasRelevantStep = (hasFirstRelation && hasSecondRelation) || hasDifferenceRelation || hasConclusion;
-  if (!hasRelevantStep) return null;
-
-  return {
-    ...result,
-    isRelevant: true,
-    calculationStatus: "correct",
-    calculationCheck: "板书中的 x-2y=m、2y-3x=n、m-n=8 以及 x-y=2 与题图箭头差值关系一致。",
-    hasPossibleIssue: false,
-    issueType: "none",
-    issueSummary: "",
-    expectedNextStep: "",
-    guidance: "",
-    positiveFeedback: hasConclusion
-      ? "这组关系写对了，已经能推出 x-y=2。"
-      : "你列出的关键关系是对的，沿着它继续消元就可以。",
-    boardComplete: true,
-    missingBoardContent: "",
-    confidence: Math.max(Number(result.confidence) || 0, 0.96)
-  };
-}
 
 const LIAN_STYLE_RULES = [
   "你是引导者，不是代答者。",
@@ -493,7 +394,7 @@ const HANDWRITING_PROMPT = [
   "writingState=in_progress 表示学生显然还在写或只完成部分步骤；只有输入显示长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
   "只有能指出具体 errorLocation，并能在 errorEvidence 中说明截图中可见数字、符号、运算或结论的明确冲突时，才返回 calculationStatus=wrong。",
   "可见步骤与当前截图中的题意和 verifiedAnswerReference 一致时返回 correct，但这只说明已经写出的步骤成立；最终答案必须另行填写 answerVerificationStatus。",
-  "writingState=complete 只有在当前截图明确出现最终结论、答案/结果/所以/解得等收束标记，或最后一行是独立且完整的最终答案时才允许；仅有 x-2y=m、m-n=8、代入式、过程式或一个正确关键步骤时，必须返回 in_progress 或 stalled。boardComplete=true 仅表示存在可核验关键步骤，绝不能作为最终答案信号。",
+  "writingState=complete 只有在当前截图明确出现最终结论、答案/结果/所以/解得等收束标记，或最后一行是独立且完整的最终答案时才允许；仅有题目关系式、代入式、过程式或一个正确关键步骤时，必须返回 in_progress 或 stalled。boardComplete=true 仅表示存在可核验关键步骤，绝不能作为最终答案信号。",
   "不要生成完整解题过程或替学生补写未出现的步骤。guidance 只在 nextAction=continue_guidance 或 ask_for_board 时给出一句贴着当前板书的具体引导；nextAction=verify_answer 或 finished 时 guidance 必须为空。",
   "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
   "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；只要一个可见关键关系或计算步骤与 Question Memory 一致，就可以作为可核验步骤。",
@@ -505,7 +406,7 @@ const HANDWRITING_PROMPT = [
   "当前截图没有 finalAnswer 时，只能继续引导当前关系式、代入、消元、计算或推理步骤；禁止出现‘请将最终答案或关键结论写在黑板上，以便核验’以及任何要求提前写最终答案/关键结论的同义话术。只有截图已明确出现 finalAnswer 后，才允许进入最终答案核验。",
   "如果 calculationStatus=correct，completedSteps 中已有的内容只能视为已完成，guidance 必须直接给 verifiedGuideSteps 中尚未完成的下一步，禁止再让学生重写、复述或确认已完成步骤；如果 calculationStatus=wrong，必须在 guidance 或 answerHint 中同时说清‘错在何处’和‘正确应为’的具体内容，不能只说‘再检查一下’。",
   "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
-  "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。m-n=8、x-2y=m、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
+  "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。题目关系式、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
   "如果看不清或无法核算，calculationStatus=\"unclear\"，answerVerificationStatus=\"unclear\"；如果没有可见最终答案，answerVerificationStatus=\"not_present\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
   "如果只有语音而当前黑板没有学生关键笔迹，禁止核验答案，返回 answerVerificationStatus=\"not_present\"、nextAction=ask_for_board，并只提醒学生把当前关键关系式或计算步骤写到黑板上；不要要求提前写最终答案，最终答案必须由后续板书识别确认。",
   "输出必须严格遵守 JSON schema。"
@@ -7652,7 +7553,7 @@ const TRANSCRIPT_CORRECTION_PROMPT_V2 = [
   "学生讲解通常紧贴题目条件，所以当 ASR 文本里出现和题目无关的词，要优先考虑它是不是题目中的数学词被误识别了。",
   "重点恢复数学与题面词：x、y、m、n、等于、负数、加、减、乘、除、比例、方程、等式、左数、右数、相邻、下方、上方、箭头、共同指向、差、和、积、商、选项、结论。",
   "数学表达要尽量规范：三x/3X 写成 3x，5Y 写成 5y，等于负一写成 = -1，x减y写成 x - y。",
-  "例如题目说“上方相邻的左数与右数之差等于下方箭头共同指向的数”，ASR 把“左数/右数/之差/箭头”听成“总数/右束支/树”等时，要按题目语义改回。",
+  "如果 ASR 把数学术语、变量、运算符或图形关系听错，必须回看当前题图和板书逐项校正，不能用语音猜测替代视觉证据。",
   "黑板内容只能作为纠错上下文：如果学生当前语音和黑板正在写的式子一致，可以用黑板帮助恢复变量、符号和数字；但不能凭空把黑板上有、学生没说的步骤加入文本。",
   "只校对学生确实可能说过的这一句，不要补充新的解题步骤，不要替学生回答题目。",
   "如果无法确定，就保留原文。只返回 correctedText 和 changed。"
@@ -7975,7 +7876,7 @@ const ANSWER_KEY_SOLVER_PROMPT = [
   "solutionOutline 和 verificationChecks 只写简洁、可核验的关键步骤，不写冗长推理。",
   "如果题图不完整、题意存在多解或无法可靠读取，status 必须为 ambiguous 或 unreadable，不能猜答案。",
   ORDERED_PROPORTION_RULES,
-  ARROW_DIAGRAM_RULES
+  VISUAL_RELATION_RULES
 ].join("\n");
 
 const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
@@ -7988,13 +7889,13 @@ const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
   "choiceAnalysis 是选项语义的唯一依据。先判断各结论，再按题图中实际出现的选项文字匹配字母；不要凭记忆假定 C 或 D 的含义。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "finalAnswer 和 canonicalAnswer 都写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
-  "givenConditions 必须单独列出题干、图片、图形、表格和定义中直接给出的全部事实；例如题图直接给出 m-n=8 时，必须把 m-n=8 放入 givenConditions，而不是把它当作需要学生推导的步骤。",
-  "solutionSteps 和 solutionOutline 只能写基于这些条件进行的具体变形或计算，不能重复列出 m-n=8 这类原题条件。",
+  "givenConditions 必须单独列出题干、图片、图形、表格和定义中直接给出的全部事实；题目直接给出的关系式必须放入 givenConditions，而不是把它当作需要学生推导的步骤。",
+  "solutionSteps 和 solutionOutline 只能写基于这些条件进行的具体变形或计算，不能重复列出题目原有的关系式。",
   "verification.checks 写代入检查或计算核验过程。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，verification.isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verification.checks 中说明原因。",
   "只返回符合 schema 的 JSON，不要返回 Markdown，不要在 JSON 外输出任何文字。",
   ORDERED_PROPORTION_RULES,
-  ARROW_DIAGRAM_RULES
+  VISUAL_RELATION_RULES
 ].join("\n");
 
 const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
@@ -8007,11 +7908,11 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
   "必须返回 choiceAnalysis：逐字抄录题图中的选项文字，独立填写各结论的 true/false，并用结论组合匹配 selectedOption 和 selectedOptionText。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 只能写代入、变形、计算、证明和结论，简短且可核验；verificationChecks 写代入检查或计算核验过程。",
-  "givenConditions 必须覆盖题干、图片、图形箭头、表格、坐标和定义中所有直接给出的事实；题目直接给出的 m-n=8 不能作为待推导步骤，也不能在 solutionOutline 中重复出现。",
+  "givenConditions 必须覆盖题干、图片、图形箭头、表格、坐标和定义中所有直接给出的事实；题目直接给出的关系式不能作为待推导步骤，也不能在 solutionOutline 中重复出现。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verificationChecks 中说明原因。",
   "只返回符合 schema 的 JSON。不要返回 Markdown，不要在 JSON 外输出任何文字。",
   ORDERED_PROPORTION_RULES,
-  ARROW_DIAGRAM_RULES
+  VISUAL_RELATION_RULES
 ].join("\n");
 
 const ANSWER_KEY_VERIFIER_PROMPT = [
@@ -8023,7 +7924,7 @@ const ANSWER_KEY_VERIFIER_PROMPT = [
   "如果题目依赖图形或表格，而清洗后的题目文本没有包含关键关系，verified 必须为 false，不能猜。",
   "只有独立结果与候选标准答案数学等价时 verified 才能为 true；有任何冲突或题图不清都返回 false。",
   ORDERED_PROPORTION_RULES,
-  ARROW_DIAGRAM_RULES
+  VISUAL_RELATION_RULES
 ].join("\n");
 
 const GUIDE_MATH_AUDIT_PROMPT = [
@@ -8205,14 +8106,6 @@ function setCachedAnswerKey(key, value) {
 
 async function solveAndVerifyAnswerKey(questionImage, context = {}) {
   const startedAt = Date.now();
-  const deterministicFromContext = deterministicArrowDifferenceAnswerKey(context.problemText || "");
-  if (deterministicFromContext) {
-    return {
-      ...deterministicFromContext,
-      elapsedMs: Date.now() - startedAt
-    };
-  }
-
   const solver = await callQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
     schema: answerKeySolverSchema,
@@ -8251,16 +8144,6 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
   };
   if ((solver.verification?.isSolved === false || solver.isSolved === false) && solver.status === "solved") {
     solver.status = "ambiguous";
-  }
-
-  const deterministicFromSolverText = deterministicArrowDifferenceAnswerKey(
-    [context.problemText, solver.problemText].filter(Boolean).join("\n")
-  );
-  if (deterministicFromSolverText) {
-    return {
-      ...deterministicFromSolverText,
-      elapsedMs: Date.now() - startedAt
-    };
   }
 
   const hasVerifiableWork = solver.solutionOutline.length > 0 && solver.verificationChecks.length > 0;
@@ -9463,7 +9346,7 @@ async function handleGuide(req, res) {
       LIAN_GUIDE_PROMPT,
       HANDWRITING_CONSISTENCY_RULES,
       ORDERED_PROPORTION_RULES,
-      ARROW_DIAGRAM_RULES,
+      VISUAL_RELATION_RULES,
       STATEMENT_EVALUATION_RULES,
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
@@ -9516,7 +9399,7 @@ async function handleGuide(req, res) {
           verifiedAnswerReference: answerReference,
           boundaryRules: [
             "When silenceStage is at least 1 and silenceContextStep is present, use that exact problem-specific relation as formulaOrStep and explain only that one next step; do not replace it with generic wording.",
-            "givenConditions 是题目明确给出的已知条件，优先级高于所有推导步骤。绝对不要询问 givenConditions 中的关系式是如何由其他式子推出的；例如 givenConditions 包含 m-n=8 时，只能把它作为已知条件使用，不能再问 m-n=8 是怎么得到的。",
+            "givenConditions 是题目明确给出的已知条件，优先级高于所有推导步骤。绝对不要询问 givenConditions 中的关系式是如何由其他式子推出的；已列入 givenConditions 的关系只能作为已知条件使用，不能再要求学生重新推导它。",
             "At silenceStage 1, one concrete relation or formula is allowed, but the final answer is still forbidden until the verified-answer stage.",
             "At silenceStage 4, give the complete problem-specific explanation, key equations, and final answer even when the standard answer reference is unavailable; derive and check it from the question image instead of returning a generic retry message.",
             "如果 eventType=answer_to_lian_question，必须优先回应 lianQuestion 和 latestStudentSpeech 的对应关系，shouldSpeak=true，通常一句话确认后再给一个很小的下一步。",

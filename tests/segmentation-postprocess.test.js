@@ -363,7 +363,8 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
   assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
   assert.match(serverSource, /HIGHEST PRIORITY SILENCE OVERRIDE/);
-  assert.match(serverSource, /ARROW_DIAGRAM_RULES/);
+  assert.match(serverSource, /VISUAL_RELATION_RULES/);
+  assert.match(serverSource, /图形、箭头、表格、坐标/);
   assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);
   assert.match(serverSource, /guideResult = ensureConcreteSilenceGuide\(guideResult, guideBody\)/);
   assert.match(serverSource, /ensureGuideFormulaMatchesTrustedSteps/);
@@ -411,7 +412,7 @@ test("waits for a fixed choice answer before requesting guide output", () => {
   assert.match(gateSource, /Bare numbers or relations are ambiguous/);
   assert.doesNotMatch(gateSource, /hasReviewableBoardStep\(result\)/);
   assert.match(promptSource, /boardComplete=true 仅表示存在可核验关键步骤/);
-    assert.match(promptSource, /x-2y=m、m-n=8/);
+    assert.match(promptSource, /题目关系式、代入式、过程式/);
   });
 
   test("uses the multimodal handwriting action and finalAnswer when provided", () => {
@@ -1424,31 +1425,6 @@ test("preserves the meaning of a choice letter instead of comparing the letter a
 
   assert.equal(choiceAnalysesAgree(solver, sameMeaning), true);
   assert.equal(choiceAnalysesAgree(solver, wrongMeaning), false);
-});
-
-test.skip("legacy single-problem local answer override is disabled", () => {
-  const key = deterministicArrowDifferenceAnswerKey(
-    "如图，约定：上方相邻的左数与右数之差等于这两数下方箭头共同指向的数。图中有 x、2y、3x、m、n 和 8。结论 I：若 m 的值为 3，则 y 的值为 4；结论 II：不论 m、n 取何值，x-y 的值一定为 2。下列说法正确的是 A. I，II 都对 B. I 对，II 不对 C. I 不对，II 对 D. I，II 都不对"
-  );
-
-  assert.equal(key.trusted, true);
-  assert.equal(key.canonicalAnswer, "C");
-  assert.equal(studentAnswerMatchesVerifiedKey("选C", key), true);
-  assert.equal(studentAnswerMatchesVerifiedKey("选A", key), false);
-  assert.deepEqual(
-    guideContradictsVerifiedAnswer(
-      { speech: "两个结论都对，应该选 A，而不是 C。" },
-      key
-    ).map((claim) => claim.raw),
-    ["A", "not:C"]
-  );
-  assert.deepEqual(
-    guideContradictsVerifiedAnswer(
-      { speech: "\u800c\u4e0d\u662f C" },
-      key
-    ).map((claim) => claim.raw),
-    ["not:C"]
-  );
 });
 
 test("treats spoken Chinese zero as equivalent to m=0", () => {
