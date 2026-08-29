@@ -3975,7 +3975,7 @@ async function createCurrentBoardSnapshot(options = {}) {
 // written directly over the imported image.
 async function createCurrentStudentStrokeSnapshot(options = {}) {
   const question = currentPageQuestion();
-  if (!question || !hasCurrentBoardInk(question)) return "";
+  if (!question) return "";
   saveCurrentPage();
   const pages = pagesForQuestion(question.id);
   const strokes = pages[0] || getBoardImageForGuide();

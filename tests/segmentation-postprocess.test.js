@@ -393,6 +393,8 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /首页导入图片中原本就有的印刷公式、选项、红笔批注/);
   assert.match(serverSource, /导入后新增的学生笔迹隔离层/);
   assert.match(serverSource, /学生后来写在图片上、图片内或图片旁边的新增笔迹算本次笔迹/);
+  assert.match(serverSource, /即使合成图里看见红叉、圈画、批注、选项或公式/);
+  assert.match(serverSource, /不得说‘你画了红叉’/);
   assert.match(serverSource, /最高优先级的可执行输出规则/);
   assert.match(serverSource, /只返回‘继续想想’/);
   assert.match(serverSource, /空板规则/);
