@@ -21,6 +21,20 @@ test("guide validator rejects empty and generic failure messages", () => {
     ),
     true
   );
+  assert.equal(
+    isConcreteGuideResult(
+      { shouldSpeak: true, speech: "我们继续看看这道题，先理清思路。", formulaOrStep: "" },
+      { eventType: "silence_escalation" }
+    ),
+    false
+  );
+  assert.equal(
+    isConcreteGuideResult(
+      { shouldSpeak: false, speech: "" },
+      { eventType: "silence_escalation" }
+    ),
+    false
+  );
 });
 
 test("handwriting validator rejects uncertain empty output", () => {

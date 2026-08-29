@@ -3217,12 +3217,13 @@ async function callQwenMultimodalJson({
 
 function isConcreteGuideResult(result, diagnostics = {}) {
   if (!result || typeof result !== "object") return false;
-  const eventType = String(diagnostics.eventType || "");
+  const eventType = String(diagnostics.eventType || result.eventType || "");
+  const requiresActionableResponse = /(?:silence|stuck|active_help|answer_to_lian_question|next_step)/.test(eventType);
   if (result.shouldSpeak === false) {
     // A silent normal/thought-complete result is valid. A silence, help, or
     // answer-response event must produce an actual response before it wins a
     // parallel race; otherwise a fast empty result can suppress a useful one.
-    return !/(?:silence|stuck|active_help|answer_to_lian_question|next_step)/.test(eventType);
+    return !requiresActionableResponse;
   }
   const speech = String(result.speech || "").trim();
   if (!speech || /请求失败|接口|稍后再试|没有返回|无法识别|不确定|网络错误|超时/i.test(speech)) {
@@ -3230,8 +3231,11 @@ function isConcreteGuideResult(result, diagnostics = {}) {
   }
   const formula = String(result.formulaOrStep || "").trim();
   const action = String(result.studentAction || "").trim();
-  if (/silence|stuck|active_help|answer_to_lian_question/.test(eventType)) {
-    return Boolean(formula || action || speech.length >= 12);
+  if (requiresActionableResponse) {
+    // Active guidance must carry an executable anchor. A merely polite or
+    // explanatory sentence is not enough: it will otherwise be accepted by
+    // the model race and then discarded by the local safety gate.
+    return Boolean(formula || action);
   }
   return true;
 }
@@ -3484,6 +3488,10 @@ async function raceQwenStructuredModels({ options = {}, models, isValid, diagnos
 }
 
 async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
+  const normalizedDiagnostics = {
+    ...diagnostics,
+    eventType: diagnostics.eventType || options.eventType || ""
+  };
   return raceQwenStructuredModels({
     options: {
       ...options,
@@ -3493,7 +3501,7 @@ async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
     },
     models: getQwenModelCandidates(options.model || QWEN_GUIDE_MODEL, options.modelCandidates),
     isValid: isConcreteGuideResult,
-    diagnostics,
+    diagnostics: normalizedDiagnostics,
     label: "guide"
   });
 }
@@ -9341,6 +9349,7 @@ async function handleGuide(req, res) {
   });
   let guideResult = await callGuideQwenMultimodalJson({
     model: QWEN_GUIDE_MODEL,
+    eventType: body.eventType || "normal",
     schema: guideSchema,
     instructions: [
       LIAN_GUIDE_PROMPT,
