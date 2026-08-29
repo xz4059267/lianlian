@@ -475,6 +475,8 @@ const HANDWRITING_PROMPT = [
   "你会看到当前黑板区域的完整截图，截图同时包含当前题目图片和学生的原始笔迹。截图是所有视觉事实的唯一来源；服务端提供的 verifiedAnswerReference 是唯一的标准答案依据。不要依赖 OCR、前端整理文本或任何旧的板书识别结果。",
   "当前黑板上的学生原始笔迹优先级高于语音。studentSpeechTranscript 是本题从开始到现在的完整语音记录，latestStudentSpeech 只是最新片段；语音只能帮助理解学生正在说明哪一行或哪个意图，不能覆盖、改写或补充截图中没有出现的数学步骤和答案；当语音与笔迹冲突时，以笔迹为准并返回 unclear 或 ask_for_board。",
   "题目图片中的印刷文字、红笔/蓝笔批注、勾叉、圈画、旧答案和非本次书写痕迹都不是当前学生笔迹，不能当作学生本次答案或步骤；只判断黑板上本次原始笔迹。",
+  "识别时先区分图层：题目图片通常位于黑板左上或被白框包住，里面印刷的 A/B/C/D、I/II、红笔标记一律忽略；黑板书写区里由浅色笔迹写出的内容才是学生输入。若黑板书写区单独出现大写 A/B/C/D 或 I/II 判定，它就是学生写出的选项/结论，即使题图里也有同样字母，也必须把黑板笔迹记录进 detectedWriting、completedSteps 或 finalAnswer。",
+  "不要因为题图覆盖在左上角而漏读黑板其余区域；必须扫描整张当前截图的所有原始笔迹，尤其是黑板中央、右侧和底部的等式、赋值、选项字母。只要这些笔迹清晰可见，就必须在结构化结果中忠实转写，不能返回与当前截图无关的旧引导。",
   "你的职责是：忠实转写可见笔迹；判断当前书写状态；列出已经明确完成且可见的步骤；定位明确错误；当最终答案和关键步骤都可见时，直接返回与标准答案的核验结果。",
   "禁止根据学生零散板书补出未写出的步骤或最终答案。标准答案只用于核对已经写出的最终答案和可见步骤，不能替学生补写答案。",
   "detectedWriting 和 mathExpression 必须忠实对应当前截图；completedSteps 只能包含截图中已经出现并可辨认的步骤，不能补齐学生没写的内容。",
@@ -9800,6 +9802,17 @@ function shouldAuditHandwritingResult(result, answerKey, body = {}) {
   if (!answerKey?.trusted) return false;
   const status = String(result?.calculationStatus || "");
   if (!["correct", "wrong"].includes(status)) return false;
+  // A complete, correct board with a visible final answer has already been
+  // verified by the primary multimodal request. Running a second visual call
+  // here can replace its visible steps with an empty/uncertain audit and send
+  // the student back into guidance. Keep the single-pass verdict authoritative.
+  if (
+    status === "correct" &&
+    result?.boardComplete === true &&
+    String(result?.finalAnswer || "").trim() &&
+    Array.isArray(result?.completedSteps) &&
+    result.completedSteps.length > 0
+  ) return false;
   const confidence = Number(result?.confidence) || 0;
   const hasConcreteWrongEvidence = Boolean(
     String(result?.errorLocation || "").trim() &&
@@ -10057,11 +10070,17 @@ function applyHandwritingAudit(result, audit) {
     ? status
     : (status === "correct" || status === "wrong" ? "unclear" : status);
   const hasIssue = auditedStatus === "wrong";
+  const auditedSteps = normalizeVisibleCompletedSteps(audit?.completedSteps);
+  const originalSteps = normalizeVisibleCompletedSteps(result?.completedSteps);
+  const completedSteps = auditedSteps.length ? auditedSteps : originalSteps;
+  const auditBoardComplete = audit?.boardComplete === true || (
+    audit?.boardComplete !== false && result?.boardComplete === true
+  );
   return {
     ...(result || {}),
     calculationStatus: auditedStatus,
     calculationCheck: audit?.correctedCheck || audit?.reason || result?.calculationCheck || "",
-    completedSteps: normalizeVisibleCompletedSteps(audit?.completedSteps || result?.completedSteps),
+    completedSteps,
     hasPossibleIssue: hasIssue,
     issueType: hasIssue ? (audit?.issueType || result?.issueType || "unclear") : "none",
     issueSummary: hasIssue ? (audit?.issueSummary || audit?.reason || "") : "",
@@ -10069,7 +10088,7 @@ function applyHandwritingAudit(result, audit) {
     errorEvidence: hasIssue ? String(audit?.errorEvidence || result?.errorEvidence || "").trim() : "",
     guidance: String(result?.guidance || "").trim(),
     positiveFeedback: "",
-    boardComplete: auditedStatus === "correct" && Boolean(audit?.boardComplete),
+    boardComplete: auditedStatus === "correct" && auditBoardComplete,
     missingBoardContent: audit?.missingBoardContent || "",
     confidence: confidence || Number(result?.confidence) || 0.5
   };
