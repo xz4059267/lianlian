@@ -9596,9 +9596,16 @@ function isActiveGuideEvent(eventType) {
   return ACTIVE_GUIDE_EVENT_PATTERN.test(String(eventType || ""));
 }
 
+function normalizeGuideSpeechText(value) {
+  return String(value || "")
+    .replace(/^\s*下一步只做这一项\s*[:：，,]?\s*/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function synchronizeGuideResultCandidate(result) {
   const output = result && typeof result === "object" ? { ...result } : {};
-  const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
+  const speech = normalizeGuideSpeechText(output.speech);
   const formulaOrStep = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
   const studentAction = String(output.studentAction || "").replace(/\s+/g, " ").trim();
   output.speech = speech;
@@ -9727,9 +9734,9 @@ function buildTrustedStepGuideFallback(context = {}, meta = {}) {
   output = {
     ...output,
     shouldSpeak: true,
-    speech: `下一步只做这一项：${nextStep}。把对应的变形或计算写在黑板上。`,
+    speech: nextStep,
     formulaOrStep: nextStep,
-    studentAction: `把“${nextStep}”对应的变形或计算写在黑板上。`,
+    studentAction: `把“${nextStep}”写在黑板上。`,
     askStudentToRepeat: meta.guideState === "interactive_teaching",
     lectureComplete: false,
     nextStepId,

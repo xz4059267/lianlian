@@ -223,7 +223,7 @@ test("hard delivery validation rejects vague, repeated, and out-of-order active 
 test("hard delivery validation accepts only the current next step and synchronizes the browser candidate", () => {
   const validated = validateGuideResultForDelivery({
     shouldSpeak: true,
-    speech: "下一步写出2x/2=4/2，再算出x。",
+    speech: "下一步只做这一项：写出2x/2=4/2，再算出x。",
     formulaOrStep: "2x/2=4/2",
     studentAction: "把2x/2=4/2写在黑板上并计算。",
     nextStepId: "step_2",
@@ -250,6 +250,7 @@ test("hard delivery validation accepts only the current next step and synchroniz
   assert.equal(validated.result.guidanceCandidates.length, 1);
   assert.equal(validated.result.guidanceCandidates[0].formulaOrStep, "2x/2=4/2");
   assert.match(validated.result.guidanceCandidates[0].speech, /2x\/2=4\/2/);
+  assert.doesNotMatch(validated.result.guidanceCandidates[0].speech, /下一步只做这一项/);
 });
 
 test("hard delivery validation requires the exact nextStepId", () => {
@@ -296,7 +297,8 @@ test("trusted fallback exposes only the deterministic Question Memory next step"
 
   assert.equal(fallback.nextStepId, "step_3");
   assert.equal(fallback.formulaOrStep, "把x=2代回原方程验算");
-  assert.match(fallback.speech, /把x=2代回原方程验算/);
+  assert.equal(fallback.speech, "把x=2代回原方程验算");
+  assert.doesNotMatch(fallback.speech, /下一步只做这一项|把对应的变形或计算/);
   assert.equal(fallback.guidanceCandidates[0].formulaOrStep, fallback.formulaOrStep);
   assert.equal(fallback.guideSpeechSource, "trusted-question-memory");
   assert.equal(fallback.fallbackFrom, "model_repeated_previous_guidance");
