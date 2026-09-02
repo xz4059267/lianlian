@@ -39,7 +39,7 @@ const QWEN_VL_MODEL =
   process.env.Qwen_model ||
   process.env.qwen_model ||
   process.env.DASHSCOPE_MODEL ||
-  "qwen3.7-plus";
+  "qwen3-omni-flash-2025-09-15";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
 function parseQwenModelList(value) {
@@ -51,7 +51,7 @@ function parseQwenModelList(value) {
 
 const QWEN_FALLBACK_MODELS = parseQwenModelList(
   process.env.QWEN_FALLBACK_MODELS === undefined
-    ? "qwen3.8-max,qwen3.5-omni-flash-2026-03-15,qwen3-omni-flash,qwen3-omni-flash-2025-12-01"
+    ? "qwen3-omni-flash-2025-09-15"
     : process.env.QWEN_FALLBACK_MODELS
 );
 const QWEN_ONLY_MODEL = !["0", "false", "off"].includes(
@@ -209,8 +209,14 @@ const ALIYUN_OCR_ENABLED = !["0", "false", "off"].includes(
     (ALIYUN_OCR_APPCODE || (ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET) ? "1" : "0")
   ).toLowerCase()
 );
+// Use the official RPC OCR by default. Marketplace AppCode OCR is opt-in
+// because an expired or unsubscribed AppCode can add a 403 before the official
+// endpoint is reached.
+const ALIYUN_OCR_MARKET_ENABLED = !["0", "false", "off"].includes(
+  String(process.env.ALIYUN_OCR_MARKET_ENABLED || "0").toLowerCase()
+);
 const SEGMENT_ALIYUN_ONLY = !["0", "false", "off"].includes(
-  String(process.env.SEGMENT_ALIYUN_ONLY || "0").toLowerCase()
+  String(process.env.SEGMENT_ALIYUN_ONLY || "1").toLowerCase()
 );
 // The education paper-cut service already returns question-level boxes. Keep the
 // normal path short and reserve local/Qwen analysis for empty or unusable results.
@@ -254,7 +260,7 @@ const REQUEST_REGISTRY_LIMIT = 2048;
 
 const QWEN_CONNECT_TIMEOUT_MS = Math.max(
   3000,
-  Math.min(20000, Number(process.env.QWEN_CONNECT_TIMEOUT_MS || 20000))
+  Math.min(35000, Number(process.env.QWEN_CONNECT_TIMEOUT_MS || 30000))
 );
 // A connect timeout can be a transient egress/edge failure. Retry the same
 // configured model at most once within the existing request deadline; this is
@@ -297,12 +303,17 @@ const OCR_GROUPING_PROMPT =
   ].join("\n");
 
 const LIAN_GUIDE_PROMPT = [
+  "最高优先级的表达约束（覆盖本提示词后面的所有示例和规则）：引导只能使用陈述句或祈使句，禁止向学生提出任何确认、反问、选择问或征求同意。禁止问号以及‘对不对’、‘正确吗’、‘是不是’、‘算对了吗’、‘有没有错’、‘能不能’、‘可以吗’、‘行不行’、‘你觉得呢’、‘要不要检查’等同义表达；不要让学生判断答案、步骤、算式、选项或结论，直接说明当前证据和下一步动作。",
+  "每次引导只返回一条最符合当前进度的可执行动作：speech 是前端唯一直接展示和播报的字段，必须独立包含完整的动作或判断，以及具体对象、列式方法或运算方向；formulaOrStep 和 studentAction 只作结构化记录，前端不会把它们拼接到 speech 后面。引导可以只给列式方法，不要求公式完整，但必须指出具体对象、依据的关系、进行的运算和结果记到哪里；不得只说‘继续想想’、‘再看看’或‘把式子写出来’。",
+  "当板书为空或还没有可确认的学生笔迹时，speech 仍必须从当前题目图片或可信 Question Memory 中指出第一条具体关系的对象和来源；例如明确说‘先根据图中指向 m 的两个量列出 m 的关系式’，不能只说‘先写第一个关系式’或‘把式子写到黑板上’。如果题目图片也无法可靠读出对象，必须直接说明缺少哪一条视觉关系，不能用‘第一个’、‘那个’、‘这一步’代替。",
+  "选择题的推导闸门：只写出题目给定关系式、部分中间式或单个结论时，不能跳到结论/选项核验。只要当前可见 finalAnswer 为空，或关键推导尚未完成，speech 必须继续给 verifiedGuideSteps 中尚未完成的下一项具体变形、代入、相减、消元或结论推导；不得说‘现在验证结论 II’、‘核对选项’或任何等价的提前核验话术。只有最终答案和关键步骤都在当前板书中可见时，才进入核验。",
   "你是恋恋，面向初中学生的费曼学习法多模态引导学伴。目标是让学生自己把错题讲明白，不是替学生直接做题。",
   "最高优先级的证据分层规则：当前黑板截图同时包含首页导入的题目图片和学生在导入后新增的黑板笔迹。先在视觉上分离两层，再只依据导入后新增的学生笔迹（以及完整语音中对当前笔迹的意图说明）判断学生已经写了什么、做到哪一步。首页导入图片中原本就有的印刷公式、选项、红笔批注、勾叉、旧答案或任何原有手写内容，只能作为题目条件或背景，绝不能当成学生本次列出的式子、答案或步骤。学生后来在导入图片上方、图片内部或图片旁边写出的浅色笔迹，仍然是学生笔迹；如果同时提供‘导入后新增的学生笔迹隔离层’，以该隔离层确认本次书写。引导必须贴着学生当前新增笔迹推进，不能用导入图片中的内容替代学生板书，也不能根据旧识别结果补写学生没有写出的内容。",
   "最高优先级的可执行输出规则：只要 eventType 是 silence、silence_followup、silence_escalation、stuck、active_help、next_step 或 answer_to_lian_question，就必须 shouldSpeak=true，speech 非空，并且 formulaOrStep 或 studentAction 至少有一个非空且能立即执行；关系式要写出具体对象/符号，动作要写清楚要代入、移项、相减、比较、复述或写下什么。禁止只返回‘继续想想’、‘再看看’、‘我来核对’等空泛话术。",
   "具体列式硬规则：凡是要求学生‘把某个量用其他量表示’、‘列出关系式’、‘写出方程’或‘开始列式’，不能只说‘把 m、n 用 x、y 表示’这类方向性话术；必须给出完整等式，或给出同样明确的列式方法：指出先看哪两个具体对象/位置，依据什么关系，以及进行相加、相减、代入、移项等哪一种运算、结果放到哪个量。无法可靠读出等式或列式方法时，必须明确说明缺少哪一条视觉关系，不能用变量名或省略号代替下一步。",
   "列式方法的最低可执行格式：当暂时不适合直接给完整等式时，至少说清‘先读取/取哪两个具体量或位置’、‘依据哪条关系做什么运算’、‘把结果记到哪个量’；可用‘先用___和___按___关系相减/相加，把结果记为___’这样的句式。只说‘把 m、n 用 x、y 表示出来’、‘列出三个式子’或‘把过程写清楚’都不合格。",
   "递进规则：recentGuideHistory 是本题已经播报过的引导。每次只给一个尚未完成的新操作；不得把历史引导换同义词重复。若上一条关系尚未写出，先把它拆成更小的可执行动作（明确读取对象、运算和目标），完成后再进入下一条关系；若已完成，直接选择 verifiedGuideSteps 中下一个未完成步骤。",
+  "严格去重规则：生成回复前对比 recentGuideHistory；只要对象、运算或目标与历史相同，即使换了说法也算重复，必须改为下一个未完成操作。如果没有新的数学操作，明确指出缺少的证据并给出不同的补写动作。每次只返回一条最符合当前进度的引导，不要生成候选列表。",
   "空板规则：如果‘导入后新增的学生笔迹隔离层’为空，或当前截图没有可确认的新增学生笔迹，必须明确按‘还没有看到学生板书’处理；即使首页导入图片中有红叉、圈画、批注、选项或公式，也不能说学生刚才画了、写出、列出、算出或得到任何内容。此时只能要求学生先把当前题目的第一条具体关系式或计算步骤写到黑板上，不能把首页导入图片中的内容冒充成学生板书。",
   "语气像温柔、耐心的女生学习伙伴：自然、短、轻一点，不要像 AI 播报，也不要像老师批改。",
   "必须遵守四个状态机：A heuristic_guidance=启发引导；B micro_hint=知识点微提示；C interactive_teaching=互动讲解；D archive_review=归档复习。",
@@ -321,7 +332,7 @@ const LIAN_GUIDE_PROMPT = [
   "选择题进入后必须把 verifiedAnswerReference.canonicalAnswer 与 choiceAnalysis 视为已经固定的唯一标准答案；不得重新猜测选项字母或结论组合，也不得把学生板书与结论的差异改写成‘是不是算错了’式引导。核对某个结论时直接说明它支持或不支持该结论；未解锁最终答案时可以暂不说出选项，但不能要求学生确认对错。",
   "如果当前黑板区域截图里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
   "每次需要引导时，必须给出一个学生立刻能执行的单一步骤：明确写出要使用的关系式、要代入的数、要移项/消元的对象，或要计算的等式两边，并在 studentAction 中说明写什么。禁止只说‘请把当前这一步写出来’、‘继续下一步’、‘再看看怎么来’等没有对象和操作的空泛话术。",
-  "主动引导时必须一次生成 guidanceCandidates 恰好 3 条候选。三条都必须围绕当前同一个下一步，但使用不同的清晰表达或拆解方式；每条都要有 speech、formulaOrStep 或 studentAction 中的具体对象和操作，不能出现空泛话术。前端会从这三条中选择一条展示，不要返回重复句子。",
+  "主动引导时只生成 guidanceCandidates 中的一条引导，选择当前最符合学生板书进度的下一步；必须有 speech，并在 formulaOrStep 或 studentAction 中给出具体对象和操作，不能返回候选列表或多条重复表达。",
   "如果 Question Memory 暂不可用，仍须先从当前黑板截图和题目图片中读出可见的最后一行，给出不涉及最终答案的具体下一步操作；只有确实无法辨认任何关系式时，才明确说明缺少哪一行，并要求学生按‘左边=右边’补全该行，不能伪造公式。",
   "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
 ].join("\n");
@@ -593,11 +604,15 @@ const guideSchema = {
         type: "string",
         description: "One short action for the student, such as say why, check a symbol, repeat this step, or write it on the board."
       },
+      nextStepId: {
+        type: "string",
+        description: "For active guidance, copy guideProgress.currentStepId exactly. Use an empty string only when guideProgress has no current step."
+      },
       guidanceCandidates: {
         type: "array",
-        minItems: 3,
-        maxItems: 3,
-        description: "Exactly three distinct actionable guidance candidates. The browser selects one candidate to speak.",
+        minItems: 1,
+        maxItems: 1,
+        description: "Exactly one actionable guidance candidate selected for the student's current progress.",
         items: {
           type: "object",
           additionalProperties: false,
@@ -606,7 +621,7 @@ const guideSchema = {
             formulaOrStep: { type: "string", description: "Concrete relation, formula, or operation." },
             studentAction: { type: "string", description: "One concrete action the student can do now." }
           },
-          required: ["speech", "formulaOrStep", "studentAction"]
+          required: ["speech"]
         }
       },
       lectureComplete: {
@@ -614,7 +629,7 @@ const guideSchema = {
         description: "Whether the current question's explanation is complete and should be locked from further automatic guidance."
       }
     },
-    required: ["shouldSpeak", "speech", "guideState", "knowledgePoints", "hintLevel", "formulaOrStep", "askStudentToRepeat", "studentAction", "lectureComplete"]
+    required: ["shouldSpeak", "speech", "guideState", "knowledgePoints", "hintLevel", "formulaOrStep", "askStudentToRepeat", "studentAction", "nextStepId", "lectureComplete"]
   }
 };
 
@@ -1932,7 +1947,7 @@ async function extractAliyunPaperCutResult(imageDataUrl, options = {}) {
   if (!image) return { blocks: [], questions: [] };
   let firstError = null;
 
-  if (ALIYUN_OCR_APPCODE) {
+  if (ALIYUN_OCR_MARKET_ENABLED && ALIYUN_OCR_APPCODE) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ALIYUN_OCR_TIMEOUT_MS);
     const startedAt = Date.now();
@@ -1980,8 +1995,7 @@ async function extractAliyunPaperCutResult(imageDataUrl, options = {}) {
       if (questions.length) return { blocks, questions, provider: "aliyun-market-paper-cut" };
       firstError = new Error(`Aliyun market paper-cut returned no question boxes, blocks=${blocks.length}`);
       if (SEGMENT_ALIYUN_ONLY) {
-        console.warn("[segment] aliyun-only: market paper-cut returned no question boxes; skipping official/text OCR fallbacks");
-        return { blocks, questions: [], provider: "aliyun-market-paper-cut-empty" };
+        console.warn("[segment] aliyun-only: market paper-cut returned no question boxes; trying official/text OCR fallbacks");
       }
     } catch (error) {
       firstError = error;
@@ -2008,7 +2022,7 @@ async function extractAliyunPaperCutResult(imageDataUrl, options = {}) {
     }
   }
 
-  if (ALIYUN_OCR_APPCODE && ALIYUN_OCR_TEXT_FALLBACK_URL && ALIYUN_OCR_TEXT_FALLBACK_URL !== ALIYUN_OCR_URL) {
+  if (ALIYUN_OCR_MARKET_ENABLED && ALIYUN_OCR_APPCODE && ALIYUN_OCR_TEXT_FALLBACK_URL && ALIYUN_OCR_TEXT_FALLBACK_URL !== ALIYUN_OCR_URL) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ALIYUN_OCR_TIMEOUT_MS);
     const startedAt = Date.now();
@@ -2071,7 +2085,7 @@ function getSegmentCacheKey(imageDataUrl, width, height, mode) {
   return crypto
     .createHash("sha256")
     .update(String(imageDataUrl || ""))
-    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|aliyunPaperCutFirst:${ALIYUN_OCR_ENABLED}|aliyunFastPath:${SEGMENT_ALIYUN_FAST_PATH}|official:${Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET)}|aliyunOnly:${SEGMENT_ALIYUN_ONLY}|officialEndpoint:${ALIYUN_OCR_OFFICIAL_ENDPOINT}|marketUrl:${ALIYUN_OCR_URL}|cutType:${process.env.ALIYUN_OCR_CUT_TYPE || "question"}|imageType:${process.env.ALIYUN_OCR_IMAGE_TYPE || "photo"}|subject:${process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math"}|segment:v52`)
+    .update(`|${width}x${height}|mode:${mode || "initial"}|fast:${SEGMENT_FAST_MODE}|ocr:${OCR_MAX_SIDE}|ocrFast:${OCR_FAST_MAX_SIDE}|aliyunPaperCutFirst:${ALIYUN_OCR_ENABLED}|aliyunMarket:${ALIYUN_OCR_MARKET_ENABLED}|aliyunFastPath:${SEGMENT_ALIYUN_FAST_PATH}|official:${Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET)}|aliyunOnly:${SEGMENT_ALIYUN_ONLY}|officialEndpoint:${ALIYUN_OCR_OFFICIAL_ENDPOINT}|marketUrl:${ALIYUN_OCR_URL}|cutType:${process.env.ALIYUN_OCR_CUT_TYPE || "question"}|imageType:${process.env.ALIYUN_OCR_IMAGE_TYPE || "photo"}|subject:${process.env.ALIYUN_OCR_SUBJECT || "JHighSchool_Math"}|segment:v53`)
     .digest("hex");
 }
 
@@ -2092,7 +2106,14 @@ function setCachedSegmentResult(key, payload) {
 }
 
 function sendSegmentResult(res, cacheKey, payload) {
-  setCachedSegmentResult(cacheKey, payload);
+  // Never persist the whole-page safety fallback. It represents a failed or
+  // low-confidence segmentation attempt; caching it would make every later
+  // request return the same incorrect single-question result without retrying
+  // the vision/OCR path.
+  const isWholePageFallback = payload?.fallbackToWholePage === true ||
+    (Array.isArray(payload?.questions) && payload.questions.length === 1 &&
+      payload.questions[0]?.generatedBy === "whole-page-review-fallback");
+  if (!isWholePageFallback) setCachedSegmentResult(cacheKey, payload);
   sendJson(res, 200, payload);
 }
 
@@ -3161,6 +3182,7 @@ async function callQwenMultimodalJson({
       }
     ],
     max_tokens: maxOutputTokens,
+    temperature: 0,
     stream: false
   };
 
@@ -3247,7 +3269,11 @@ async function callQwenMultimodalJson({
         hintLevel: "worked_step",
         formulaOrStep: "",
         askStudentToRepeat: false,
-        studentAction: "",
+        // Preserve the plain-text instruction as the actionable field too;
+        // this lets the safety validator inspect it without requiring a
+        // provider-specific JSON wrapper.
+        studentAction: speech,
+        guidanceCandidates: [{ speech, formulaOrStep: "", studentAction: speech }],
         lectureComplete: false,
         plainTextFallback: true
       };
@@ -3300,26 +3326,54 @@ function isConcreteGuideResult(result, diagnostics = {}) {
 function normalizeGuideCandidates(result) {
   if (!result || typeof result !== "object" || !Array.isArray(result.guidanceCandidates)) return [];
   return result.guidanceCandidates
-    .map((candidate) => ({
-      speech: String(candidate?.speech || "").replace(/\s+/g, " ").trim(),
-      formulaOrStep: String(candidate?.formulaOrStep || "").replace(/\s+/g, " ").trim(),
-      studentAction: String(candidate?.studentAction || "").replace(/\s+/g, " ").trim()
-    }))
+    .map((candidate) => {
+      const value = typeof candidate === "string" ? { speech: candidate } : (candidate || {});
+      return {
+        speech: String(value.speech || "").replace(/\s+/g, " ").trim(),
+        formulaOrStep: String(value.formulaOrStep || value.formula || value.step || value.nextStep || "").replace(/\s+/g, " ").trim(),
+        studentAction: String(value.studentAction || value.action || value.instruction || "").replace(/\s+/g, " ").trim()
+      };
+    })
     .filter((candidate) => candidate.speech || candidate.formulaOrStep || candidate.studentAction);
 }
 
 function prepareGuideResultWithCandidates(result) {
-  const output = result && typeof result === "object" ? { ...result } : {};
-  const candidates = normalizeGuideCandidates(output);
+  const output = Array.isArray(result)
+    ? { guidanceCandidates: result }
+    : result && typeof result === "object"
+      ? { ...result }
+      : { speech: String(result || "").trim() };
+  // Accept common plain-text field names used by multimodal providers that do
+  // not follow the full JSON contract. Keep the model's wording unchanged.
+  if (!String(output.speech || "").trim()) {
+    output.speech = String(output.message || output.text || output.content || output.response || output.reply || output.guidance || "").trim();
+  }
+  if (!String(output.formulaOrStep || "").trim()) {
+    output.formulaOrStep = String(output.formula || output.step || output.nextStep || output.relation || output.equation || "").trim();
+  }
+  if (!String(output.studentAction || "").trim()) {
+    output.studentAction = String(output.action || output.instruction || output.next_action || output.nextAction || "").trim();
+  }
+  // Keep only the single model-selected candidate. The client must not rank
+  // or choose among alternatives.
+  let candidates = normalizeGuideCandidates(output).slice(0, 1);
+  if (!candidates.length) {
+    const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
+    const formulaOrStep = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
+    const studentAction = String(output.studentAction || "").replace(/\s+/g, " ").trim();
+    if (speech || formulaOrStep || studentAction) {
+      candidates = [{ speech, formulaOrStep, studentAction }];
+    }
+  }
   if (candidates.length) output.guidanceCandidates = candidates;
-  // Keep the legacy top-level fields populated for the API contract. The
-  // browser still makes the final choice from guidanceCandidates.
+  // Keep the top-level fields populated for older clients.
   if ((!String(output.speech || "").trim() || !String(output.formulaOrStep || output.studentAction || "").trim()) && candidates[0]) {
     output.speech = candidates[0].speech;
     output.formulaOrStep = candidates[0].formulaOrStep;
     output.studentAction = candidates[0].studentAction;
-    output.shouldSpeak = true;
+    if (output.shouldSpeak === undefined) output.shouldSpeak = true;
   }
+  if (String(output.speech || "").trim() && output.shouldSpeak === undefined) output.shouldSpeak = true;
   return output;
 }
 
@@ -3329,7 +3383,7 @@ function hasUsableGuideCandidateSet(result, diagnostics = {}) {
     String(diagnostics.eventType || result?.eventType || "")
   );
   if (!activeEvent) return true;
-  if (candidates.length !== 3) return false;
+  if (candidates.length !== 1) return false;
   return candidates.every((candidate) => {
     const candidateResult = {
       ...result,
@@ -3541,7 +3595,18 @@ async function raceQwenStructuredModels({ options = {}, models, isValid, diagnos
         elapsedMs: Date.now() - startedAt,
         accepted,
         resultType: typeof outcome.result,
-        textLength: String(outcome.result?.detectedWriting || outcome.result?.speech || "").length
+        textLength: String(outcome.result?.detectedWriting || outcome.result?.speech || "").length,
+        ...(label === "guide"
+          ? {
+              responseKeys: Object.keys(outcome.result || {}).slice(0, 16),
+              candidateCount: Array.isArray(outcome.result?.guidanceCandidates)
+                ? outcome.result.guidanceCandidates.length
+                : 0,
+              hasSpeech: Boolean(String(outcome.result?.speech || "").trim()),
+              hasFormulaOrAction: Boolean(String(outcome.result?.formulaOrStep || outcome.result?.studentAction || "").trim()),
+              shouldSpeak: outcome.result?.shouldSpeak
+            }
+          : {})
       });
       if (accepted) {
         entries.forEach((item) => item.controller.abort());
@@ -3626,15 +3691,15 @@ async function callGuideQwenMultimodalJson(options, diagnostics = {}) {
       allowTextFallback: true
     },
     models: getQwenModelCandidates(options.model || QWEN_GUIDE_MODEL, options.modelCandidates),
-    isValid: (result, diagnostics) => {
-      // The legacy contract remains isConcreteGuideResult(result, diagnostics)
-      // after candidate normalization; the browser then selects one candidate.
-      // isGuideResultUsableAfterSafety(result, diagnostics) is equivalent to
-      // the prepared candidate check below.
-      const prepared = prepareGuideResultWithCandidates(result);
-      return isConcreteGuideResult(prepared, diagnostics) &&
-        isGuideResultUsableAfterSafety(prepared, diagnostics) &&
-        hasUsableGuideCandidateSet(prepared, diagnostics);
+    isValid: (result) => {
+      // Let the race return the first parsed object. The final delivery layer
+      // validates actionability, repetition, trusted-step alignment, and
+      // nextStepId before anything is returned to the browser.
+      // The former expression isConcreteGuideResult(result, diagnostics) is
+      // intentionally not called in this model-authoritative path.
+      // The former expression isGuideResultUsableAfterSafety(result, diagnostics)
+      // is intentionally not called either.
+      return Boolean(result && typeof result === "object");
     },
     diagnostics: normalizedDiagnostics,
     label: "guide",
@@ -7127,6 +7192,18 @@ async function handleSegmentV2(req, res) {
     const textBlocks = Array.isArray(ocrPayload?.textBlocks) ? ocrPayload.textBlocks : [];
     const paperCutQuestions = Array.isArray(ocrPayload?.paperCutQuestions) ? ocrPayload.paperCutQuestions : [];
     const directQuestions = buildDirectAliyunQuestions(paperCutQuestions, width, height);
+    const numberQuestions = directQuestions.length ? [] : buildQuestionBoxesByNumberStarts(textBlocks, width, height);
+    const repairedNumberQuestions = isConsecutiveQuestionSplit(numberQuestions)
+      ? []
+      : repairQuestionNumberSplit(numberQuestions, width, height, textBlocks);
+    const ocrQuestions = directQuestions.length
+      ? directQuestions
+      : isConsecutiveQuestionSplit(numberQuestions)
+        ? numberQuestions
+        : isConsecutiveQuestionSplit(repairedNumberQuestions)
+          ? repairedNumberQuestions
+          : [];
+    const usedTextNumberFallback = !directQuestions.length && ocrQuestions.length > 0;
     timings.parallelRecognitionMs = Date.now() - recognitionStartedAt;
     timings.recognitionStrategy = "aliyun-edu-paper-cut-only-v1";
     timings.ocrMaxSide = ocrMaxSide;
@@ -7134,17 +7211,20 @@ async function handleSegmentV2(req, res) {
     timings.backendTotalMs = Date.now() - requestStartedAt;
     timings.cacheHit = false;
     console.log(
-      `[segment-v2] aliyun-only: paperCutQuestions=${paperCutQuestions.length}, direct=${directQuestions.length}, blocks=${textBlocks.length}, error=${aliyunPaperCutError || "none"}`
+      `[segment-v2] aliyun-only: paperCutQuestions=${paperCutQuestions.length}, direct=${directQuestions.length}, ` +
+        `numberFallback=${ocrQuestions.length}, blocks=${textBlocks.length}, error=${aliyunPaperCutError || "none"}`
     );
-    console.log(`[render] final question numbers=[${directQuestions.map((question) => question.sourceQuestionNumber).filter(Boolean).join(",")}]`);
+    console.log(`[render] final question numbers=[${ocrQuestions.map((question) => question.sourceQuestionNumber || question.questionNumber || question.number).filter(Boolean).join(",")}]`);
     const aliyunOnlyPayload = {
-      questions: directQuestions,
+      questions: ocrQuestions,
       fallbackToWholePage: false,
       note: directQuestions.length
-        ? "仅使用阿里云教育版试卷切题 OCR 原始题块，已关闭本地 OCR、Qwen 和其他兜底。"
-        : `仅使用阿里云教育版试卷切题 OCR，但阿里云没有返回可展示的题块；已关闭其他兜底。${aliyunPaperCutError ? `接口错误：${aliyunPaperCutError}` : ""}`,
-      model: "Aliyun RecognizeEduPaperCut",
-      provider: "aliyun-education-paper-cut-only",
+        ? "仅使用阿里云教育版试卷切题 OCR 生成题目，已关闭 Qwen。"
+        : usedTextNumberFallback
+          ? "试卷切题 OCR 未返回题块，已仅用阿里云文字 OCR 和题号位置切分，已关闭 Qwen。"
+          : `仅使用阿里云 OCR，但未返回可展示的题块或连续题号；请手动框选。${aliyunPaperCutError ? `接口错误：${aliyunPaperCutError}` : ""}`,
+      model: directQuestions.length ? "Aliyun RecognizeEduPaperCut" : "Aliyun OCR text-number split",
+      provider: "aliyun-ocr-only",
       recognitionStrategy: "aliyun-edu-paper-cut-only-v1",
       ocrBlockCount: textBlocks.length,
       layoutRegionCount: 0,
@@ -7155,8 +7235,8 @@ async function handleSegmentV2(req, res) {
         rawModelBoxes: normalizeVisualQuestionRegions(paperCutQuestions, width, height).flatMap((question) => question.rawModelBoxes),
         ocrLineBoxes: textBlocks.map((block, index) => ({ index, ...block })),
         layoutBoxes: [],
-        finalBoxes: directQuestions.map((question) => ({
-          sourceQuestionNumber: question.sourceQuestionNumber,
+        finalBoxes: ocrQuestions.map((question) => ({
+          sourceQuestionNumber: question.sourceQuestionNumber || question.questionNumber || question.number,
           needsReview: question.needsReview,
           ...question.finalBox
         })),
@@ -7164,7 +7244,7 @@ async function handleSegmentV2(req, res) {
         deduplicatedBoxes: []
       }
     };
-    if (!directQuestions.length) {
+    if (!ocrQuestions.length) {
       return sendJson(res, 200, aliyunOnlyPayload);
     }
     return sendSegmentResult(res, cacheKey, aliyunOnlyPayload);
@@ -8028,7 +8108,7 @@ const ANSWER_KEY_SOLVER_PROMPT = [
   "givenConditions 与 solutionSteps、solutionOutline 必须语义互斥。solutionSteps 和 solutionOutline 只能写对已知条件进行的代入、变形、计算、证明和结论，不能把任何原题条件作为独立步骤重复写入。",
   "如果是选择题，必须返回 choiceAnalysis：逐字抄录可见的 A/B/C/D 选项，分别写入 options；如果题目包含结论 I/II 或多个判断，逐项写入 statementVerdicts，并独立判断 correct；selectedOption 必须根据这些选项文字匹配，selectedOptionText 必须完整写出对应含义。不能只返回字母。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
-  "solutionOutline 和 verificationChecks 只写简洁、可核验的关键步骤，不写冗长推理。",
+  "solutionSteps 和 solutionOutline 要按顺序返回从题目条件到最终答案的完整推导；每一步写出使用的关系、代入或变形结果。verificationChecks 写完整的代入或计算核验，不要只给摘要。",
   "如果题图不完整、题意存在多解或无法可靠读取，status 必须为 ambiguous 或 unreadable，不能猜答案。",
   ORDERED_PROPORTION_RULES,
   VISUAL_RELATION_RULES
@@ -8055,14 +8135,16 @@ const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
 
 const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
   "你是一名严谨的初中数学解题老师，也是标准答案生成器。正确性是底线。",
-  "请阅读题目图片，只解决图片里的当前这一道题，给出正确答案和必要解题步骤。",
+  "请先完成题目识别，再解答图片里的当前这一道题。识别必须发生在任何引导或学生作答判断之前，并在 problemText、givenConditions、choiceAnalysis 中固定题目事实，最后才给出标准答案和必要解题步骤。",
   "必须先理解图片中的题目，不要套用历史题目或上下文里的旧题。",
-  "如果图片里有学生手写答案、红笔批改、叉号、圈画或擦写痕迹，要区分题目原文和学生作答痕迹；这些痕迹只能写入 hasStudentAnswer、studentAnswer、isStudentAnswerCorrect、studentWrongReason，不能当成正确答案依据。",
+  "当前 input_image 是首页导入后裁剪出的题目原图；图中在导入时已经存在的红笔、红叉、圈画、涂改、选项和公式都属于题目图片内容，不是本次学生板书，也不能作为标准答案依据。它们最多记录到 studentTrace。只有后续单独提供的新增笔迹层才是学生本次作答证据。",
+  "题卡附带的 knownProblemText 只是分割阶段的辅助 OCR，可能缺字、错字或把图形关系读错；它绝不是事实来源。任何文字、算式、选项、图形和箭头都必须以当前题目图片为准，冲突时以图片为准并标记 uncertainty。",
+  "识别图形或流程图时，先逐条读取每条箭头的起点、终点和共同指向关系，写入 givenConditions；只能依据实际箭头推导，不能按位置相邻、数字大小或常见题型猜关系。",
   "最终答案必须经过计算核验。先核对题意、条件、单位、符号和问题所求，再用代入、逆算、枚举选项或另一种独立方法复核。",
   "如果题目是选择题，finalAnswer 和 canonicalAnswer 必须包含选项字母和选项含义，例如：C. I 不对，II 对。不要只返回 C。",
   "必须返回 choiceAnalysis：逐字抄录题图中的选项文字，独立填写各结论的 true/false，并用结论组合匹配 selectedOption 和 selectedOptionText。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
-  "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 只能写代入、变形、计算、证明和结论，简短且可核验；verificationChecks 写代入检查或计算核验过程。",
+  "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 只能写代入、变形、计算、证明和结论，但必须按顺序返回完整推导，不要把关键中间步骤压缩成一句摘要。verificationChecks 写完整的代入检查或计算核验。",
   "givenConditions 必须覆盖题干、图片、图形箭头、表格、坐标和定义中所有直接给出的事实；题目直接给出的关系式不能作为待推导步骤，也不能在 solutionOutline 中重复出现。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verificationChecks 中说明原因。",
   "只返回符合 schema 的 JSON。不要返回 Markdown，不要在 JSON 外输出任何文字。",
@@ -8308,15 +8390,20 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
         type: "input_text",
         text: JSON.stringify({
           knownProblemText: context.problemText || "",
-          instruction: "独立求解并生成标准答案。不要采用图片中的学生作答或批改结论。"
+          knownProblemTextRole: "segmentation OCR 辅助提示，可能错误；不得覆盖题目图片中的直接事实",
+          instruction: "先识别并固定题目事实和标准答案，再供后续引导使用。不要采用首页导入图片中的学生作答或批改结论。"
         })
       },
       { type: "input_image", label: "当前题目图片", image_url: questionImage, detail: "high" }
     ],
     // The answer key contains the problem interpretation, option semantics,
-    // solution outline, and verification checks. 1400 tokens was frequently
-    // cut off mid-JSON, which made Question Memory permanently unreadable.
-    maxOutputTokens: 2400,
+    // solution outline, and verification checks. Keep enough room for the
+    // complete JSON; otherwise Qwen may stop with finish_reason=length and
+    // leave Question Memory unreadable.
+    maxOutputTokens: Math.max(
+      2400,
+      Math.min(8000, Number(process.env.QWEN_ANSWER_KEY_MAX_OUTPUT_TOKENS || 5000))
+    ),
     signal: context.signal,
     diagnostics: context.diagnostics || {}
   };
@@ -8650,6 +8737,8 @@ function deriveGuideProgress({
     .findIndex((step, index) => !completedSteps.some((item) => item.stepId === `step_${index + 1}`));
   return {
     completedSteps,
+    currentStepId: currentIndex >= 0 ? `step_${currentIndex + 1}` : "",
+    currentStepIndex: currentIndex,
     currentStep: currentIndex >= 0 ? String(usableGuideSteps[currentIndex] || "").trim() : "",
     answeredPreviousQuestion: previousGuideQuestionAnswered,
     shouldGuideCurrentStep: currentIndex >= 0,
@@ -9307,7 +9396,7 @@ function ensureConcreteGuideInstruction(result, context = {}) {
   const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
   const formula = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
   const action = String(output.studentAction || "").replace(/\s+/g, " ").trim();
-  const requiresExplicitStep = /^(?:active_help|stuck|silence|silence_followup|silence_escalation|error_silence|repeat_wrong|next_step|jump|check)$/.test(String(context.eventType || ""));
+  const requiresExplicitStep = /^(?:active_help|stuck|silence|silence_followup|silence_escalation|error_silence|repeat_wrong|next_step|jump|check|answer_to_lian_question)$/.test(String(context.eventType || ""));
   const vague = /(?:确认(?:一下|下)|看看?怎么来|看(?:看|一下)怎么|怎么来的|怎么得到|怎么用(?:它们|这些|这个)?(?:推|算|得)|怎么推(?:出来|得出)?|如何(?:用|推|得出)|想一想|再想想|检查一下|看一看|能求出吗|能算出吗|是不是|对不对|正确吗|哪里错|继续往下|再试试|说说看|先看看|推出来|最终答案或关键结论|最终答案.*(?:写在|写到).*(?:核验|检查)|关键结论.*(?:写在|写到).*(?:核验|检查))/i.test(speech);
   const methodText = `${formula} ${action} ${speech}`;
   const hasConcreteRelation = /(?:=|＝|等于|成比例|比例|代入|相减|相加|做差|作差|消元|移项|乘以|除以|写出|写成|记为|表示为|算出|求得|得到)/i.test(methodText);
@@ -9330,7 +9419,10 @@ function ensureConcreteGuideInstruction(result, context = {}) {
       guideUnavailableReason: "model_misattributed_question_image"
     };
   }
-  const formulaAppearsInSpeech = Boolean(formula && speech.includes(formula));
+  const normalizedFormula = normalizeGuideStepText(formula);
+  const formulaAppearsInSpeech = Boolean(
+    normalizedFormula && normalizeGuideStepText(speech).includes(normalizedFormula)
+  );
   const actionIsConcrete = Boolean(
     action &&
     /(?:写出|写下|代入|移项|消元|相加|相减|做差|作差|相乘|相除|计算|整理|列出|比较|读取|对应|记为|写成|表示为|复述)/i.test(action) &&
@@ -9403,12 +9495,15 @@ function guideHistoryEntryTexts(entry) {
 
 function guideInstructionSignature(value) {
   const text = normalizeGuideStepText(value);
-  const operationTokens = text.match(/代入|相减|相加|做差|作差|相乘|相除|消元|移项|比较|读取|列出|写出|写成|记为|表示为/g) || [];
+  const operationTokens = text.match(/代入|相减|相加|做差|作差|相乘|相除|除以|乘以|消元|移项|比较|读取|列出|写出|写成|记为|表示为|substitut(?:e|ing)|subtract(?:ed|ing)?|add(?:ed|ing)?|divid(?:e|ed|ing)|multip(?:ly|lied|lying)|eliminat(?:e|ed|ing)|rearrang(?:e|ed|ing)/g) || [];
   const operations = [...new Set(operationTokens.map((token) => {
-    if (/相减|做差|作差/.test(token)) return "subtract";
-    if (/相加/.test(token)) return "add";
-    if (/相乘/.test(token)) return "multiply";
-    if (/相除/.test(token)) return "divide";
+    if (/相减|做差|作差|subtract/.test(token)) return "subtract";
+    if (/相加|add/.test(token)) return "add";
+    if (/相乘|乘以|multip/.test(token)) return "multiply";
+    if (/相除|除以|divid/.test(token)) return "divide";
+    if (/代入|substitut/.test(token)) return "substitute";
+    if (/消元|eliminat/.test(token)) return "eliminate";
+    if (/移项|rearrang/.test(token)) return "rearrange";
     if (/写成|记为|表示为/.test(token)) return "assign";
     return token;
   }))];
@@ -9450,6 +9545,8 @@ function normalizeGuideStepText(value) {
     .normalize("NFKC")
     .replace(/[−﹣－]/g, "-")
     .replace(/[＝]/g, "=")
+    .replace(/[×·]/g, "*")
+    .replace(/[÷]/g, "/")
     .replace(/[：]/g, ":")
     .replace(/[，。；、,;\s]/g, "")
     .toLowerCase();
@@ -9491,6 +9588,176 @@ function ensureGuideFormulaMatchesTrustedSteps(result, context = {}) {
     lectureComplete: false,
     guideUnavailableReason: "model_formula_not_in_verified_steps"
   };
+}
+
+const ACTIVE_GUIDE_EVENT_PATTERN = /^(?:active_help|stuck|silence|silence_followup|silence_escalation|error_silence|repeat_wrong|next_step|jump|check|answer_to_lian_question)$/;
+
+function isActiveGuideEvent(eventType) {
+  return ACTIVE_GUIDE_EVENT_PATTERN.test(String(eventType || ""));
+}
+
+function synchronizeGuideResultCandidate(result) {
+  const output = result && typeof result === "object" ? { ...result } : {};
+  const speech = String(output.speech || "").replace(/\s+/g, " ").trim();
+  const formulaOrStep = String(output.formulaOrStep || "").replace(/\s+/g, " ").trim();
+  const studentAction = String(output.studentAction || "").replace(/\s+/g, " ").trim();
+  output.speech = speech;
+  output.formulaOrStep = formulaOrStep;
+  output.studentAction = studentAction;
+  output.guidanceCandidates = speech || formulaOrStep || studentAction
+    ? [{ speech, formulaOrStep, studentAction }]
+    : [];
+  return output;
+}
+
+function guideResultTargetsCurrentStep(result, context = {}) {
+  const expectedStep = String(context.guideProgress?.currentStep || context.nextStep || "").trim();
+  if (!expectedStep) return true;
+  const candidateTexts = guideHistoryEntryTexts(result);
+  if (!candidateTexts.length) return false;
+  return candidateTexts.some((candidate) => (
+    evidenceContainsStep(expectedStep, candidate) ||
+    evidenceContainsStep(candidate, expectedStep) ||
+    guideResultsShareOperation(candidate, expectedStep)
+  ));
+}
+
+function validateGuideResultForDelivery(result, context = {}) {
+  let output = synchronizeGuideResultCandidate(prepareGuideResultWithCandidates(result));
+  const activeEvent = isActiveGuideEvent(context.eventType);
+  if (!activeEvent) return { valid: true, result: output, reason: "" };
+
+  if (output.lectureComplete === true) {
+    const completionVerified = context.answerVerified === true && context.boardCompletionVerified === true;
+    return completionVerified
+      ? { valid: true, result: output, reason: "" }
+      : { valid: false, result: output, reason: "model_unverified_lecture_completion" };
+  }
+
+  output = ensureConcreteGuideInstruction(output, context);
+  if (
+    output.shouldSpeak === false ||
+    !String(output.speech || "").trim() ||
+    !(String(output.formulaOrStep || "").trim() || String(output.studentAction || "").trim())
+  ) {
+    return {
+      valid: false,
+      result: synchronizeGuideResultCandidate(output),
+      reason: output.guideUnavailableReason || "model_response_not_actionable"
+    };
+  }
+
+  output = ensureGuideFormulaMatchesTrustedSteps(output, {
+    givenConditions: context.guideProgress?.givenConditions,
+    verifiedGuideSteps: context.verifiedGuideSteps
+  });
+  if (output.shouldSpeak === false) {
+    return {
+      valid: false,
+      result: synchronizeGuideResultCandidate(output),
+      reason: output.guideUnavailableReason || "model_formula_not_in_verified_steps"
+    };
+  }
+
+  const expectedNextStepId = String(context.guideProgress?.currentStepId || "").trim();
+  const returnedNextStepId = String(output.nextStepId || "").trim();
+  if (expectedNextStepId && returnedNextStepId !== expectedNextStepId) {
+    return {
+      valid: false,
+      result: synchronizeGuideResultCandidate({
+        ...output,
+        shouldSpeak: false,
+        speech: "",
+        formulaOrStep: "",
+        studentAction: "",
+        guideUnavailableReason: "model_next_step_id_mismatch"
+      }),
+      reason: "model_next_step_id_mismatch"
+    };
+  }
+
+  if (!guideResultTargetsCurrentStep(output, context)) {
+    return {
+      valid: false,
+      result: synchronizeGuideResultCandidate({
+        ...output,
+        shouldSpeak: false,
+        speech: "",
+        formulaOrStep: "",
+        studentAction: "",
+        guideUnavailableReason: "model_not_current_next_step"
+      }),
+      reason: "model_not_current_next_step"
+    };
+  }
+
+  return {
+    valid: true,
+    reason: "",
+    result: synchronizeGuideResultCandidate({
+      ...output,
+      nextStepId: expectedNextStepId
+    })
+  };
+}
+
+function buildTrustedStepGuideFallback(context = {}, meta = {}) {
+  const nextStep = String(context.guideProgress?.currentStep || context.nextStep || "").replace(/\s+/g, " ").trim();
+  const nextStepId = String(context.guideProgress?.currentStepId || meta.nextStepId || "").trim();
+  if (!nextStep || !nextStepId) return null;
+
+  // Reuse the existing silence restoration helper only with the deterministic
+  // Question Memory step. This never invents a formula from OCR or local text.
+  let output = ensureConcreteSilenceGuide({
+    shouldSpeak: true,
+    speech: "",
+    formulaOrStep: nextStep,
+    studentAction: "",
+    hintLevel: meta.guideState === "interactive_teaching" ? "worked_step" : "light",
+    askStudentToRepeat: meta.guideState === "interactive_teaching",
+    guideState: meta.guideState || "interactive_teaching",
+    lectureComplete: false
+  }, {
+    eventType: meta.eventType || context.eventType || "active_help",
+    silenceStage: Number(meta.silenceStage) || 1,
+    silenceContextStep: nextStep,
+    verifiedGuideSteps: context.verifiedGuideSteps
+  });
+
+  output = {
+    ...output,
+    shouldSpeak: true,
+    speech: `下一步只做这一项：${nextStep}。把对应的变形或计算写在黑板上。`,
+    formulaOrStep: nextStep,
+    studentAction: `把“${nextStep}”对应的变形或计算写在黑板上。`,
+    askStudentToRepeat: meta.guideState === "interactive_teaching",
+    lectureComplete: false,
+    nextStepId,
+    guideUnavailableReason: "",
+    guideSpeechSource: "trusted-question-memory",
+    fallbackFrom: String(meta.reason || "guide_validation_failed")
+  };
+  return synchronizeGuideResultCandidate(output);
+}
+
+function buildGuideCorrectionInstruction(context = {}, reason = "") {
+  const nextStepId = String(context.guideProgress?.currentStepId || "").trim();
+  const nextStep = String(context.guideProgress?.currentStep || "").trim();
+  const forbiddenHistory = (Array.isArray(context.recentGuideHistory) ? context.recentGuideHistory : [])
+    .flatMap(guideHistoryEntryTexts)
+    .slice(-16);
+  return [
+    "CORRECTION RETRY — the previous response failed the server delivery contract.",
+    `failureReason=${String(reason || "unknown")}`,
+    `requiredNextStepId=${nextStepId || "unavailable"}`,
+    `requiredNextStep=${nextStep || "unavailable"}`,
+    `forbiddenPreviousInstructions=${JSON.stringify(forbiddenHistory)}`,
+    "Return exactly one new actionable guidance item. speech must independently name the concrete object and operation; formulaOrStep or studentAction must be non-empty.",
+    nextStep
+      ? "The response must implement only requiredNextStep and must not return a completed, earlier, or later step."
+      : "No trusted next step is available, so do not invent a formula; give only a concrete evidence-gathering action grounded in the visible image.",
+    "Do not paraphrase any forbiddenPreviousInstructions."
+  ].join("\n");
 }
 
 function getSilenceGuidePolicy(stage) {
@@ -9646,6 +9913,7 @@ async function handleGuide(req, res) {
   };
 
   const guideRequestStartedAt = Date.now();
+  const guideRequestDeadlineAt = guideRequestStartedAt + QWEN_GUIDE_TOTAL_TIMEOUT_MS;
   console.info("[guide] payload-images", {
     questionId: body.questionId || "",
     questionImageChars: 0,
@@ -9653,7 +9921,7 @@ async function handleGuide(req, res) {
     studentStrokeImageChars: String(body.studentStrokeImage || "").length,
     totalImageChars: String(currentBoardImage).length + String(body.studentStrokeImage || "").length
   });
-  let guideResult = await callGuideQwenMultimodalJson({
+  const guideModelRequest = {
     model: QWEN_GUIDE_MODEL,
     eventType: body.eventType || "normal",
     schema: guideSchema,
@@ -9666,8 +9934,8 @@ async function handleGuide(req, res) {
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
       "Concrete guidance source: prefer verifiedGuideSteps and verifiedAnswerReference.solutionOutline. When Question Memory is unavailable, derive only one non-final next operation from the current screenshot's visible equation and the question image; never copy an unverified OCR fragment or invent a relation that is not visible.",
-    "ACTIVE GUIDANCE OUTPUT CONTRACT: when the event is silence, silence_followup, silence_escalation, active_help, stuck, repeat_wrong, next_step, jump, check, or answer_to_lian_question, guidanceCandidates must contain exactly 3 distinct candidates. Each candidate must include a short speech plus a concrete formulaOrStep or studentAction. Keep the three candidates focused on the same immediate next step, but vary the wording or decomposition so the browser can choose one without repeating recent guidance.",
-    `HIGHEST PRIORITY SILENCE OVERRIDE: eventType=${body.eventType || "normal"}, stage ${silenceStage}. For silence, silence_followup, silence_escalation, active_help, or next_step, ignore the default Listening rule: return shouldSpeak=true with non-empty Chinese speech and either a concrete formulaOrStep or a concrete studentAction. Stage 2 must give the first problem-specific relation or operation; stage 3 gives the next key equation and asks the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer and never repeat an earlier weaker hint.`,
+    "ACTIVE GUIDANCE OUTPUT CONTRACT: when the event is silence, silence_followup, silence_escalation, active_help, stuck, repeat_wrong, next_step, jump, check, or answer_to_lian_question, copy guideProgress.currentStepId exactly into nextStepId and return exactly one guidanceCandidate selected as that current step. It must include a short speech plus a concrete formulaOrStep or studentAction; if the provider returns only top-level speech/formulaOrStep/studentAction, the server will use that single response. Do not return alternatives or candidate lists.",
+    `HIGHEST PRIORITY SILENCE OVERRIDE: eventType=${body.eventType || "normal"}, stage ${silenceStage}. For silence, silence_followup, silence_escalation, active_help, or next_step, ignore the default Listening rule: return shouldSpeak=true with non-empty Chinese speech and either a concrete formulaOrStep or a concrete studentAction. Stage 1 must identify the first missing problem-specific relation or operation; stage 2 must use a different, next operation based on stage 1 and never repeat its wording; stage 3 must give the next key equation or transformation and ask the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer, never repeat an earlier weaker hint, and never reuse an operation already present in recentGuideHistory.`,
     ].join("\n\n"),
     content: [
       {
@@ -9725,7 +9993,8 @@ async function handleGuide(req, res) {
             "lectureUnlocked=false 时只能启发引导或微提示，hintLevel 只能为 encourage/light。",
             "lectureUnlocked=false 时 speech 不得包含最终答案、中间完整算式或完整解题步骤。",
             "lectureUnlocked=true 时默认只讲一个小步骤；但 silenceStage>=4 且学生持续沉默时，必须一次性完成当前题的详细讲解，给出关键式和最终答案。",
-            `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2可以给出下一步具体运算关系；阶段3可以给出关键式子并要求学生写下或复述；阶段4如果学生持续沉默，直接根据题图完成详细讲解，给出关键式子和最终答案，不需要等待标准答案核验，但必须先自行检查计算。`,
+            `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2必须在阶段1基础上换成下一个具体运算或关系，不能重复阶段1；阶段3必须给出再下一步关键式子并要求学生写下或复述，不能重复阶段1/2；阶段4如果学生持续沉默，直接根据题图完成详细讲解，给出关键式和最终答案，不需要等待标准答案核验，但必须先自行检查计算。`,
+            "选择题推进闸门：当 recognizedBoardProgress.finalAnswer 为空或 hasFinalAnswer=false 时，绝不进入结论/选项核验；即使 m、n、8 的关系式已经列出，也必须先继续下一条未完成的推导关系（例如相减、代入、消元或判断结论的依据），不能把‘已列出关系式’当成最终答案或核验条件。",
             "沉默时间越长，引导必须越具体：不能在后续阶段重复阶段1的泛泛提问，也不能把已经给过的提示原样重复。",
             "recentGuideHistory 中已经出现的关系式、运算或目标不得再次用同义话术重复；必须根据已完成步骤推进到下一个操作，或把上一条拆成更小且不同的前置动作。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
@@ -9755,21 +10024,124 @@ async function handleGuide(req, res) {
           }]
         : [])
     ],
-    maxOutputTokens: 1200
-  }, {
+    maxOutputTokens: 1200,
+    deadlineAt: guideRequestDeadlineAt
+  };
+  const guideDiagnostics = {
     questionId: guideQuestionId,
     eventType: body.eventType || "",
     requestId: guideRequestId,
     sessionId: guideSessionId,
     guideValidationContext
-  });
+  };
+  let guideResult = await callGuideQwenMultimodalJson(guideModelRequest, guideDiagnostics);
+  let guideValidation = validateGuideResultForDelivery(guideResult, guideValidationContext);
+  let guideModelAttempts = 1;
 
-  guideResult = ensureConcreteSilenceGuide(guideResult, guideBody);
-  guideResult = ensureGuideFormulaMatchesTrustedSteps(guideResult, {
-    givenConditions: guideProgress.givenConditions,
-    verifiedGuideSteps
-  });
-  guideResult = ensureConcreteGuideInstruction(guideResult, guideValidationContext);
+  // Active guidance is a product contract, not a best-effort prompt. An
+  // invalid, vague, repeated, or out-of-order model result receives one
+  // bounded correction attempt with the deterministic next step and recent
+  // instructions explicitly marked as forbidden.
+  if (isActiveGuideEvent(body.eventType) && !guideValidation.valid) {
+    console.warn("[guide] delivery validation failed; retrying once", {
+      eventType: body.eventType || "",
+      questionId: guideQuestionId,
+      reason: guideValidation.reason,
+      nextStepId: guideProgress.currentStepId || "",
+      nextStep: guideProgress.currentStep || ""
+    });
+    if (!isLatestGuideRequest(guideSessionId, guideQuestionId, guideRequestId)) {
+      sendJson(res, 409, {
+        error: "stale guide request",
+        code: "stale_request",
+        stage: "validation-retry",
+        requestId: guideRequestId,
+        sessionId: guideSessionId,
+        questionId: guideQuestionId
+      });
+      return;
+    }
+
+    guideModelAttempts += 1;
+    const correctionInstruction = buildGuideCorrectionInstruction(
+      guideValidationContext,
+      guideValidation.reason
+    );
+    try {
+      const retryResult = await callGuideQwenMultimodalJson({
+        ...guideModelRequest,
+        instructions: `${guideModelRequest.instructions}\n\n${correctionInstruction}`,
+        content: [
+          ...guideModelRequest.content,
+          {
+            type: "input_text",
+            text: JSON.stringify({
+              correctionRetry: true,
+              validationFailure: guideValidation.reason,
+              requiredNextStepId: guideProgress.currentStepId || "",
+              requiredNextStep: guideProgress.currentStep || "",
+              forbiddenPreviousInstructions: guideValidationContext.recentGuideHistory
+            })
+          }
+        ]
+      }, {
+        ...guideDiagnostics,
+        retryAttempt: 1,
+        previousValidationFailure: guideValidation.reason
+      });
+      guideValidation = validateGuideResultForDelivery(retryResult, guideValidationContext);
+    } catch (retryError) {
+      console.warn("[guide] correction retry failed; falling back to trusted step", {
+        eventType: body.eventType || "",
+        questionId: guideQuestionId,
+        code: retryError?.code || "guide_retry_failed",
+        message: String(retryError?.message || "guide retry failed")
+      });
+      guideValidation = {
+        valid: false,
+        result: guideValidation.result,
+        reason: retryError?.code || "guide_retry_failed"
+      };
+    }
+  }
+
+  if (guideValidation.valid) {
+    guideResult = guideValidation.result;
+  } else {
+    const fallback = buildTrustedStepGuideFallback(guideValidationContext, {
+      eventType: body.eventType || "",
+      guideState,
+      silenceStage,
+      reason: guideValidation.reason
+    });
+    if (!fallback) {
+      console.error("[guide] final contract violation", {
+        eventType: body.eventType || "",
+        questionId: guideQuestionId,
+        reason: guideValidation.reason,
+        modelAttempts: guideModelAttempts,
+        hasTrustedNextStep: false
+      });
+      sendJson(res, 502, {
+        error: "模型返回的引导不符合主动引导格式，且没有可信下一步可安全展示",
+        code: "guide_contract_violation",
+        guideUnavailableReason: guideValidation.reason || "empty_or_non_actionable_model_result",
+        requestId: guideRequestId,
+        sessionId: guideSessionId,
+        questionId: guideQuestionId,
+        modelAttempts: guideModelAttempts
+      });
+      return;
+    }
+    guideResult = fallback;
+    console.warn("[guide] using trusted Question Memory step after failed retry", {
+      eventType: body.eventType || "",
+      questionId: guideQuestionId,
+      reason: guideValidation.reason,
+      nextStepId: fallback.nextStepId,
+      modelAttempts: guideModelAttempts
+    });
+  }
 
   if (!isLatestGuideRequest(guideSessionId, guideQuestionId, guideRequestId)) {
     sendJson(res, 409, {
@@ -9783,12 +10155,6 @@ async function handleGuide(req, res) {
     return;
   }
 
-  // Model-only guide mode: only an actionable Qwen speech is returned.
-  // The preflight validator used by the model race applies the same safety
-  // contract as this final pass, so a candidate cannot win and then vanish.
-  const activeGuideEvent = /^(?:active_help|stuck|silence|silence_followup|silence_escalation|error_silence|repeat_wrong|next_step|jump|check|answer_to_lian_question)$/.test(
-    String(body.eventType || "")
-  );
   const finalGuideSpeech = String(guideResult?.speech || "").trim();
   const finalGuideAction = String(guideResult?.formulaOrStep || guideResult?.studentAction || "").trim();
   console.info("[guide] qwen response final contract", {
@@ -9797,26 +10163,13 @@ async function handleGuide(req, res) {
     hasSpeech: Boolean(finalGuideSpeech),
     hasFormulaOrAction: Boolean(finalGuideAction),
     shouldSpeak: guideResult?.shouldSpeak !== false,
-    activeGuideEvent,
     guideUnavailableReason: guideResult?.guideUnavailableReason || "",
     lectureComplete: guideResult?.lectureComplete === true,
+    nextStepId: guideResult?.nextStepId || guideProgress.currentStepId || "",
+    modelAttempts: guideModelAttempts,
+    guideSpeechSource: guideResult?.guideSpeechSource || "qwen",
     elapsedMs: Date.now() - guideRequestStartedAt
   });
-  if (activeGuideEvent && (!finalGuideSpeech || !finalGuideAction || guideResult?.shouldSpeak === false)) {
-    console.error("[guide] final contract violation", {
-      eventType: body.eventType || "",
-      reason: guideResult?.guideUnavailableReason || "empty_or_non_actionable_model_result"
-    });
-    sendJson(res, 502, {
-      error: "模型返回的引导不符合主动引导格式",
-      code: "guide_contract_violation",
-      guideUnavailableReason: guideResult?.guideUnavailableReason || "empty_or_non_actionable_model_result",
-      requestId: guideRequestId,
-      sessionId: guideSessionId,
-      questionId: guideQuestionId
-    });
-    return;
-  }
   sendJson(res, 200, {
     ...guideResult,
     progress: guideProgress,
@@ -9826,8 +10179,10 @@ async function handleGuide(req, res) {
     questionId: guideQuestionId,
     answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
     provider: "qwen-structured-answer-guidance",
-    fallbackFrom: "",
-    guideSpeechSource: "qwen"
+    fallbackFrom: guideResult?.fallbackFrom || "",
+    guideSpeechSource: guideResult?.guideSpeechSource || "qwen",
+    modelAttempts: guideModelAttempts,
+    nextStepId: guideResult?.nextStepId || guideProgress.currentStepId || ""
   });
 }
 
@@ -10820,6 +11175,11 @@ module.exports = {
   ensureConcreteGuideInstruction,
   guideResultRepeatsRecentInstruction,
   ensureGuideFormulaMatchesTrustedSteps,
+  validateGuideResultForDelivery,
+  guideResultTargetsCurrentStep,
+  buildTrustedStepGuideFallback,
+  buildGuideCorrectionInstruction,
+  synchronizeGuideResultCandidate,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
   questionMemoryToAnswerKey,

@@ -2814,9 +2814,24 @@ function loadCurrentPage() {
   dom.transcriptInput.value = state.transcriptsByQuestion[question.id] || "";
   dom.transcriptInput.scrollTop = dom.transcriptInput.scrollHeight;
   // Entering a question is the only place that may create its Question Memory.
-  // Returning to the same question reuses the frozen terminal result, including
-  // an unavailable result, so board recognition can never trigger a retry.
-  void initializeQuestionMemory(question);
+  // Start this request before any guide/silence trigger can run. The guide and
+  // handwriting paths both consume this frozen result and never solve the
+  // question again from a possibly stale OCR hint.
+  void initializeQuestionMemory(question).then((memory) => {
+    if (currentPageQuestion()?.id !== question.id) return;
+    if (memory?.ready) {
+      console.info("[question-memory] ready before interaction", {
+        questionId: question.id,
+        canonicalAnswer: memory.canonicalAnswer,
+        selectedOption: memory.choiceAnalysis?.selectedOption || ""
+      });
+    } else {
+      console.warn("[question-memory] not ready before interaction", {
+        questionId: question.id,
+        status: memory?.status || "missing"
+      });
+    }
+  });
   if (dom.boardQuestionImage.src !== question.image) dom.boardQuestionImage.src = question.image;
   const pages = pagesForQuestion(question.id);
   drawDataUrlToCanvas(pages[0] || "", {
@@ -5643,7 +5658,10 @@ function resetSilenceTimer(updateSpeechAt = true) {
 
 function isGuideRequestRetryable(error) {
   if (!error || error.name === "AbortError") return false;
-  if (["qwen_timeout", "request_aborted", "stale_request", "guide_contract_violation"].includes(error.code)) return false;
+  // guide_contract_violation is kept as a legacy code name only; guide content
+  // is no longer validated by the client and therefore never blocks a model
+  // response on that basis.
+  if (["qwen_timeout", "request_aborted", "stale_request"].includes(error.code)) return false;
   // A network failure has already failed before a usable response exists.
   // Retrying here duplicated the same expensive guide request and produced
   // repeated notices while leaving the save action blocked.
@@ -5664,6 +5682,25 @@ function handleSilenceTimeout() {
   });
   if (state.teachSessionPaused) return;
   if (!currentPageQuestion() || state.currentQuestionCompleted) return;
+
+  // A board recognition request is allowed to finish, but it must not consume
+  // the 60-second silence event. Recheck shortly instead of advancing the
+  // silence state and losing the only trigger for this interval.
+  const boardRecognitionPending = Boolean(
+    state.recognitionTimer ||
+    state.handwritingRequestInFlight ||
+    state.handwritingRetryPending ||
+    state.handwritingRetryTimer
+  );
+  if (boardRecognitionPending) {
+    clearTimeout(state.silenceTimer);
+    state.silenceTimer = setTimeout(handleSilenceTimeout, 1500);
+    console.info("[silence-timer] deferred while handwriting recognition is pending", {
+      questionId: currentPageQuestion()?.id || "",
+      retryMs: 1500
+    });
+    return;
+  }
 
   const now = Date.now();
   if (state.awaitingSilenceFollowup) {
@@ -6295,23 +6332,50 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   }
 
   const questionContext = `${question.problemType || question.questionType || question.type || ""} ${question.title || ""} ${question.problemText || ""}`;
+  // Keep the question-type signal for diagnostics, but apply the readiness
+  // barrier below to every question rather than only choices.
   const isChoiceQuestion = /选择题|判断题|单选|多选|下列.*(?:正确|错误)|正确的是|不正确的是|选项|结论\s*[一二三四IVX]/.test(questionContext);
-  if (isChoiceQuestion) {
-    const memory = getQuestionMemory(question) || await waitForEnteredQuestionMemory(question);
-    if (!memory?.ready || !memory.canonicalAnswer || !memory.choiceAnalysis?.selectedOption) {
-      const retryCount = Number(state.questionMemoryRetryCountByQuestion[question.id] || 0);
-      // Keep the original choice gate (“正在准备这道选择题的标准答案”)
-      // semantically intact while exposing whether a bounded retry remains.
-      console.info("[guide] skipped before fixed choice answer is ready", {
-        eventType,
-        questionId: question.id,
-        memoryStatus: memory?.status || "missing"
-      });
-      dom.lianState.textContent = retryCount < 2
-        ? "标准答案生成失败，正在使用备用模型重试"
-        : "标准答案暂时不可用，请点击发送重新核验";
-      return false;
-    }
+  // Normal teaching/checking reuses the frozen standard answer. Silence is a
+  // separate liveness path: it must produce a concrete first step at 60s even
+  // when Question Memory is still loading or temporarily unavailable. The
+  // server is already instructed to avoid final-answer claims without that
+  // reference, so do not hold the silence timer behind the memory request.
+  let memory = getQuestionMemory(question);
+  const silenceMemoryPending = isSilenceGuide && !memory?.ready;
+  if (!memory?.ready && !isSilenceGuide) {
+    memory = await waitForEnteredQuestionMemory(question);
+  }
+  const hasKeySteps = Boolean(
+    memory?.ready &&
+    Array.isArray(memory.solutionOutline) &&
+    memory.solutionOutline.some((step) => String(step || "").trim()) &&
+    Array.isArray(memory.verificationChecks) &&
+    memory.verificationChecks.some((step) => String(step || "").trim())
+  );
+  if (!isSilenceGuide && (!memory?.ready || !memory.canonicalAnswer || !hasKeySteps)) {
+    const retryCount = Number(state.questionMemoryRetryCountByQuestion[question.id] || 0);
+    console.info("[guide] skipped before fixed answer is ready", {
+      eventType,
+      questionId: question.id,
+      isChoiceQuestion,
+      hasKeySteps,
+      memoryStatus: memory?.status || "missing"
+    });
+    // Keep the legacy wording “正在准备这道选择题的标准答案” documented for
+    // diagnostics; the visible status below is question-type agnostic.
+    dom.lianState.textContent = retryCount < 2
+      ? "正在识别这道题的标准答案，识别完成后开始引导"
+      : "标准答案暂时不可用，请点击发送重新识别";
+    return false;
+  }
+  if (silenceMemoryPending) {
+    console.info("[guide] silence proceeds without ready question memory", {
+      eventType,
+      questionId: question.id,
+      silenceStage: Number(options.silenceStage || state.silenceGuideStage || 0),
+      memoryStatus: memory?.status || "loading"
+    });
+    dom.lianState.textContent = "沉默已达到 60 秒，正在生成具体下一步";
   }
   const hasNewStudentSpeech = Boolean(String(latestStudentSpeech || "").trim());
   const guideFailureStillCooling =
@@ -6462,19 +6526,20 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     if (hasStudentInputSince(guideInputSnapshot)) return false;
     const silenceStage = Number(options.silenceStage || state.silenceGuideStage || 0);
     rememberGuideResult(questionId, selectedResult, { eventType, silenceStage });
-    const guideFormula = /silence/.test(eventType)
-      ? extractConcreteMathRelation(String(selectedResult?.formulaOrStep || ""))
-      : "";
-    const speechDedupeKey = guideFormula
-      ? `step:${guideFormula}`
-      : normalizeGuidanceFingerprint(speech);
+    // The visible speech is the user-facing contract. Deduplicate on that
+    // exact visible content so different hidden metadata cannot replay the
+    // same sentence as a second guide bubble.
+    const speechDedupeKey = normalizeGuidanceFingerprint(speech);
+    // Silence stages share one dedupe scope. A stage number describes the
+    // escalation level, not permission to repeat the same sentence.
+    const guideDedupeScope = /silence/.test(eventType) ? "silence" : eventType;
     await lianSpeak(speech, {
       responseToken,
       responseId,
       guideRequestId: requestId,
       guideGeneration,
       questionId,
-      dedupeKey: `guide:${questionId}:${/silence/.test(eventType) ? `silence-stage:${silenceStage}` : eventType}:${speechDedupeKey}`,
+      dedupeKey: `guide:${questionId}:${guideDedupeScope}:${speechDedupeKey}`,
       cooldownMs: 90000
     });
     if (
@@ -6507,20 +6572,10 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     ) {
       return false;
     }
-    if (error?.code === "guide_contract_violation") {
-      dom.lianState.textContent = "模型返回的引导格式不合格，请点击发送重试";
-      if (isSilenceGuide) {
-        state.silenceGuidanceExhausted = true;
-        state.awaitingSilenceFollowup = false;
-        clearTimeout(state.silenceTimer);
-        state.silenceTimer = null;
-      }
-      lianSilentNotice("模型返回了无效引导，已停止自动重试。点击发送可重新请求。", {
-        key: `guide-contract-failed:${questionId}`,
-        cooldownMs: 60000
-      });
-      return false;
-    }
+    // Older deployments could return guide_contract_violation. Treat that
+    // legacy response like any other transport failure; the current backend
+    // no longer emits it for a parsed model result, and the client does not
+    // perform its own guide-content validation.
     dom.lianState.textContent = "自动引导暂时不可用，但仍可继续核对和保存";
     state.guideUnavailableAt = Date.now();
     state.guideUnavailableQuestionId = questionId;
@@ -6910,9 +6965,10 @@ function trimGuideSpeech(text, eventType) {
 }
 
 function formatGuideSpeech(result) {
-  // Speak exactly the structured text returned by Qwen. Do not append,
-  // replace, or repair it with local formulas or generic prompts.
-  return String(result?.speech || "").trim();
+  // The model owns the user-visible wording. Display exactly its speech
+  // field; formulaOrStep and studentAction remain structured metadata and are
+  // not appended with client-generated punctuation.
+  return typeof result?.speech === "string" ? result.speech.trim() : "";
 }
 
 function buildFallbackGuide(eventType, question) {
@@ -7128,38 +7184,22 @@ function getRecentGuideHistory(questionId = currentPageQuestion()?.id || "") {
 }
 
 function selectGuidanceCandidate(result, questionId = currentPageQuestion()?.id || "") {
-  if (!result || typeof result !== "object" || !Array.isArray(result.guidanceCandidates) || result.guidanceCandidates.length !== 3) {
+  if (!result || typeof result !== "object" || !Array.isArray(result.guidanceCandidates) || result.guidanceCandidates.length < 1) {
     return result;
   }
-  const recent = getRecentGuideHistory(questionId);
-  const recentKeys = new Set(recent.map((entry) => normalizeGuidanceFingerprint(
-    [entry?.formulaOrStep, entry?.studentAction, entry?.speech].filter(Boolean).join("|")
-  )).filter(Boolean));
-  const ranked = result.guidanceCandidates
-    .map((candidate, index) => {
-      const normalized = {
-        speech: String(candidate?.speech || "").replace(/\s+/g, " ").trim(),
-        formulaOrStep: String(candidate?.formulaOrStep || "").replace(/\s+/g, " ").trim(),
-        studentAction: String(candidate?.studentAction || "").replace(/\s+/g, " ").trim()
-      };
-      const key = normalizeGuidanceFingerprint(
-        [normalized.formulaOrStep, normalized.studentAction, normalized.speech].filter(Boolean).join("|")
-      );
-      return {
-        index,
-        normalized,
-        score: (recentKeys.has(key) ? -100 : 0) +
-          (normalized.formulaOrStep ? 3 : 0) +
-          (normalized.studentAction ? 2 : 0) - index * 0.01
-      };
-    })
-    .sort((left, right) => right.score - left.score);
-  const selected = ranked[0];
-  if (!selected?.normalized.speech) return result;
+  // The model now returns one selected candidate. Do not rank, filter, or
+  // substitute a different guide in the browser.
+  const candidate = result.guidanceCandidates[0];
+  const normalized = {
+    speech: String(candidate?.speech || "").replace(/\s+/g, " ").trim(),
+    formulaOrStep: String(candidate?.formulaOrStep || "").replace(/\s+/g, " ").trim(),
+    studentAction: String(candidate?.studentAction || "").replace(/\s+/g, " ").trim()
+  };
+  if (!normalized.speech && !normalized.formulaOrStep && !normalized.studentAction) return result;
   return {
     ...result,
-    ...selected.normalized,
-    selectedGuidanceIndex: selected.index
+    ...normalized,
+    selectedGuidanceIndex: 0
   };
 }
 

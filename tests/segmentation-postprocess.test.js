@@ -36,6 +36,10 @@ const {
   ensureConcreteGuideInstruction,
   guideResultRepeatsRecentInstruction,
   ensureGuideFormulaMatchesTrustedSteps,
+  validateGuideResultForDelivery,
+  buildTrustedStepGuideFallback,
+  buildGuideCorrectionInstruction,
+  deriveGuideProgress,
   summarizeHandwritingDiagnostics,
   buildQuestionMemory,
   questionMemoryToAnswerKey,
@@ -160,6 +164,168 @@ test("rejects a repeated guidance operation and leaves later steps available", (
     ),
     false
   );
+});
+
+test("hard delivery validation rejects vague, repeated, and out-of-order active guidance", () => {
+  const baseContext = {
+    eventType: "next_step",
+    hasBoardInk: true,
+    guideProgress: {
+      currentStepId: "step_2",
+      currentStep: "两边同时除以2：2x/2=4/2",
+      givenConditions: ["2x+3=7"]
+    },
+    verifiedGuideSteps: ["两边同时减去3：2x=4", "两边同时除以2：2x/2=4/2"],
+    recentGuideHistory: []
+  };
+
+  const vague = validateGuideResultForDelivery({
+    shouldSpeak: true,
+    speech: "再想想下一步。",
+    formulaOrStep: "",
+    studentAction: "继续下一步",
+    nextStepId: "step_2",
+    lectureComplete: false
+  }, baseContext);
+  assert.equal(vague.valid, false);
+  assert.equal(vague.reason, "model_response_not_actionable");
+
+  const wrongStep = validateGuideResultForDelivery({
+    shouldSpeak: true,
+    speech: "先写出2x=4。",
+    formulaOrStep: "2x=4",
+    studentAction: "把2x=4写在黑板上。",
+    nextStepId: "step_2",
+    lectureComplete: false
+  }, baseContext);
+  assert.equal(wrongStep.valid, false);
+  assert.equal(wrongStep.reason, "model_not_current_next_step");
+
+  const repeated = validateGuideResultForDelivery({
+    shouldSpeak: true,
+    speech: "下一步写出2x/2=4/2。",
+    formulaOrStep: "2x/2=4/2",
+    studentAction: "把2x/2=4/2写在黑板上并计算。",
+    nextStepId: "step_2",
+    lectureComplete: false
+  }, {
+    ...baseContext,
+    recentGuideHistory: [{
+      speech: "把等式两边都除以2。",
+      formulaOrStep: "2x/2=4/2",
+      studentAction: "写出2x/2=4/2。"
+    }]
+  });
+  assert.equal(repeated.valid, false);
+  assert.equal(repeated.reason, "model_repeated_previous_guidance");
+});
+
+test("hard delivery validation accepts only the current next step and synchronizes the browser candidate", () => {
+  const validated = validateGuideResultForDelivery({
+    shouldSpeak: true,
+    speech: "下一步写出2x/2=4/2，再算出x。",
+    formulaOrStep: "2x/2=4/2",
+    studentAction: "把2x/2=4/2写在黑板上并计算。",
+    nextStepId: "step_2",
+    guidanceCandidates: [{
+      speech: "旧候选不能覆盖校验结果。",
+      formulaOrStep: "2x=4",
+      studentAction: "重写旧步骤。"
+    }],
+    lectureComplete: false
+  }, {
+    eventType: "next_step",
+    hasBoardInk: true,
+    guideProgress: {
+      currentStepId: "step_2",
+      currentStep: "两边同时除以2：2x/2=4/2",
+      givenConditions: ["2x+3=7"]
+    },
+    verifiedGuideSteps: ["两边同时减去3：2x=4", "两边同时除以2：2x/2=4/2"],
+    recentGuideHistory: []
+  });
+
+  assert.equal(validated.valid, true);
+  assert.equal(validated.result.nextStepId, "step_2");
+  assert.equal(validated.result.guidanceCandidates.length, 1);
+  assert.equal(validated.result.guidanceCandidates[0].formulaOrStep, "2x/2=4/2");
+  assert.match(validated.result.guidanceCandidates[0].speech, /2x\/2=4\/2/);
+});
+
+test("hard delivery validation requires the exact nextStepId", () => {
+  const context = {
+    eventType: "next_step",
+    guideProgress: {
+      currentStepId: "step_2",
+      currentStep: "两边同时除以2：2x/2=4/2",
+      givenConditions: ["2x+3=7"]
+    },
+    verifiedGuideSteps: ["两边同时减去3：2x=4", "两边同时除以2：2x/2=4/2"],
+    recentGuideHistory: []
+  };
+  const response = {
+    shouldSpeak: true,
+    speech: "下一步写出2x/2=4/2，再算出x。",
+    formulaOrStep: "2x/2=4/2",
+    studentAction: "把2x/2=4/2写在黑板上并计算。"
+  };
+
+  const missing = validateGuideResultForDelivery(response, context);
+  assert.equal(missing.valid, false);
+  assert.equal(missing.reason, "model_next_step_id_mismatch");
+
+  const wrong = validateGuideResultForDelivery({ ...response, nextStepId: "step_3" }, context);
+  assert.equal(wrong.valid, false);
+  assert.equal(wrong.reason, "model_next_step_id_mismatch");
+});
+
+test("trusted fallback exposes only the deterministic Question Memory next step", () => {
+  const fallback = buildTrustedStepGuideFallback({
+    eventType: "next_step",
+    guideProgress: {
+      currentStepId: "step_3",
+      currentStep: "把x=2代回原方程验算",
+      givenConditions: ["2x+3=7"]
+    },
+    verifiedGuideSteps: ["2x=4", "x=2", "把x=2代回原方程验算"]
+  }, {
+    eventType: "next_step",
+    guideState: "interactive_teaching",
+    reason: "model_repeated_previous_guidance"
+  });
+
+  assert.equal(fallback.nextStepId, "step_3");
+  assert.equal(fallback.formulaOrStep, "把x=2代回原方程验算");
+  assert.match(fallback.speech, /把x=2代回原方程验算/);
+  assert.equal(fallback.guidanceCandidates[0].formulaOrStep, fallback.formulaOrStep);
+  assert.equal(fallback.guideSpeechSource, "trusted-question-memory");
+  assert.equal(fallback.fallbackFrom, "model_repeated_previous_guidance");
+});
+
+test("guide progress assigns a stable nextStepId and correction retry forbids old instructions", () => {
+  const progress = deriveGuideProgress({
+    verifiedGuideSteps: ["2x=4", "x=2"],
+    latestHandwritingResult: {
+      detectedWriting: "2x=4",
+      completedSteps: ["2x=4"]
+    }
+  });
+  assert.equal(progress.currentStepId, "step_2");
+  assert.equal(progress.currentStepIndex, 1);
+  assert.equal(progress.currentStep, "x=2");
+
+  const instruction = buildGuideCorrectionInstruction({
+    guideProgress: progress,
+    recentGuideHistory: [{
+      speech: "先把两边同时减去3。",
+      formulaOrStep: "2x=4",
+      studentAction: "写出2x=4。"
+    }]
+  }, "model_repeated_previous_guidance");
+  assert.match(instruction, /requiredNextStepId=step_2/);
+  assert.match(instruction, /requiredNextStep=x=2/);
+  assert.match(instruction, /forbiddenPreviousInstructions=/);
+  assert.match(instruction, /model_repeated_previous_guidance/);
 });
 
 test("allows stage-4 silence to explain without a standard-answer key", async () => {
@@ -471,7 +637,10 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /只返回‘继续想想’/);
   assert.match(serverSource, /空板规则/);
   assert.match(serverSource, /仅在 eventType=normal 或 thought_complete/);
-  assert.match(serverSource, /guideResult = ensureConcreteSilenceGuide\(guideResult, guideBody\)/);
+  assert.match(serverSource, /validateGuideResultForDelivery\(guideResult, guideValidationContext\)/);
+  assert.match(serverSource, /buildGuideCorrectionInstruction/);
+  assert.match(serverSource, /buildTrustedStepGuideFallback/);
+  assert.match(serverSource, /delivery validation failed; retrying once/);
   assert.match(serverSource, /ensureGuideFormulaMatchesTrustedSteps/);
   assert.match(serverSource, /isGuideResultUsableAfterSafety/);
   assert.match(serverSource, /guideValidationContext/);
