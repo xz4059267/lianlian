@@ -1,4 +1,4 @@
-.env
+.env*
 .venv/
 .paddleocr/
 .paddlex/
@@ -11,5 +11,6 @@ node_modules/
 server-*.log
 __pycache__/
 *.pyc
+*.docx
 dist/
 build/

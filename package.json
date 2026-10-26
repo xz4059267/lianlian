@@ -7,9 +7,12 @@
   "scripts": {
     "start": "node server.js",
     "check": "node --check server.js && node --check app.js",
-    "test": "node --test tests/segmentation-postprocess.test.js tests/qwen-race.test.js tests/answer-guide.test.js"
+    "test": "node --test tests/segmentation-postprocess.test.js tests/qwen-race.test.js tests/answer-guide.test.js tests/handwriting-ocr.test.js tests/kimi-private-image.test.js"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.8.2"
   }
 }

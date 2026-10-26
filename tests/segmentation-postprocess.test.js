@@ -113,6 +113,13 @@ test("starts the first silence interval with stage-one guidance", () => {
   assert.doesNotMatch(firstSilenceStart, /Skip the vague first-stage care prompt/);
 });
 
+test("keeps the initial 60-second care interval but allows all four guidance stages", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  assert.match(appSource, /const SILENCE_CARE_MS = 60000/);
+  assert.match(appSource, /const SILENCE_AFTER_CARE_MS = 30000/);
+  assert.match(appSource, /const MAX_SILENCE_AUTO_ATTEMPTS = MAX_SILENCE_GUIDE_STAGE/);
+});
+
 test("rejects vague variable-representation guidance but accepts an explicit construction method", () => {
   const context = { eventType: "silence", hasBoardInk: true };
   const vague = ensureConcreteGuideInstruction(
@@ -501,7 +508,7 @@ test("fails closed when handwriting has no matching Question Memory", () => {
   );
 });
 
-test("handwriting sends the current blackboard image without client OCR", () => {
+test("handwriting sends stroke-only OCR text to Qwen and uses stroke-only image fallback", () => {
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const handlerSource = serverSource.slice(
     serverSource.indexOf("async function handleHandwriting"),
@@ -517,7 +524,7 @@ test("handwriting sends the current blackboard image without client OCR", () => 
     appSource.indexOf("async function createCurrentBoardSnapshot")
   );
   const snapshotSource = appSource.slice(
-    appSource.indexOf("async function createCurrentBoardSnapshot"),
+    appSource.indexOf("async function createCurrentStudentStrokeSnapshot"),
     appSource.indexOf("function isIncompleteHandwritingIssue")
   );
   const appHandwritingRun = appSource.slice(
@@ -529,31 +536,41 @@ test("handwriting sends the current blackboard image without client OCR", () => 
   assert.doesNotMatch(handlerSource, /getVerifiedAnswerKey\(/);
   assert.doesNotMatch(handlerSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
   assert.doesNotMatch(auditSource, /body\.questionImage|body\.problemText|body\.knowledgePoints|ORDERED_PROPORTION_RULES|STATEMENT_EVALUATION_RULES/);
-  assert.match(handlerSource, /body\.boardImage/);
-  assert.match(handlerSource, /当前黑板区域截图/);
+  assert.doesNotMatch(handlerSource, /body\.boardImage|image_url:\s*boardImage/);
+  assert.match(handlerSource, /recognizeAliyunHandwriting\(/);
+  assert.match(handlerSource, /getStudentStrokeImageForHandwriting\(body\)/);
+  assert.match(handlerSource, /handwritingRecognitionMode === "aliyun-ocr-text"/);
+  assert.doesNotMatch(handlerSource, /image_url:\s*boardImage/);
+  assert.match(handlerSource, /OCR 无结果时的兜底证据，不含题目图片/);
+  assert.doesNotMatch(auditSource, /image_url:\s*boardImage|当前黑板区域截图/);
+  assert.match(auditSource, /handwritingRecognitionMode !== "aliyun-ocr-text"/);
   assert.doesNotMatch(handlerSource, /privateQuestionMemoryReference\(answerKey\)/);
   assert.doesNotMatch(auditSource, /privateQuestionMemoryReference\(answerKey\)|initialHandwritingResult/);
   assert.match(appSource, /fetch\("\/api\/question-memory"/);
   assert.doesNotMatch(appSource, /fetch\("\/api\/answer-key"/);
   assert.match(appSource, /questionMemory,/);
-  assert.match(appHandwritingRequest, /boardImage/);
-  assert.match(appHandwritingRequest, /createCurrentBoardSnapshot/);
+  assert.doesNotMatch(appHandwritingRequest, /boardImage|createCurrentBoardSnapshot/);
+  assert.match(appHandwritingRequest, /createCurrentStudentStrokeSnapshot/);
   assert.doesNotMatch(appHandwritingRequest, /boardOnlyImage|createCurrentBoardOnlySnapshot|composeStrokeOcrSnapshot/);
-  assert.match(snapshotSource, /question\.image/);
+  assert.doesNotMatch(snapshotSource, /question\.image/);
   assert.match(snapshotSource, /prepareGuideImage/);
   assert.doesNotMatch(snapshotSource, /getImageData|putImageData|threshold|二值化/);
   assert.match(appHandwritingRun, /handleHandwritingAnswerVerification\(result\)/);
   assert.match(handlerSource, /verifiedAnswerReference: privateAnswerReference\(answerKey\)/);
   assert.match(handlerSource, /latestStudentSpeech/);
   assert.match(handlerSource, /studentSpeechTranscript/);
-  assert.match(handlerSource, /笔迹优先于本题完整语音记录/);
-  assert.match(serverSource, /题目图片中的印刷文字/);
+  assert.match(handlerSource, /只使用 aliyunHandwritingTranscription 作为学生新增笔迹转写/);
+  assert.match(serverSource, /不要假设收到题目图片或合成黑板截图/);
   assert.match(handlerSource, /applyHandwritingAnswerVerification\(result, answerKey\)/);
+  assert.doesNotMatch(handlerSource, /await auditHandwritingResult\(/);
+  assert.doesNotMatch(handlerSource, /ocrRecognizedText: String\(body\.aliyunHandwritingTranscription/);
+  assert.match(handlerSource, /delete publicResult\.ocrRecognizedText/);
   assert.match(appHandwritingRun, /finalAnswerCandidate/);
+  assert.doesNotMatch(appHandwritingRun, /isCurrentInteraction\(responseToken\)/);
   assert.doesNotMatch(appHandwritingRun, /getVerifiedAnswerKey\(|fetch\("\/api\/answer-key"/);
 });
 
-test("guide receives one current blackboard image and ignores legacy handwriting text", () => {
+test("guide sends OCR text and only uses isolated strokes as image fallback", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
   const guideRequest = appSource.slice(
@@ -568,14 +585,19 @@ test("guide receives one current blackboard image and ignores legacy handwriting
     serverSource.indexOf("async function handleGuide"),
     serverSource.indexOf("async function handleHandwriting")
   );
-  assert.match(guideRequest, /createCurrentBoardSnapshot/);
+  assert.match(guideRequest, /const boardImage = ""/);
+  assert.doesNotMatch(guideRequest, /createCurrentBoardSnapshot/);
+  assert.match(guideRequest, /createCurrentStudentStrokeSnapshot/);
+  assert.match(guideRequest, /handwritingRecognitionMode === "student-stroke-image-fallback"/);
+  assert.doesNotMatch(guideRequest, /ocrRecognizedText/);
   assert.match(guideRequest, /boardImage/);
   assert.match(guideRequest, /recognizedBoardProgress/);
   assert.match(guideGate, /state\.recognitionTimer/);
   assert.match(guideGate, /wait-for-handwriting-recognition/);
   assert.doesNotMatch(guideRequest, /questionImage,|latestHandwritingResult:/);
-  assert.match(guideHandler, /currentBoardImage/);
-  assert.match(guideHandler, /当前黑板区域截图/);
+  assert.match(guideHandler, /ignoredLegacyBoardImageChars/);
+  assert.doesNotMatch(guideHandler, /currentBoardImage/);
+  assert.match(guideHandler, /buildGuideEvidenceContent/);
   assert.match(guideHandler, /latestHandwritingResult: body\.recognizedBoardProgress \|\| null/);
   assert.doesNotMatch(guideHandler, /latestHandwritingResult: body\.latestHandwritingResult/);
   const boardInkSource = appSource.slice(
@@ -613,21 +635,21 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /引导接口不得以任何形式向学生索取对错确认/);
   assert.match(serverSource, /对不对\/正确吗\/是不是\/算对了吗\/有没有错/);
   assert.match(serverSource, /禁止任何形式的对错确认式提问/);
-  assert.match(serverSource, /answerHint 必须具体指出错误的可见行、数字、符号、运算或选项/);
+  assert.match(serverSource, /错误时 answerHint 要指出具体错误/);
   assert.match(serverSource, /const concreteHint = errorLocation && errorEvidence/);
   assert.match(serverSource, /function answerKeyCorrection\(answerKey\)/);
   assert.match(serverSource, /正确选项应为：\$\{choice\.selectedOption\}/);
   assert.match(serverSource, /guidance: `下一步直接做：\$\{nextMemoryStep\}`/);
   assert.match(serverSource, /选择题进入后必须把 verifiedAnswerReference\.canonicalAnswer 与 choiceAnalysis 视为已经固定/);
-  assert.match(serverSource, /选择题特别规则：如果当前截图已写出 A\/B\/C\/D 选项或 I\/II 等结论判定/);
+  assert.match(serverSource, /选择题如果已写出选项\/结论/);
   assert.match(serverSource, /HIGHEST PRIORITY SILENCE OVERRIDE/);
   assert.match(serverSource, /VISUAL_RELATION_RULES/);
   assert.match(serverSource, /图形、箭头、表格、坐标/);
   assert.match(serverSource, /最高优先级的证据分层规则/);
   assert.match(serverSource, /首页导入图片中原本就有的印刷公式、选项、红笔批注/);
   assert.match(serverSource, /导入后新增的学生笔迹隔离层/);
-  assert.match(serverSource, /学生后来写在图片上、图片内或图片旁边的新增笔迹算本次笔迹/);
-  assert.match(serverSource, /即使合成图里看见红叉、圈画、批注、选项或公式/);
+  assert.match(serverSource, /当前是 OCR 文字模式/);
+  assert.match(serverSource, /图片兜底模式只根据新增学生笔迹隔离层图片/);
   assert.match(serverSource, /不得说‘你画了红叉’/);
   assert.match(serverSource, /最高优先级的可执行输出规则/);
   assert.match(serverSource, /具体列式硬规则/);
@@ -652,8 +674,8 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /recognizedBoardProgress\.completedSteps/);
   assert.match(appSource, /createCurrentStudentStrokeSnapshot/);
   assert.match(appSource, /studentStrokeImage/);
-  assert.match(serverSource, /唯一的本次书写证据/);
-  assert.match(serverSource, /首页导入图片原本包含的印刷、批注或手写内容都不是本次笔迹/);
+  assert.match(serverSource, /OCR 无结果时的兜底证据/);
+  assert.match(serverSource, /只核验学生本次新增的板书/);
   assert.match(appSource, /handwriting-answer-unclear/);
   assert.match(appSource, /hasVisibleAnswerAndKeyStep/);
   assert.doesNotMatch(appSource, /result\.shouldSpeak === false && !options\.force/);
@@ -677,7 +699,7 @@ test("waits for a fixed choice answer before requesting guide output", () => {
   assert.match(guideGate, /const isChoiceQuestion =/);
   assert.match(guideGate, /await waitForEnteredQuestionMemory\(question\)/);
   assert.match(guideGate, /!memory\?\.ready \|\| !memory\.canonicalAnswer/);
-  assert.match(guideGate, /正在准备这道选择题的标准答案/);
+  assert.match(guideGate, /正在生成这道题的标准答案与步骤/);
 });
 
   test("does not treat a reviewable intermediate equation as a final answer", () => {
@@ -697,8 +719,8 @@ test("waits for a fixed choice answer before requesting guide output", () => {
   assert.match(gateSource, /getVisibleHandwritingEvidence/);
   assert.match(gateSource, /Bare numbers or relations are ambiguous/);
   assert.doesNotMatch(gateSource, /hasReviewableBoardStep\(result\)/);
-  assert.match(promptSource, /boardComplete=true 仅表示存在可核验关键步骤/);
-    assert.match(promptSource, /题目关系式、代入式、过程式/);
+  assert.match(promptSource, /boardComplete=true 只表示存在可核验关键步骤/);
+    assert.match(promptSource, /只有关系式、代入式、过程式/);
   });
 
   test("uses the multimodal handwriting action and finalAnswer when provided", () => {
@@ -718,8 +740,8 @@ test("waits for a fixed choice answer before requesting guide output", () => {
     assert.match(gateSource, /modelAction === "continue_guidance"/);
     assert.doesNotMatch(gateSource, /standaloneAssignment/);
     assert.match(gateSource, /Do not infer an answer/);
-    assert.match(promptSource, /finalAnswer、answer 或 studentAnswer 不能凭空填写/);
-    assert.match(promptSource, /answerVerificationStatus=correct 或 wrong/);
+    assert.match(promptSource, /finalAnswer 只能来自输入证据/);
+    assert.match(promptSource, /必须依据 verifiedAnswerReference 完成核验/);
     assert.match(promptSource, /verifiedAnswerReference/);
   });
 
@@ -763,6 +785,32 @@ test("keeps correct board progress silent and grounds feedback in visible work",
   assert.equal(result.guidance, "");
   assert.equal(result.positiveFeedback, "你已经写出了“列出 2:3=x:6”。");
   assert.doesNotMatch(result.positiveFeedback, /很好|很棒|继续努力/);
+});
+
+test("handwriting guidance advances past an OCR-visible step omitted from model completedSteps", () => {
+  const answerKey = {
+    trusted: true,
+    givenConditions: ["x-y=-1"],
+    solutionOutline: [
+      "(4x-y)+(x-4y)=(7m+1)+(3m-6)",
+      "5x-5y=10m-5",
+      "代入 x-y=-1：5(x-y)=-5=10m-5"
+    ]
+  };
+  const result = buildHandwritingProcessFeedback({
+    writingState: "complete",
+    completedSteps: ["(4x-y)+(x-4y)=(7m+1)+(3m-6)"],
+    calculationStatus: "correct",
+    confidence: 0.9,
+    nextAction: "continue_guidance",
+    guidance: "将两个方程相加"
+  }, answerKey, {
+    boardIdleSeconds: 7,
+    aliyunHandwritingTranscription: "5x-5y=10m-5"
+  });
+  assert.equal(result.expectedNextStep, answerKey.solutionOutline[2]);
+  assert.match(result.guidance, /代入 x-y=-1/);
+  assert.doesNotMatch(result.guidance, /将两个方程相加/);
 });
 
 test("only gives stalled guidance from Question Memory standard steps", () => {

@@ -70,6 +70,40 @@ test("handwriting validator rejects uncertain empty output", () => {
   );
 });
 
+test("answer-key race includes structured validation reasons when every candidate is rejected", async () => {
+  await assert.rejects(
+    raceQwenStructuredModels({
+      options: {},
+      models: ["answer-model"],
+      label: "answer-key",
+      isValid: () => false,
+      getValidationIssues: () => ["solution-steps-missing", "verification-checks-missing"],
+      invokeModel: async () => ({ canonicalAnswer: "0" })
+    }),
+    (error) => {
+      assert.equal(error.code, "invalid_model_output");
+      assert.deepEqual(error.validationIssues, ["solution-steps-missing", "verification-checks-missing"]);
+      assert.match(error.message, /solution-steps-missing、verification-checks-missing/);
+      return true;
+    }
+  );
+});
+
+test("answer-key race retries one empty array response without accepting it", async () => {
+  let calls = 0;
+  const result = await raceQwenStructuredModels({
+    options: { deadlineAt: Date.now() + 5000 },
+    models: ["answer-model"],
+    label: "answer-key",
+    isValid: (value) => value?.status === "solved",
+    getValidationIssues: () => ["status-missing"],
+    invokeModel: async () => (++calls === 1 ? [] : { status: "solved" })
+  });
+
+  assert.equal(calls, 2);
+  assert.deepEqual(result, { status: "solved" });
+});
+
 test("parallel race returns the first valid structured result and aborts the slower request", async () => {
   let slowAborted = false;
   const result = await raceQwenStructuredModels({

@@ -137,15 +137,14 @@ const GUIDE_STATE_LABELS = {
 };
 
 const SILENCE_CARE_MS = 60000;
-const SILENCE_AFTER_CARE_MS = 60000;
+const SILENCE_AFTER_CARE_MS = 30000;
 // Keep the browser budget just above the server's dedicated guide budget.
 // A guide turn must fail fast enough that the student can continue writing.
-const GUIDE_REQUEST_TIMEOUT_MS = 30000;
-// The server allows Qwen up to 45s. Keep the browser alive slightly longer so
-// a valid response is not turned into a duplicate retry by the client.
-// The server owns the handwriting race budget. Keep the browser timeout a
-// little longer so it receives the real server error instead of aborting first.
-const HANDWRITING_REQUEST_TIMEOUT_MS = 35000;
+const GUIDE_REQUEST_TIMEOUT_MS = 22000;
+// OCR and the single handwriting judgment complete in one server request.
+// The server can spend up to 260 seconds on the model; do not abandon a valid
+// result after 24 seconds and accidentally start over on the same board.
+const HANDWRITING_REQUEST_TIMEOUT_MS = 285000;
 const LIAN_TTS_REQUEST_TIMEOUT_MS = 9000;
 const LIAN_TEXT_PUBLISH_WATCHDOG_MS = 10000;
 // Each additional full idle interval moves the guide closer to a concrete
@@ -153,7 +152,7 @@ const LIAN_TEXT_PUBLISH_WATCHDOG_MS = 10000;
 const MAX_SILENCE_GUIDE_STAGE = 4;
 // Silence guidance is bounded. A missing model response must never create an
 // unbounded retry loop; at most one request is made for each active stage.
-const MAX_SILENCE_AUTO_ATTEMPTS = MAX_SILENCE_GUIDE_STAGE - 1;
+const MAX_SILENCE_AUTO_ATTEMPTS = MAX_SILENCE_GUIDE_STAGE;
 const ERROR_SILENCE_MS = 60000;
 const BOARD_RECOGNITION_DELAY_MS = 6500;
 const THOUGHT_PAUSE_MS = 8000;
@@ -2876,6 +2875,7 @@ function normalizeQuestionMemory(question, payload = {}) {
     givenConditions: Array.isArray(source.givenConditions) ? source.givenConditions : [],
     solutionOutline: Array.isArray(source.solutionOutline) ? source.solutionOutline : [],
     verificationChecks: Array.isArray(source.verificationChecks) ? source.verificationChecks : [],
+    independentVerification: source.independentVerification || null,
     studentTrace: source.studentTrace || null,
     reason: String(source.reason || "").trim(),
     provider: String(source.provider || ""),
@@ -2956,27 +2956,30 @@ async function initializeQuestionMemory(question) {
 }
 
 async function waitForEnteredQuestionMemory(question) {
-  const memory = getQuestionMemory(question);
-  const pending = question?.id ? state.questionMemoryFetchPromises[question.id] : null;
-  if (pending) return await pending;
-  if (memory?.ready) return memory;
-  // A failed/temporarily unavailable lookup must not permanently poison the
-  // question for the rest of the lecture. Allow two bounded retries at the
-  // moment a board or guide request needs the frozen answer key; after that,
-  // fail closed with an explicit retry state and never guess a standard answer.
-  if (
-    question?.id &&
-    memory &&
-    !memory.ready &&
-    Number(state.questionMemoryRetryCountByQuestion[question.id] || 0) < 2
-  ) {
-    state.questionMemoryRetryCountByQuestion[question.id] =
-      Number(state.questionMemoryRetryCountByQuestion[question.id] || 0) + 1;
+  if (!question?.id) return null;
+  // Await an in-flight request, but do not treat its failure as the end of the
+  // recovery path. This used to return the failed result immediately and skip
+  // the bounded retries whenever a guide arrived during the first request.
+  for (;;) {
+    const memory = getQuestionMemory(question);
+    if (memory?.ready) return memory;
+    const pending = state.questionMemoryFetchPromises[question.id];
+    if (pending) {
+      await pending;
+      continue;
+    }
+
+    const retryCount = Number(state.questionMemoryRetryCountByQuestion[question.id] || 0);
+    if (!memory || retryCount >= 2) return memory || null;
+
+    // Retry at most twice per question/session. initializeQuestionMemory is
+    // intentionally started synchronously after incrementing the counter so
+    // concurrent callers join the same request instead of duplicating it.
+    state.questionMemoryRetryCountByQuestion[question.id] = retryCount + 1;
     delete state.questionMemoryStatusByQuestion[question.id];
     delete state.questionMemoriesByQuestion[question.id];
-    return initializeQuestionMemory(question);
+    await initializeQuestionMemory(question);
   }
-  return memory || null;
 }
 
 function showBoardStatusPill(text, duration = 1200) {
@@ -3430,12 +3433,19 @@ function scheduleHandwritingRecognition(reason) {
     return;
   }
   if (state.handwritingRequestInFlight) {
+    const active = state.handwritingActiveRequest;
+    const boardVersion = getBoardVersion(question);
+    if (
+      active?.sessionId === state.answerSessionId &&
+      active?.questionId === question?.id &&
+      Number(active?.boardVersion) === boardVersion
+    ) return;
     state.handwritingQueuedReason = reason;
     state.handwritingQueuedMeta = {
       sessionId: state.answerSessionId,
       interactionSessionId: state.lectureSessionId,
       questionId: question?.id || "",
-      boardVersion: getBoardVersion(question)
+      boardVersion
     };
     console.log("[handwriting] queued while another request is in flight", {
       reason,
@@ -3615,7 +3625,6 @@ async function runHandwritingRecognition(reason) {
   const boardVersion = requestMeta.boardVersion;
   beginHandwritingRequest(requestMeta);
   const recognitionInputSnapshot = getStudentInputSnapshot();
-  const responseToken = getInteractionToken();
   let shouldRetryTransiently = false;
   saveCurrentPage();
   dom.recognitionPill.textContent = "板书识别中";
@@ -3627,7 +3636,7 @@ async function runHandwritingRecognition(reason) {
     );
     if (
       !isCurrentHandwritingRequest(requestMeta) ||
-      !isCurrentInteraction(responseToken)
+      state.teachSessionPaused
     ) {
       rememberHandwritingRequestStatus(requestId, "stale");
       return;
@@ -3788,7 +3797,7 @@ async function runHandwritingRecognition(reason) {
   } catch (error) {
     if (
       !isCurrentHandwritingRequest(requestMeta) ||
-      !isCurrentInteraction(responseToken)
+      state.teachSessionPaused
     ) {
       rememberHandwritingRequestStatus(requestId, "stale");
       return;
@@ -3826,6 +3835,7 @@ async function runHandwritingRecognition(reason) {
       queuedMeta?.interactionSessionId === state.lectureSessionId &&
       queuedMeta?.questionId === currentPageQuestion()?.id &&
       queuedMeta?.boardVersion === getBoardVersion(currentPageQuestion()) &&
+      queuedMeta.boardVersion !== requestMeta.boardVersion &&
       currentPageQuestion() &&
       hasCurrentBoardInk(currentPageQuestion())
     ) {
@@ -3860,12 +3870,8 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     error.stage = "request-identity";
     throw error;
   }
-  // Freeze the visible blackboard as one image. It contains the question image
-  // and the student's original strokes; no client OCR or thresholding is used.
-  const boardImage = await createCurrentBoardSnapshot({
-    maxSide: HANDWRITING_IMAGE_MAX_SIDE,
-    quality: HANDWRITING_IMAGE_JPEG_QUALITY
-  });
+  // Send the transparent student-stroke layer only. The imported question is
+  // deliberately excluded from OCR and from the handwriting image fallback.
   const studentStrokeImage = await createCurrentStudentStrokeSnapshot({
     maxSide: HANDWRITING_IMAGE_MAX_SIDE,
     quality: HANDWRITING_IMAGE_JPEG_QUALITY
@@ -3880,7 +3886,6 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     reason: String(reason || ""),
     canvasWidth: Number(dom.canvas.width || 0),
     canvasHeight: Number(dom.canvas.height || 0),
-    boardImageBytes: String(boardImage || "").length,
     studentStrokeImageBytes: String(studentStrokeImage || "").length,
     capturedAt: new Date().toISOString()
   };
@@ -3898,7 +3903,6 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
         requestId,
         memoryId: requestMeta.memoryId,
         questionMemory,
-        boardImage,
         studentStrokeImage,
         reason,
         boardIdleSeconds,
@@ -6335,14 +6339,17 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
   // Keep the question-type signal for diagnostics, but apply the readiness
   // barrier below to every question rather than only choices.
   const isChoiceQuestion = /选择题|判断题|单选|多选|下列.*(?:正确|错误)|正确的是|不正确的是|选项|结论\s*[一二三四IVX]/.test(questionContext);
-  // Normal teaching/checking reuses the frozen standard answer. Silence is a
-  // separate liveness path: it must produce a concrete first step at 60s even
-  // when Question Memory is still loading or temporarily unavailable. The
-  // server is already instructed to avoid final-answer claims without that
-  // reference, so do not hold the silence timer behind the memory request.
+  // Every guide, including silence escalation, must use the answer/steps
+  // generated from the question image on entry. Otherwise the model is asked
+  // to guide without its trusted reference and tends to stall or repeat.
   let memory = getQuestionMemory(question);
-  const silenceMemoryPending = isSilenceGuide && !memory?.ready;
-  if (!memory?.ready && !isSilenceGuide) {
+  if (!memory?.ready) {
+    if (["active_help", "next_step", "check", "answer_to_lian_question", "jump"].includes(eventType)) {
+      // A fresh, explicit student request is an intentional recovery action;
+      // allow it to start another bounded memory retry cycle after an earlier
+      // cycle was exhausted.
+      state.questionMemoryRetryCountByQuestion[question.id] = 0;
+    }
     memory = await waitForEnteredQuestionMemory(question);
   }
   const hasKeySteps = Boolean(
@@ -6352,30 +6359,25 @@ async function requestSmartGuide(eventType, latestStudentSpeech = "", options = 
     Array.isArray(memory.verificationChecks) &&
     memory.verificationChecks.some((step) => String(step || "").trim())
   );
-  if (!isSilenceGuide && (!memory?.ready || !memory.canonicalAnswer || !hasKeySteps)) {
+  if (!memory?.ready || !memory.canonicalAnswer || !hasKeySteps) {
     const retryCount = Number(state.questionMemoryRetryCountByQuestion[question.id] || 0);
     console.info("[guide] skipped before fixed answer is ready", {
       eventType,
       questionId: question.id,
       isChoiceQuestion,
       hasKeySteps,
-      memoryStatus: memory?.status || "missing"
+      memoryStatus: memory?.status || "missing",
+      memoryReason: memory?.reason || ""
     });
-    // Keep the legacy wording “正在准备这道选择题的标准答案” documented for
-    // diagnostics; the visible status below is question-type agnostic.
+    clearTimeout(state.silenceTimer);
+    state.silenceTimer = null;
+    state.silenceGuidePending = false;
+    state.awaitingSilenceFollowup = false;
+    state.silenceGuidanceExhausted = true;
     dom.lianState.textContent = retryCount < 2
-      ? "正在识别这道题的标准答案，识别完成后开始引导"
-      : "标准答案暂时不可用，请点击发送重新识别";
+      ? "正在生成这道题的标准答案与步骤，完成后继续引导"
+      : "题目答案与步骤暂不可用，恋恋先不猜答案；点击发送可重新尝试";
     return false;
-  }
-  if (silenceMemoryPending) {
-    console.info("[guide] silence proceeds without ready question memory", {
-      eventType,
-      questionId: question.id,
-      silenceStage: Number(options.silenceStage || state.silenceGuideStage || 0),
-      memoryStatus: memory?.status || "loading"
-    });
-    dom.lianState.textContent = "沉默已达到 60 秒，正在生成具体下一步";
   }
   const hasNewStudentSpeech = Boolean(String(latestStudentSpeech || "").trim());
   const guideFailureStillCooling =
@@ -6623,7 +6625,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       .filter(Boolean)
       .filter((step) => {
         const normalizedStep = step.replace(/\s+/g, "");
-        return !givenConditions.some((condition) => normalizedStep === condition || normalizedStep.includes(condition) || condition.includes(normalizedStep));
+        return !givenConditions.some((condition) => normalizedStep === condition);
       })
     : [];
   const trustedProblemText = memory?.ready && memory.problemText
@@ -6645,6 +6647,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
         // promoted into completedSteps by a single handwriting response.
         detectedWriting: String(state.latestHandwritingResult.detectedWriting || ""),
         recognizedText: String(state.latestHandwritingResult.recognizedText || ""),
+        handwritingRecognitionMode: String(state.latestHandwritingResult.handwritingRecognitionMode || ""),
         mathExpression: String(state.latestHandwritingResult.mathExpression || ""),
         boardText: String(state.latestHandwritingResult.boardText || ""),
         writingState: String(state.latestHandwritingResult.writingState || ""),
@@ -6682,16 +6685,28 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
   });
   let response;
   try {
-    // Give the guide the same frozen visual state as handwriting recognition:
-    // one current blackboard image containing the question and raw strokes.
-    const boardImage = await createCurrentBoardSnapshot({
-      maxSide: GUIDE_IMAGE_MAX_SIDE,
-      quality: GUIDE_IMAGE_JPEG_QUALITY
-    });
-    const studentStrokeImage = await createCurrentStudentStrokeSnapshot({
-      maxSide: GUIDE_IMAGE_MAX_SIDE,
-      quality: GUIDE_IMAGE_JPEG_QUALITY
-    });
+    const latestBoardResultIsCurrent = Boolean(
+      hasCurrentBoardInk(question) &&
+      state.latestHandwritingResult &&
+      state.lastHandwritingRecognizedAt >= (state.lastBoardWriteAt || 0)
+    );
+    const latestBoardResult = latestBoardResultIsCurrent ? state.latestHandwritingResult : null;
+    const handwritingRecognitionMode = latestBoardResultIsCurrent
+      ? String(latestBoardResult?.handwritingRecognitionMode || "")
+      : "";
+    const useStudentStrokeImageFallback = Boolean(
+      latestBoardResultIsCurrent &&
+      handwritingRecognitionMode === "student-stroke-image-fallback"
+    );
+    // The guide receives only the completed board judgment. Raw OCR stays on
+    // the server; only an OCR failure sends the isolated stroke image.
+    const boardImage = "";
+    const studentStrokeImage = useStudentStrokeImageFallback
+      ? await createCurrentStudentStrokeSnapshot({
+          maxSide: GUIDE_IMAGE_MAX_SIDE,
+          quality: GUIDE_IMAGE_JPEG_QUALITY
+        })
+      : "";
     if (!markGuideRequestActive()) {
       const staleError = new Error("stale guide request");
       staleError.name = "AbortError";
@@ -6705,7 +6720,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       questionImageChars: 0,
       boardImageChars: boardImage.length,
       studentStrokeImageChars: studentStrokeImage.length,
-      totalImageChars: boardImage.length + studentStrokeImage.length
+      recognizedTextChars: String(latestBoardResult?.recognizedText || "").length,
+      recognitionMode: handwritingRecognitionMode || "no-current-recognition",
+      totalImageChars: studentStrokeImage.length
     });
     while (true) {
       requestAttempt += 1;
@@ -6727,10 +6744,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       knowledgePoints: question.knowledgePoints || [],
       boardImage,
       studentStrokeImage,
+      handwritingRecognitionMode,
       hasBoardInk: Boolean(hasCurrentBoardInk(question)),
-      // This is the structured result of the latest completed multimodal
-      // recognition, not client OCR. It lets the guide advance past steps
-      // already confirmed on the board instead of asking for them again.
+      // Only the completed server-side board judgment is available here.
       // A cleared/empty board invalidates any older recognition snapshot. Do
       // not let a previous answer make the model claim the student wrote it.
       recognizedBoardProgress: hasCurrentBoardInk(question) ? recognizedBoardProgress : null,
@@ -6738,8 +6754,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
       resolvedConcepts: state.resolvedConceptsByQuestion[question.id] || [],
       recentGuideHistory: getRecentGuideHistory(question.id),
       previousGuideQuestion: state.pendingLianQuestion?.text || "",
-      // The server/model reads progress from the current blackboard image;
-      // never send a step reconstructed from an older handwriting result.
+      // Never let a result from an older board version advance the guide.
       silenceContextStep: "",
       verifiedGuideSteps: trustedSteps,
       // Reuse the frozen Question Memory created when this question was

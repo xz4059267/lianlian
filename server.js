@@ -29,8 +29,27 @@ const QWEN_API_KEY =
 const QWEN_BASE_URL = (
   process.env.QWEN_BASE_URL ||
   process.env.DASHSCOPE_BASE_URL ||
-  "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  "https://maas.qianwenaiapi.com/compatible-mode/v1"
 ).replace(/\/+$/, "");
+// Kimi-K3 on Alibaba Model Studio uses a workspace/region-specific compatible
+// endpoint. Reuse the existing DashScope key only when a dedicated Kimi key is
+// not supplied; never guess the workspace URL from the Qwen endpoint.
+const KIMI_API_KEY = process.env.KIMI_API_KEY || QWEN_API_KEY;
+const KIMI_BASE_URL = String(process.env.KIMI_BASE_URL || "").trim().replace(/\/+$/, "");
+const KIMI_VERIFY_MODEL = process.env.KIMI_VERIFY_MODEL || "kimi-k3";
+// Answer memory is prepared before the student starts. Do not impose the old
+// 25-second product timeout on visual problem solving; leave room for Qwen to
+// inspect the image and produce a complete solution within Vercel's 300s cap.
+// The remaining time is reserved for independent Kimi verification and reply.
+const ANSWER_KEY_SOLVER_TIMEOUT_MS = 270_000;
+// Leave a small function-runtime margin while allowing a slow independent
+// verifier to finish after the visual solver returns.
+const ANSWER_KEY_TOTAL_TIMEOUT_MS = 285_000;
+const KIMI_VERIFY_TIMEOUT_MS = Math.max(
+  45000,
+  Math.min(60000, Number(process.env.KIMI_VERIFY_TIMEOUT_MS || 45000))
+);
+const KIMI_IMAGE_LINK_TTL_MS = 5 * 60 * 1000;
 const QWEN_VL_MODEL =
   process.env.QWEN_VL_MODEL ||
   process.env.Qwen_vl_model ||
@@ -42,6 +61,9 @@ const QWEN_VL_MODEL =
   "qwen3-omni-flash-2025-09-15";
 const QWEN_GUIDE_MODEL = process.env.QWEN_GUIDE_MODEL || QWEN_VL_MODEL;
 const QWEN_HANDWRITING_MODEL = process.env.QWEN_HANDWRITING_MODEL || QWEN_VL_MODEL;
+function getGuideReasoningEffort(model) {
+  return /qwen3\.8-omni-flash/i.test(String(model || "")) ? "low" : "";
+}
 function parseQwenModelList(value) {
   return [...new Set(String(value || "")
     .split(/[\s,;]+/)
@@ -91,15 +113,15 @@ const QWEN_TOTAL_TIMEOUT_MS = Math.max(
 // Guidance is a short interactive turn. It should not consume the longer
 // handwriting/answer budget while the student is waiting for a response.
 const QWEN_GUIDE_TOTAL_TIMEOUT_MS = Math.max(
-  10000,
-  Math.min(35000, Number(process.env.QWEN_GUIDE_TIMEOUT_MS || 25000))
+  8000,
+  Math.min(20000, Number(process.env.QWEN_GUIDE_TIMEOUT_MS || 15000))
 );
 // Handwriting is an observation request, not a structured answer request.
 // Keep its wall-clock budget separate from answer/guidance calls so one slow
 // board observation cannot hold the lecture state indefinitely.
 const QWEN_HANDWRITING_TOTAL_TIMEOUT_MS = Math.max(
-  12000,
-  Math.min(35000, Number(process.env.QWEN_HANDWRITING_TIMEOUT_MS || 30000))
+  240000,
+  Math.min(260000, Number(process.env.QWEN_HANDWRITING_TIMEOUT_MS || 240000))
 );
 // Keep failover bounded by limiting concurrent calls, not the candidate list.
 // When a model is out of quota, the next candidate must be able to enter the
@@ -209,6 +231,12 @@ const ALIYUN_OCR_ENABLED = !["0", "false", "off"].includes(
     (ALIYUN_OCR_APPCODE || (ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET) ? "1" : "0")
   ).toLowerCase()
 );
+const ALIYUN_HANDWRITING_OCR_ENABLED = !["0", "false", "off"].includes(
+  String(
+    process.env.ALIYUN_HANDWRITING_OCR_ENABLED ||
+    (ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET ? "1" : "0")
+  ).toLowerCase()
+);
 // Use the official RPC OCR by default. Marketplace AppCode OCR is opt-in
 // because an expired or unsubscribed AppCode can add a 403 before the official
 // endpoint is reached.
@@ -245,6 +273,10 @@ const OCR_CACHE_LIMIT = Number(process.env.OCR_CACHE_LIMIT || 32);
 const SEGMENT_CACHE_LIMIT = Number(process.env.SEGMENT_CACHE_LIMIT || 32);
 const ANSWER_KEY_CACHE_LIMIT = Number(process.env.ANSWER_KEY_CACHE_LIMIT || 64);
 const ANSWER_KEY_MIN_CONFIDENCE = Number(process.env.ANSWER_KEY_MIN_CONFIDENCE || 0.86);
+const ANSWER_KEY_DERIVED_MIN_CONFIDENCE = Math.max(
+  0.65,
+  Math.min(ANSWER_KEY_MIN_CONFIDENCE, Number(process.env.ANSWER_KEY_DERIVED_MIN_CONFIDENCE || 0.72))
+);
 const SEGMENT_FAST_MODE = !["0", "false", "off"].includes(String(process.env.SEGMENT_FAST_MODE || "1").toLowerCase());
 const SEGMENT_LLM_TIMEOUT_MS = Number(process.env.SEGMENT_LLM_TIMEOUT_MS || 15000);
 const ocrCache = new Map();
@@ -410,34 +442,24 @@ const LECTURE_COMPLETION_RULES = [
 ].join("\n");
 
 const HANDWRITING_PROMPT = [
-  "你是初中数学黑板板书的异步观察与核验器。你要在一次请求里同时识别当前板书，并把可见的最终答案和步骤与服务端提供的可信标准答案进行对比。",
-  "你会看到当前黑板区域的完整截图，截图同时包含当前题目图片和学生的原始笔迹。截图是所有视觉事实的唯一来源；服务端提供的 verifiedAnswerReference 是唯一的标准答案依据。不要依赖 OCR、前端整理文本或任何旧的板书识别结果。",
-  "当前黑板上的学生原始笔迹优先级高于语音。studentSpeechTranscript 是本题从开始到现在的完整语音记录，latestStudentSpeech 只是最新片段；语音只能帮助理解学生正在说明哪一行或哪个意图，不能覆盖、改写或补充截图中没有出现的数学步骤和答案；当语音与笔迹冲突时，以笔迹为准并返回 unclear 或 ask_for_board。",
-  "题目图片中的印刷文字、红笔/蓝笔批注、勾叉、圈画、旧答案、原有手写内容和非本次书写痕迹都不是当前学生笔迹，不能当作学生本次答案或步骤；只判断导入后新增的黑板笔迹。学生在导入图片上方、图片内部或图片旁边新增的笔迹都属于本次书写。",
-  "识别时先区分图层：先看‘导入后新增的学生笔迹隔离层’确认本次书写，再用合成黑板截图确定这些笔迹对应的位置和题目上下文。若没有隔离层，则只能把合成图中明显位于导入图片之外、且符合黑板书写笔迹的新增内容作为候选；无法区分时返回 unclear，不得猜测。首页导入图片里的 A/B/C/D、I/II、红笔标记一律忽略；如果这些字母出现在新增笔迹隔离层中，才记录为学生写出的选项/结论。",
-  "不要因为题图覆盖在左上角而漏读黑板其余区域；必须扫描整张当前截图的所有原始笔迹，尤其是黑板中央、右侧和底部的等式、赋值、选项字母。只要这些笔迹清晰可见，就必须在结构化结果中忠实转写，不能返回与当前截图无关的旧引导。",
-  "你的职责是：忠实转写可见笔迹；判断当前书写状态；列出已经明确完成且可见的步骤；定位明确错误；当最终答案和关键步骤都可见时，直接返回与标准答案的核验结果。",
-  "禁止根据学生零散板书补出未写出的步骤或最终答案。标准答案只用于核对已经写出的最终答案和可见步骤，不能替学生补写答案。",
-  "detectedWriting 和 mathExpression 必须忠实对应当前截图；completedSteps 只能包含截图中已经出现并可辨认的步骤，不能补齐学生没写的内容。",
-  "判断某个可见步骤是否正确时，先读取当前截图中的题目条件，再与学生当前笔迹比较；如果截图不清楚或无法可靠核算，返回 unclear，不能猜测。",
-  "writingState=in_progress 表示学生显然还在写或只完成部分步骤；只有输入显示长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
-  "只有能指出具体 errorLocation，并能在 errorEvidence 中说明截图中可见数字、符号、运算或结论的明确冲突时，才返回 calculationStatus=wrong。",
-  "可见步骤与当前截图中的题意和 verifiedAnswerReference 一致时返回 correct，但这只说明已经写出的步骤成立；最终答案必须另行填写 answerVerificationStatus。",
-  "writingState=complete 只有在当前截图明确出现最终结论、答案/结果/所以/解得等收束标记，或最后一行是独立且完整的最终答案时才允许；仅有题目关系式、代入式、过程式或一个正确关键步骤时，必须返回 in_progress 或 stalled。boardComplete=true 仅表示存在可核验关键步骤，绝不能作为最终答案信号。",
-  "不要生成完整解题过程或替学生补写未出现的步骤。guidance 只在 nextAction=continue_guidance 或 ask_for_board 时给出一句贴着当前板书的具体引导；nextAction=verify_answer 或 finished 时 guidance 必须为空。",
-  "额外判断板书是否留下了至少一个可核验的正确关键步骤。boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显数学错误。",
-  "不要求板书写完整推导，不要求写最终答案、单位或覆盖全部小问；只要一个可见关键关系或计算步骤与 Question Memory 一致，就可以作为可核验步骤。",
-  "只有孤立的最终答案、与题目无关的字迹、无法辨认的涂写或明显错误步骤不算正确关键步骤；此时 boardComplete=false，并在 missingBoardContent 中简短说明需要补写或修正哪一个关键步骤。",
-  "如果板书最后一行或最后一组等式已经出现明确的最终赋值结果，即使前面仍保留完整推导式，也必须把这些可见结果原样写入 finalAnswer；不要求学生额外写‘答案是’、‘所以’等文字。finalAnswer 只能来自当前截图中确实可见的最后结果，不能根据题目自行补算。",
-  "当 finalAnswer 已经明确可见且板书至少有一个关键步骤时，必须依据 verifiedAnswerReference 返回 answerVerificationStatus=correct 或 wrong，并将 answerFeedback 或 answerHint 填好；当只看到了答案但没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance；最终答案和关键步骤都明确且核验正确时返回 finished。",
-  "当 finalAnswer 和关键步骤都可见时，禁止返回 continue_guidance 或 ask_for_board，禁止以任何形式询问学生是否正确或要求学生确认（包括‘对不对/正确吗/是不是/算对了吗/有没有错/你同意吗/你觉得呢/要不要检查’等同义表达，以及反问、选择问、确认式追问），必须直接完成核验；如果不正确，answerHint 必须具体指出错误的可见行、数字、符号、运算或选项，并同时填写 errorLocation 与 errorEvidence。",
-  "选择题特别规则：如果当前截图已写出 A/B/C/D 选项或 I/II 等结论判定，并且至少有一条与题目相关的有效计算、代入、消元或反例步骤，必须将该步骤计入 completedSteps、boardComplete=true、nextAction=finished，并直接依据固定标准答案完成 answerVerificationStatus；不得因为没有写‘答案是’三个字而继续引导。",
-  "当前截图没有 finalAnswer 时，只能继续引导当前关系式、代入、消元、计算或推理步骤；禁止出现‘请将最终答案或关键结论写在黑板上，以便核验’以及任何要求提前写最终答案/关键结论的同义话术。只有截图已明确出现 finalAnswer 后，才允许进入最终答案核验。",
-  "如果 calculationStatus=correct，completedSteps 中已有的内容只能视为已完成，guidance 必须直接给 verifiedGuideSteps 中尚未完成的下一步，禁止再让学生重写、复述或确认已完成步骤；如果 calculationStatus=wrong，必须在 guidance 或 answerHint 中同时说清‘错在何处’和‘正确应为’的具体内容，不能只说‘再检查一下’。",
-  "guidance 必须说明当前下一步的具体关系式、代入或计算方向，不能只说‘继续写式子’或‘再想一想’；如果 nextAction=verify_answer 或 finished，guidance 必须为空字符串。",
-  "finalAnswer、answer 或 studentAnswer 不能凭空填写；只有当前截图的可见笔迹明确写出最终答案或收束结论时才填写，否则必须为空字符串。题目关系式、代入式等过程式即使可以算出某个数，也不能作为 finalAnswer。多个可见最终赋值可以一起返回，例如 y=-1，x=1。",
-  "如果看不清或无法核算，calculationStatus=\"unclear\"，answerVerificationStatus=\"unclear\"；如果没有可见最终答案，answerVerificationStatus=\"not_present\"；如果与题目无关，calculationStatus=\"not_relevant\"。",
-  "如果只有语音而当前黑板没有学生关键笔迹，禁止核验答案，返回 answerVerificationStatus=\"not_present\"、nextAction=ask_for_board，并只提醒学生把当前关键关系式或计算步骤写到黑板上；不要要求提前写最终答案，最终答案必须由后续板书识别确认。",
+  "你是初中数学板书的异步核验器。正常模式下，aliyunHandwritingTranscription 是学生本次板书的唯一文字证据；只有进入 student-stroke-image-fallback 模式时，才可读取新增学生笔迹隔离层图片。不要假设收到题目图片或合成黑板截图。",
+  "verifiedAnswerReference 是唯一标准答案依据。studentSpeechTranscript 是本题完整语音记录，latestStudentSpeech 是最新片段；语音只能帮助理解表达，不能覆盖、改写或补充板书证据中没有出现的步骤和答案。",
+  "OCR 转写不完整、关键符号含混或无法可靠对应题目时返回 unclear，不得猜测。只核验学生本次新增的板书，不要把题目原文、批注或旧答案误认成学生作答。",
+  "你的职责是忠实转写板书证据、列出明确完成的步骤、定位明确错误，并将已写出的步骤和答案与 verifiedAnswerReference 对比。禁止补出未写步骤或最终答案。",
+  "detectedWriting 和 mathExpression 必须忠实对应输入证据；completedSteps 只能包含明确出现且可辨认的步骤。无法可靠核算时返回 unclear。",
+  "writingState=in_progress 表示学生只完成部分步骤；只有长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
+  "只有能指出具体 errorLocation，并在 errorEvidence 中说明转写或笔迹证据里的明确数字、符号、运算或结论冲突时，才返回 calculationStatus=wrong。",
+  "可见步骤与题意和 verifiedAnswerReference 一致时返回 correct，但这只说明已写步骤成立；最终答案必须另行填写 answerVerificationStatus。",
+  "writingState=complete 仅在输入明确出现最终结论或完整最终答案时允许；只有关系式、代入式、过程式或一个正确关键步骤时必须返回 in_progress 或 stalled。boardComplete=true 只表示存在可核验关键步骤，不代表已写最终答案。",
+  "不要生成完整解题过程或替学生补写步骤。guidance 只在 nextAction=continue_guidance 或 ask_for_board 时给出一句贴着当前板书的具体引导；nextAction=verify_answer 或 finished 时 guidance 必须为空。",
+  "boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显错误。孤立最终答案或无法辨认内容不算正确关键步骤。",
+  "finalAnswer 只能来自输入证据中明确出现的最终结果，不能根据题目自行补算。多个明确最终赋值可以一起返回，例如 y=-1，x=1。",
+  "当 finalAnswer 明确且至少有一个关键步骤时，必须依据 verifiedAnswerReference 完成核验；错误时 answerHint 要指出具体错误，并填写 errorLocation 与 errorEvidence。仅有答案没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance。",
+  "当 finalAnswer 与关键步骤都明确时，禁止继续询问学生是否正确；必须直接核验。选择题如果已写出选项/结论且至少有一条有效计算、代入、消元或反例步骤，直接依据标准答案核验。",
+  "当前没有 finalAnswer 时，只能引导当前关系式、代入、消元、计算或推理步骤；不得要求提前写最终答案。",
+  "如果 calculationStatus=correct，已完成步骤不得要求重写，guidance 应推进到 verifiedGuideSteps 中尚未完成的下一步；如果 calculationStatus=wrong，必须说清错处和正确改法。",
+  "guidance 必须说明具体下一步，不能泛泛地说继续或再想一想。",
+  "如果输入证据中没有学生关键笔迹，返回 answerVerificationStatus=\"not_present\"、nextAction=ask_for_board，并只提醒学生写下当前关键关系式或计算步骤。",
   "输出必须严格遵守 JSON schema。"
 ].join("\n");
 
@@ -835,8 +857,8 @@ const handwritingAuditSchema = {
 
 const HANDWRITING_AUDIT_PROMPT = [
   "你是初中数学板书观察结果的安全审校员，不负责重新解题或生成教学反馈。",
-  "你会看到当前黑板区域完整截图，其中同时包含首页导入题目图片和导入后新增的学生笔迹；有一张‘导入后新增的学生笔迹隔离层’时，它是确认本次书写的优先证据。首页导入图片原本包含的印刷、批注或手写内容都不是本次笔迹。不要采用 OCR、前端整理文本或任何旧识别结果。",
-  "请独立检查截图中的题目与导入后新增的当前笔迹，不要补写学生没有写出的步骤，也不要根据截图外的历史内容推断。",
+  "审校证据由识别模式决定：OCR 模式只使用服务端提供的阿里云手写 OCR 转写；图片兜底模式只使用新增学生笔迹隔离层图片。不要假设有题目图片或合成黑板截图。",
+  "请独立检查当前板书证据与服务端可信标准答案，不要补写学生没有写出的步骤，也不要根据历史内容推断。",
   "completedSteps 只能保留板书上明确可见且已经完成的步骤。",
   "如果当前截图不能同时支持题意和笔迹的判断，必须返回 unclear。",
   "如果判断为 wrong，必须同时给出具体 errorLocation 和来自当前截图的 errorEvidence，否则降级为 unclear 或 incomplete。",
@@ -1141,8 +1163,81 @@ function decodeDataImage(dataUrl) {
   };
   return {
     buffer: Buffer.from(match[2], "base64"),
-    ext: extByMime[match[1].toLowerCase()] || ".png"
+    ext: extByMime[match[1].toLowerCase()] || ".png",
+    mime: match[1].toLowerCase()
   };
+}
+
+async function withTemporaryKimiImageUrl(questionImage, operation, options = {}) {
+  const imageUrl = String(questionImage || "").trim();
+  if (/^https:\/\//i.test(imageUrl)) return operation(imageUrl);
+
+  const image = decodeDataImage(imageUrl);
+  if (!image?.buffer?.length) {
+    const error = new Error("题目图片格式无效，无法提供给 Kimi 独立验算");
+    error.statusCode = 400;
+    error.code = "invalid_kimi_question_image";
+    throw error;
+  }
+  if (image.buffer.length > 10 * 1024 * 1024) {
+    const error = new Error("题目图片超过 Kimi 支持的 10 MB 限制，请压缩图片后重试");
+    error.statusCode = 413;
+    error.code = "kimi_question_image_too_large";
+    throw error;
+  }
+  if (!process.env.BLOB_STORE_ID && !process.env.BLOB_READ_WRITE_TOKEN) {
+    const error = new Error("未连接 Vercel Blob 私有存储，暂时无法生成题目图片的安全链接");
+    error.statusCode = 503;
+    error.code = "missing_private_blob_store";
+    throw error;
+  }
+
+  const blobSdk = options.blobSdk || await import("@vercel/blob");
+  const pathname = `answer-key-temp/${Date.now()}-${crypto.randomUUID()}${image.ext}`;
+  let uploadedPathname = "";
+  try {
+    const blob = await blobSdk.put(pathname, image.buffer, {
+      access: "private",
+      addRandomSuffix: false,
+      allowOverwrite: false,
+      contentType: image.mime,
+      cacheControlMaxAge: 60,
+      abortSignal: options.signal || undefined
+    });
+    uploadedPathname = blob.pathname || pathname;
+
+    const validUntil = Date.now() + KIMI_IMAGE_LINK_TTL_MS;
+    const signedToken = await blobSdk.issueSignedToken({
+      pathname: uploadedPathname,
+      operations: ["get"],
+      validUntil,
+      abortSignal: options.signal || undefined
+    });
+    const { presignedUrl } = await blobSdk.presignUrl(signedToken, {
+      pathname: uploadedPathname,
+      operation: "get",
+      access: "private",
+      validUntil,
+      useCache: false
+    });
+    if (!presignedUrl) {
+      const error = new Error("Vercel Blob 没有返回题目图片签名链接");
+      error.statusCode = 502;
+      error.code = "private_blob_signed_url_missing";
+      throw error;
+    }
+    return await operation(presignedUrl);
+  } finally {
+    if (uploadedPathname) {
+      try {
+        await blobSdk.del(uploadedPathname);
+      } catch (error) {
+        console.warn("[answer-key] temporary private image cleanup failed", {
+          code: error?.code || "private_blob_delete_failed"
+        });
+      }
+    }
+  }
 }
 
 function runCommand(file, args, options = {}) {
@@ -1674,6 +1769,97 @@ function parseAliyunOfficialPayload(raw) {
     }
   }
   return payload;
+}
+
+function extractAliyunHandwritingContent(payload) {
+  const parsed = parseAliyunOfficialPayload(payload);
+  const data = parsed?.Data || parsed?.data || parsed?.result || {};
+  let content = data?.Content ?? data?.content ?? parsed?.Content ?? parsed?.content ?? "";
+  if (typeof content !== "string") return "";
+  content = content.trim();
+  if (content.startsWith('"') && content.endsWith('"')) {
+    try {
+      content = JSON.parse(content);
+    } catch {
+      // Keep the original OCR text if it is not a JSON-encoded string.
+    }
+  }
+  return String(content || "").trim();
+}
+
+async function recognizeAliyunHandwriting(imageDataUrl, signal = null) {
+  if (
+    !ALIYUN_HANDWRITING_OCR_ENABLED ||
+    !ALIYUN_OCR_ACCESS_KEY_ID ||
+    !ALIYUN_OCR_ACCESS_KEY_SECRET
+  ) return null;
+
+  const image = decodeDataImage(imageDataUrl);
+  if (!image?.buffer?.length) {
+    throw Object.assign(new Error("Aliyun handwriting OCR received an invalid image"), {
+      code: "aliyun_handwriting_image_invalid"
+    });
+  }
+
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const nonce = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+  const query = {
+    Action: "RecognizeAllText",
+    Version: "2021-07-07",
+    RegionId: ALIYUN_OCR_REGION_ID,
+    Type: "HandWriting",
+    Format: "JSON",
+    AccessKeyId: ALIYUN_OCR_ACCESS_KEY_ID,
+    SignatureMethod: "HMAC-SHA1",
+    SignatureVersion: "1.0",
+    SignatureNonce: nonce,
+    Timestamp: timestamp
+  };
+  if (ALIYUN_OCR_SECURITY_TOKEN) query.SecurityToken = ALIYUN_OCR_SECURITY_TOKEN;
+  const url = buildAliyunRpcSignedUrl(
+    ALIYUN_OCR_OFFICIAL_ENDPOINT,
+    query,
+    ALIYUN_OCR_ACCESS_KEY_SECRET
+  );
+  const controller = new AbortController();
+  const timeoutMs = Number.isFinite(ALIYUN_OCR_TIMEOUT_MS)
+    ? Math.max(3000, Math.min(12000, ALIYUN_OCR_TIMEOUT_MS))
+    : 12000;
+  const timer = setTimeout(() => controller.abort(new Error("Aliyun handwriting OCR timed out")), timeoutMs);
+  const abortFromParent = () => controller.abort(signal?.reason || createAbortError("客户端已断开", "qwen_client_disconnected"));
+  if (signal?.aborted) abortFromParent();
+  else signal?.addEventListener("abort", abortFromParent, { once: true });
+
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: image.buffer,
+      signal: controller.signal
+    });
+    const raw = await response.text();
+    const payload = parseAliyunOfficialPayload(raw);
+    const serviceCode = payload?.Code || payload?.code || payload?.Error?.Code || payload?.error_code;
+    if (!response.ok || serviceCode) {
+      const message = payload?.Message || payload?.message || payload?.error_msg || raw.slice(0, 180) || response.statusText;
+      throw Object.assign(new Error(`Aliyun handwriting OCR ${response.status}${serviceCode ? ` ${serviceCode}` : ""}: ${message}`), {
+        code: "aliyun_handwriting_ocr_failed",
+        statusCode: response.status || 502
+      });
+    }
+
+    const text = extractAliyunHandwritingContent(payload);
+    console.info("[handwriting-ocr] Aliyun RecognizeAllText completed", {
+      elapsed_ms: Date.now() - startedAt,
+      text_length: text.length,
+      request_id: payload?.RequestId || payload?.requestId || ""
+    });
+    return { text, provider: "aliyun-recognize-all-text-handwriting" };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abortFromParent);
+  }
 }
 
 let aliyunNlsTokenCache = {
@@ -2611,6 +2797,38 @@ function parseModelJson(text) {
   }
 }
 
+function summarizeAnswerKeyModelOutput(parsed, responseData, rawText) {
+  const message = responseData?.choices?.[0]?.message;
+  const isRecord = Boolean(parsed && typeof parsed === "object" && !Array.isArray(parsed));
+  const safeKeys = isRecord
+    ? Object.keys(parsed).slice(0, 40).map((key) => /^[A-Za-z_][A-Za-z0-9_]{0,47}$/.test(key) ? key : "nonstandard_key")
+    : [];
+  const valueState = (value) => ({
+    type: Array.isArray(value) ? "array" : value === null ? "null" : typeof value,
+    present: value !== undefined && value !== null && value !== "",
+    length: Array.isArray(value) ? value.length : undefined
+  });
+  return {
+    model: responseData?.model || "",
+    finishReason: String(responseData?.choices?.[0]?.finish_reason || ""),
+    refusal: Boolean(message?.refusal),
+    contentType: Array.isArray(message?.content) ? "array" : typeof message?.content,
+    textLength: String(rawText || "").length,
+    parsedType: Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed,
+    topLevelKeys: safeKeys,
+    fields: {
+      status: valueState(parsed?.status),
+      canonicalAnswer: valueState(parsed?.canonicalAnswer),
+      finalAnswer: valueState(parsed?.finalAnswer),
+      confidence: valueState(parsed?.confidence),
+      solutionSteps: valueState(parsed?.solutionSteps),
+      solutionOutline: valueState(parsed?.solutionOutline),
+      verificationChecks: valueState(parsed?.verificationChecks),
+      verification: valueState(parsed?.verification)
+    }
+  };
+}
+
 function formatOcrBlocksForPrompt(blocks, limit = 180) {
   const visibleBlocks = blocks.slice(0, limit).map((block, index) => ({
     index,
@@ -2802,11 +3020,15 @@ async function requestQwenChatCompletionOnce(
   useJsonFormat = true,
   timeoutMs = QWEN_REQUEST_TIMEOUT_MS,
   externalSignal = null,
-  diagnostics = {}
+  diagnostics = {},
+  providerConfig = {}
 ) {
   const controller = new AbortController();
   const boundedTimeoutMs = Math.max(1000, Number(timeoutMs) || QWEN_REQUEST_TIMEOUT_MS);
   const model = String(payload?.model || "");
+  const providerName = String(providerConfig.providerName || "Qwen");
+  const apiKey = String(providerConfig.apiKey || QWEN_API_KEY);
+  const baseUrl = String(providerConfig.baseUrl || QWEN_BASE_URL).replace(/\/+$/, "");
   const trace = diagnostics.qwenModels && typeof diagnostics.qwenModels === "object"
     ? (diagnostics.qwenModels[model] ||= {})
     : {};
@@ -2821,7 +3043,7 @@ async function requestQwenChatCompletionOnce(
     diagnostics[key] = value;
   };
   const makeStageTimeout = (stage, stageTimeoutMs) => {
-    const error = new Error(`Qwen ${stage} 阶段超过 ${Math.round(stageTimeoutMs / 1000)} 秒未返回`);
+    const error = new Error(`${providerName} ${stage} 阶段超过 ${Math.round(stageTimeoutMs / 1000)} 秒未返回`);
     error.name = "TimeoutError";
     error.statusCode = 504;
     error.code = `qwen_${stage}_timeout`;
@@ -2857,18 +3079,21 @@ async function requestQwenChatCompletionOnce(
     else externalSignal.addEventListener("abort", abortFromExternal, { once: true });
   }
   try {
-    const response = await runStage(fetch(`${QWEN_BASE_URL}/chat/completions`, {
+    const response = await runStage(fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${QWEN_API_KEY}`
+        Authorization: `Bearer ${apiKey}`
       },
       body: JSON.stringify({
         ...payload,
         ...(useJsonFormat ? { response_format: { type: "json_object" } } : {})
       }),
       signal: controller.signal
-    }), "connect", QWEN_CONNECT_TIMEOUT_MS);
+      }), "connect", ["answer_key", "handwriting", "answer_key_independent_verification"]
+        .includes(String(diagnostics.eventType || ""))
+        ? boundedTimeoutMs
+        : QWEN_CONNECT_TIMEOUT_MS);
     mark("first_response_time");
     trace.http_status = response.status;
 
@@ -2876,7 +3101,13 @@ async function requestQwenChatCompletionOnce(
     const rawBody = await runStage(
       response.text(),
       "response",
-      Math.min(QWEN_RESPONSE_TIMEOUT_MS, Math.max(1000, boundedTimeoutMs - (Date.now() - startedAt)))
+      Math.min(
+        ["answer_key", "handwriting", "answer_key_independent_verification"]
+          .includes(String(diagnostics.eventType || ""))
+          ? boundedTimeoutMs
+          : QWEN_RESPONSE_TIMEOUT_MS,
+        Math.max(1000, boundedTimeoutMs - (Date.now() - startedAt))
+      )
     );
     mark("response_complete_time");
     trace.response_bytes = Buffer.byteLength(rawBody || "", "utf8");
@@ -2915,7 +3146,7 @@ async function requestQwenChatCompletionOnce(
     }
 
     if (!response.ok) {
-      const rawMessage = data.error?.message || `Qwen 多模态 API 请求失败：${response.status}`;
+      const rawMessage = data.error?.message || `${providerName} API 请求失败：${response.status}`;
       const rawCode = data.error?.code || data.error?.type || "qwen_error";
       const normalizedCode = response.status === 429
         ? "rate_limited"
@@ -2934,9 +3165,9 @@ async function requestQwenChatCompletionOnce(
       });
       const friendlyMessage =
         rawCode === "access_denied"
-          ? "Qwen API 访问被拒绝，请确认 .env 里的 Qwen_api_key 是阿里云百炼 API Key，并已开通对应多模态模型权限。"
+          ? `${providerName} API 访问被拒绝，请确认对应 API Key 已开通 ${model} 模型权限。`
           : rawCode === "invalid_api_key" || /api key|authentication|认证|鉴权/i.test(rawMessage)
-            ? "Qwen API key 无法通过认证，请检查 .env 里的 Qwen_api_key、QWEN_API_KEY 或 DASHSCOPE_API_KEY。"
+            ? `${providerName} API Key 无法通过认证，请检查 ${providerName === "Kimi" ? "KIMI_API_KEY / QWEN_API_KEY" : "QWEN_API_KEY / DASHSCOPE_API_KEY"}。`
             : rawMessage;
       const error = new Error(friendlyMessage);
       error.statusCode = response.status;
@@ -2968,10 +3199,10 @@ async function requestQwenChatCompletionOnce(
         : timedOutStage === "parse"
           ? "qwen_parse_timeout"
           : "qwen_total_timeout";
-    const error = new Error(
+      const error = new Error(
       timedOut
-        ? `Qwen 多模态 API ${timedOutStage || "total"} 阶段超过 ${Math.round(boundedTimeoutMs / 1000)} 秒未返回`
-        : "Qwen 多模态 API 网络连接失败"
+        ? `${providerName} API ${timedOutStage || "total"} 阶段超过 ${Math.round(boundedTimeoutMs / 1000)} 秒未返回`
+        : `${providerName} API 网络连接失败`
     );
     error.statusCode = timedOut ? 504 : 502;
     error.code = timedOut ? timeoutCode : "network_error";
@@ -3077,7 +3308,12 @@ async function requestQwenChatCompletion(payload, useJsonFormat = true, options 
       const data = await requestQwenChatCompletionOnce(
         { ...requestPayload, model },
         useJsonFormat,
-        Math.min(QWEN_REQUEST_TIMEOUT_MS, remainingMs),
+        Math.min(
+          ["answer_key", "handwriting"].includes(String(options.diagnostics?.eventType || ""))
+            ? remainingMs
+            : QWEN_REQUEST_TIMEOUT_MS,
+          remainingMs
+        ),
         options.signal || null,
         options.diagnostics || {}
       );
@@ -3141,6 +3377,7 @@ async function callQwenMultimodalJson({
   schema,
   instructions,
   maxOutputTokens = 1200,
+  reasoningEffort = "",
   deadlineAt: requestedDeadlineAt,
   timeoutMs = QWEN_TOTAL_TIMEOUT_MS,
   signal,
@@ -3183,6 +3420,9 @@ async function callQwenMultimodalJson({
     ],
     max_tokens: maxOutputTokens,
     temperature: 0,
+    ...(reasoningEffort && getGuideReasoningEffort(model)
+      ? { reasoning_effort: reasoningEffort }
+      : {}),
     stream: false
   };
 
@@ -3250,6 +3490,9 @@ async function callQwenMultimodalJson({
     };
   }
   const parsed = parseModelJson(rawText);
+  if (diagnostics.eventType === "answer_key") {
+    console.info("[answer-key] sanitized model output shape", summarizeAnswerKeyModelOutput(parsed, data, rawText));
+  }
   if (!parsed && allowTextFallback) {
     const speech = rawText
       .replace(/```(?:json|text)?/gi, "")
@@ -3455,7 +3698,7 @@ function abortSignalPromise(signal) {
   return { promise, cleanup };
 }
 
-async function raceQwenStructuredModels({ options = {}, models, isValid, diagnostics = {}, label, invokeModel }) {
+async function raceQwenStructuredModels({ options = {}, models, isValid, getValidationIssues, diagnostics = {}, label, invokeModel }) {
   const normalizedCandidates = [...new Set((Array.isArray(models) ? models : [])
     .map((model) => String(model || "").trim())
     .filter(Boolean))];
@@ -3488,6 +3731,7 @@ async function raceQwenStructuredModels({ options = {}, models, isValid, diagnos
   let nextCandidateIndex = 0;
   const entries = [];
   const startedAt = Date.now();
+  const retriedEmptyAnswerKeyCandidates = new Set();
 
   const createEntry = (model, candidateIndex) => {
     const controller = new AbortController();
@@ -3590,10 +3834,16 @@ async function raceQwenStructuredModels({ options = {}, models, isValid, diagnos
 
     if (outcome.kind === "result") {
       const accepted = Boolean(outcome.result && isValid(outcome.result, diagnostics));
+      const validationIssues = !accepted && typeof getValidationIssues === "function"
+        ? getValidationIssues(outcome.result) || []
+        : [];
       console.info(`[${label}] parallel model result`, {
         model: outcome.model,
         elapsedMs: Date.now() - startedAt,
         accepted,
+        ...(label === "answer-key"
+          ? { validationIssues }
+          : {}),
         resultType: typeof outcome.result,
         textLength: String(outcome.result?.detectedWriting || outcome.result?.speech || "").length,
         ...(label === "guide"
@@ -3621,11 +3871,34 @@ async function raceQwenStructuredModels({ options = {}, models, isValid, diagnos
         });
         return outcome.result;
       }
+      // The current Omni endpoint intermittently returns a literal [] with a
+      // successful HTTP response. Give that empty answer-key result one more
+      // try without relaxing any of the mathematical validation rules.
+      const emptyAnswerKey = label === "answer-key" &&
+        Array.isArray(outcome.result) && outcome.result.length === 0;
+      if (
+        emptyAnswerKey &&
+        !retriedEmptyAnswerKeyCandidates.has(outcome.model) &&
+        deadlineAt - Date.now() > 1000
+      ) {
+        retriedEmptyAnswerKeyCandidates.add(outcome.model);
+        console.warn("[answer-key] retrying empty structured output", {
+          model: outcome.model,
+          elapsedMs: Date.now() - startedAt
+        });
+        entries.push(createEntry(outcome.model, outcome.candidateIndex));
+        fillSlots();
+        continue;
+      }
       lastError = Object.assign(new Error(`Qwen ${label} 返回了不可用结果`), {
         statusCode: 502,
         code: "invalid_model_output",
-        model: outcome.model
+        model: outcome.model,
+        validationIssues
       });
+      if (validationIssues.length) {
+        lastError.message += `：${validationIssues.join("、")}`;
+      }
       fillSlots();
       continue;
     }
@@ -3770,21 +4043,27 @@ function classifyQwenError(error) {
 }
 
 async function callHandwritingQwenJson(options, diagnostics = {}) {
+  const handwritingDiagnostics = {
+    ...diagnostics,
+    eventType: "handwriting"
+  };
   try {
     return await raceQwenStructuredModels({
       options: {
         ...options
       },
-      models: getQwenModelCandidates(options.model || QWEN_HANDWRITING_MODEL, options.modelCandidates),
+      // One board observation gets one model judgment. Do not race another
+      // model or launch a second visual pass behind the student's back.
+      models: [String(options.model || QWEN_HANDWRITING_MODEL).trim()],
       isValid: isValidHandwritingResult,
-      diagnostics,
+      diagnostics: handwritingDiagnostics,
       label: "handwriting"
     });
   } catch (error) {
     error.stage = error.stage || "handwriting-model";
-    error.requestId = diagnostics.requestId || 0;
-    error.sessionId = diagnostics.sessionId || 0;
-    error.questionId = diagnostics.questionId || "";
+    error.requestId = handwritingDiagnostics.requestId || 0;
+    error.sessionId = handwritingDiagnostics.sessionId || 0;
+    error.questionId = handwritingDiagnostics.questionId || "";
     error.model = error.model || options.model || "";
     throw error;
   }
@@ -8032,6 +8311,8 @@ const answerKeyVerifierSchema = {
       verified: { type: "boolean" },
       independentlySolvedAnswer: { type: "string" },
       acceptedAnswers: { type: "array", items: { type: "string" } },
+      stepsVerified: { type: "boolean" },
+      stepIssues: { type: "array", items: { type: "string" } },
       choiceAnalysis: {
         type: "object",
         additionalProperties: false,
@@ -8075,6 +8356,8 @@ const answerKeyVerifierSchema = {
       "verified",
       "independentlySolvedAnswer",
       "acceptedAnswers",
+      "stepsVerified",
+      "stepIssues",
       "choiceAnalysis",
       "confidence",
       "contradiction",
@@ -8153,13 +8436,15 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
 ].join("\n");
 
 const ANSWER_KEY_VERIFIER_PROMPT = [
-  "你是第二位独立的初中数学答案复核员。候选答案可能是错的，不能顺着候选答案解释。",
-  "你会收到原始题目图片、从题图清洗出的完整题目文本和候选答案。必须重新查看原始题图，尤其核对图形、表格、A/B/C/D 选项的完整文字和顺序；不能只相信清洗文本。",
+  "你是第二位独立的初中数学解题与验算员。候选答案、步骤和验算都可能是错的，不能顺着候选内容解释。",
+  "必须先独立阅读原始题目图片并自己解题，再把独立答案与候选答案比较；不能采用候选推导过程作为自己的解题依据。",
+  "逐行检查候选步骤：每一步必须由题目条件或前一步正确推出。stepsVerified 只有在所有关键步骤都成立且没有跳步造成错误时才能为 true；否则列出具体 stepIssues。",
+  "你会收到从题图清洗出的题目文本作为辅助；必须以原始题目图片为准，尤其核对图形、表格、A/B/C/D 选项的完整文字和顺序。",
   "如果是选择题，必须返回 choiceAnalysis：重新抄录 options，独立判断 statementVerdicts，并根据选项文字得到 selectedOption 和 selectedOptionText。字母相同但选项含义不同，必须 verified=false。",
   "必须检查题目顺序、正负号、单位、选项、定义域、是否漏解以及题目实际问法。",
   "不要采用候选答案的计算过程，也不要自行补充题目文本中不存在的条件。",
   "如果题目依赖图形或表格，而清洗后的题目文本没有包含关键关系，verified 必须为 false，不能猜。",
-  "只有独立结果与候选标准答案数学等价时 verified 才能为 true；有任何冲突或题图不清都返回 false。",
+  "只有独立结果与候选标准答案数学等价、候选关键步骤成立、题图信息足够清楚时 verified 才能为 true；有任何冲突或题图不清都返回 false。",
   ORDERED_PROPORTION_RULES,
   VISUAL_RELATION_RULES
 ].join("\n");
@@ -8237,6 +8522,38 @@ function answerValuesEquivalent(left, right) {
   const numberA = fractionValue(a);
   const numberB = fractionValue(b);
   return Number.isFinite(numberA) && Number.isFinite(numberB) && Math.abs(numberA - numberB) < 1e-9;
+}
+
+function deriveTerminalScalarAnswer(solutionOutline = []) {
+  const steps = Array.isArray(solutionOutline) ? solutionOutline : [];
+  const step = String(steps.at(-1) || "").normalize("NFKC").trim();
+  const match = step.match(/(?:因此|所以|解得|故|最终答案(?:为|是)?|答案(?:为|是)?)[：:]?\s*([\p{L}])\s*=\s*([+-]?(?:\d+(?:\.\d+)?(?:\/\d+(?:\.\d+)?)?|\.\d+))\s*(?:度|°)?[。！!]?$/u) ||
+    step.match(/^\s*([\p{L}])\s*=\s*([+-]?(?:\d+(?:\.\d+)?(?:\/\d+(?:\.\d+)?)?|\.\d+))\s*(?:度|°)?[。！!]?$/u);
+  // Only the terminal outline item can establish the final scalar result;
+  // an earlier isolated equation may be an intermediate value.
+  return match ? match[2] : "";
+}
+
+function reconcileAnswerKeyWithSolutionOutline(answerKey = {}) {
+  const canonicalAnswer = String(answerKey.canonicalAnswer || answerKey.finalAnswer || "").trim();
+  const derivedAnswer = deriveTerminalScalarAnswer(answerKey.solutionOutline || answerKey.solutionSteps);
+  if (!canonicalAnswer || !derivedAnswer || answerValuesEquivalent(canonicalAnswer, derivedAnswer)) {
+    return { consistent: true, answerKey };
+  }
+
+  const acceptedAnswers = [derivedAnswer, ...(Array.isArray(answerKey.acceptedAnswers) ? answerKey.acceptedAnswers : [])]
+    .map((answer) => String(answer || "").trim())
+    .filter((answer, index, answers) => answer && answers.indexOf(answer) === index && answerValuesEquivalent(answer, derivedAnswer));
+  return {
+    consistent: true,
+    corrected: true,
+    answerKey: {
+      ...answerKey,
+      canonicalAnswer: derivedAnswer,
+      finalAnswer: derivedAnswer,
+      acceptedAnswers
+    }
+  };
 }
 
 function answerKeyCandidates(value) {
@@ -8318,11 +8635,123 @@ function choiceAnalysesAgree(solver, verifier) {
 
 function answerKeyResultsAgree(solver, verifier) {
   const solverAnswers = answerKeyCandidates(solver);
-  const verifierAnswers = [verifier?.independentlySolvedAnswer, ...(Array.isArray(verifier?.acceptedAnswers) ? verifier.acceptedAnswers : [])]
-    .map((item) => String(item || "").trim())
-    .filter(Boolean);
-  return solverAnswers.some((left) => verifierAnswers.some((right) => answerValuesEquivalent(left, right))) &&
+  const independentlySolvedAnswer = String(verifier?.independentlySolvedAnswer || "").trim();
+  return Boolean(independentlySolvedAnswer) &&
+    solverAnswers.some((left) => answerValuesEquivalent(left, independentlySolvedAnswer)) &&
     choiceAnalysesAgree(solver, verifier);
+}
+
+function independentAnswerKeyValidationIssues(solver, verifier) {
+  const issues = [];
+  if (!verifier || typeof verifier !== "object") return ["independent-verifier-output-missing"];
+  if (verifier.verified !== true) issues.push("independent-answer-not-verified");
+  if (verifier.stepsVerified !== true) issues.push("independent-steps-not-verified");
+  if (Array.isArray(verifier.stepIssues) && verifier.stepIssues.some((item) => String(item || "").trim())) {
+    issues.push("independent-step-issues-found");
+  }
+  if (!String(verifier.independentlySolvedAnswer || "").trim()) {
+    issues.push("independent-answer-missing");
+  }
+  if (Number(verifier.confidence) < 0.65) issues.push("independent-confidence-below-0.65");
+  if (!String(verifier.verificationSummary || "").trim()) issues.push("independent-verification-summary-missing");
+  if (!answerKeyResultsAgree(solver, verifier)) issues.push("independent-result-disagrees-with-answer-key");
+  return issues;
+}
+
+async function verifyAnswerKeyWithKimi(questionImage, solver, context = {}) {
+  if (!KIMI_API_KEY) {
+    const error = new Error("未配置 Kimi 验算 API Key（KIMI_API_KEY 或现有 QWEN_API_KEY）");
+    error.statusCode = 503;
+    error.code = "missing_kimi_api_key";
+    throw error;
+  }
+  if (!KIMI_BASE_URL) {
+    const error = new Error("未配置 KIMI_BASE_URL；请填写百炼当前业务空间和地域对应的兼容接口地址");
+    error.statusCode = 503;
+    error.code = "missing_kimi_base_url";
+    throw error;
+  }
+
+  const startedAt = Date.now();
+  const buildPayload = (signedQuestionImageUrl) => ({
+    model: KIMI_VERIFY_MODEL,
+    messages: [
+      { role: "system", content: ANSWER_KEY_VERIFIER_PROMPT },
+      {
+        role: "user",
+        content: buildQwenContent([
+          {
+            type: "input_text",
+            text: JSON.stringify({
+              questionTextFromSegmentation: context.problemText || "",
+              candidate: {
+                answer: solver.canonicalAnswer,
+                acceptedAnswers: solver.acceptedAnswers || [],
+                questionType: solver.questionType || "",
+                solutionSteps: solver.solutionOutline || [],
+                verificationChecks: solver.verificationChecks || [],
+                choiceAnalysis: solver.choiceAnalysis || {}
+              },
+              instruction: "请根据随附的原始题目图片独立作答、独立验算并核对每一步；不要把候选答案当作正确前提。图片链接仅短时有效。"
+            })
+          },
+          { type: "input_image", label: "原始题目图片（独立复核依据）", image_url: signedQuestionImageUrl, detail: "high" }
+        ])
+      }
+    ],
+    max_tokens: 4000,
+    temperature: 0,
+    // Kimi-K3 can spend the whole request budget on hidden reasoning before
+    // emitting the small verification JSON. Its non-thinking image + JSON
+    // response is supported by this provider and keeps the check bounded.
+    enable_thinking: false,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: answerKeyVerifierSchema.name,
+        strict: true,
+        schema: answerKeyVerifierSchema.schema
+      }
+    },
+    stream: false
+  });
+  const diagnostics = {
+    eventType: "answer_key_independent_verification",
+    questionId: String(context.questionId || ""),
+    model_name: KIMI_VERIFY_MODEL
+  };
+  const remainingAnswerKeyBudgetMs = Number(context.deadlineAt) > 0
+    ? Number(context.deadlineAt) - Date.now()
+    : KIMI_VERIFY_TIMEOUT_MS;
+  if (remainingAnswerKeyBudgetMs <= 0) {
+    const error = new Error("题目答案与独立验算的总时间预算已用尽");
+    error.statusCode = 504;
+    error.code = "answer_key_total_timeout";
+    throw error;
+  }
+  const data = await withTemporaryKimiImageUrl(
+    questionImage,
+    (signedQuestionImageUrl) => requestQwenChatCompletionOnce(
+      buildPayload(signedQuestionImageUrl),
+      false,
+      Math.min(KIMI_VERIFY_TIMEOUT_MS, remainingAnswerKeyBudgetMs),
+      context.signal || null,
+      diagnostics,
+      { providerName: "Kimi", apiKey: KIMI_API_KEY, baseUrl: KIMI_BASE_URL }
+    ),
+    { signal: context.signal || null }
+  );
+  const text = extractModelText(data);
+  const verifier = parseModelJson(text);
+  if (!verifier) {
+    const error = new Error("Kimi 独立验算没有返回可解析的结构化结果");
+    error.statusCode = 502;
+    error.code = "kimi_invalid_verifier_output";
+    throw error;
+  }
+  verifier.elapsedMs = Date.now() - startedAt;
+  verifier.model = KIMI_VERIFY_MODEL;
+  return verifier;
 }
 
 function getAnswerKeyCacheKey(questionImage, context = {}) {
@@ -8330,7 +8759,7 @@ function getAnswerKeyCacheKey(questionImage, context = {}) {
     .createHash("sha256")
     .update(String(questionImage || ""))
     .update(`|problem:${String(context.problemText || "").replace(/\s+/g, " ").trim()}`)
-    .update(`|model:${QWEN_GUIDE_MODEL}|answer-key:v10-trusted-steps`)
+    .update(`|model:${QWEN_GUIDE_MODEL}|verifier:${KIMI_VERIFY_MODEL}|answer-key:v11-kimi-independent`)
     .digest("hex");
 }
 
@@ -8366,21 +8795,38 @@ function normalizeAnswerKeySolver(solver, context = {}) {
   return solver;
 }
 
-function answerKeySolverHasMinimumEvidence(solver) {
+function answerKeySolverValidationIssues(solver) {
   const normalized = normalizeAnswerKeySolver(solver);
+  const reconciled = reconcileAnswerKeyWithSolutionOutline(normalized);
+  Object.assign(normalized, reconciled.answerKey);
+  const issues = [];
   const hasVerifiableWork = normalized.solutionOutline.length > 0 && normalized.verificationChecks.length > 0;
-  if (
-    normalized.status !== "solved" ||
-    Number(normalized.confidence) < ANSWER_KEY_MIN_CONFIDENCE ||
-    !normalized.canonicalAnswer ||
-    !hasVerifiableWork
-  ) return false;
+  const hasDerivedTerminalAnswer = Boolean(deriveTerminalScalarAnswer(normalized.solutionOutline));
+  const minimumConfidence = hasDerivedTerminalAnswer
+    ? ANSWER_KEY_DERIVED_MIN_CONFIDENCE
+    : ANSWER_KEY_MIN_CONFIDENCE;
+  if (!reconciled.consistent) issues.push("answer-conflicts-with-terminal-step");
+  if (normalized.status !== "solved") issues.push(`status-${normalized.status || "missing"}`);
+  if (!normalized.canonicalAnswer) issues.push("canonical-answer-missing");
+  if (Number(normalized.confidence) < minimumConfidence) {
+    issues.push(`confidence-below-${minimumConfidence.toFixed(2)}`);
+  }
+  if (!normalized.solutionOutline.length) issues.push("solution-steps-missing");
+  if (!normalized.verificationChecks.length) issues.push("verification-checks-missing");
   const isChoiceAnswer = isChoiceQuestionContext(normalized) || normalized.choiceAnalysis.options.length >= 2;
-  return !isChoiceAnswer || choiceAnalysisIsUsable(normalized.choiceAnalysis);
+  if (isChoiceAnswer && !choiceAnalysisIsUsable(normalized.choiceAnalysis)) {
+    issues.push("choice-semantics-incomplete");
+  }
+  return issues;
+}
+
+function answerKeySolverHasMinimumEvidence(solver) {
+  return answerKeySolverValidationIssues(solver).length === 0;
 }
 
 async function solveAndVerifyAnswerKey(questionImage, context = {}) {
   const startedAt = Date.now();
+  const deadlineAt = startedAt + ANSWER_KEY_TOTAL_TIMEOUT_MS;
   const answerKeyOptions = {
     model: QWEN_GUIDE_MODEL,
     schema: answerKeySolverSchema,
@@ -8404,6 +8850,7 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
       2400,
       Math.min(8000, Number(process.env.QWEN_ANSWER_KEY_MAX_OUTPUT_TOKENS || 5000))
     ),
+    timeoutMs: ANSWER_KEY_SOLVER_TIMEOUT_MS,
     signal: context.signal,
     diagnostics: context.diagnostics || {}
   };
@@ -8412,28 +8859,39 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
   // guidance/handwriting. A model that times out or returns truncated JSON is
   // not allowed to win; the next configured Qwen model gets a chance within
   // the same wall-clock budget.
+  const answerKeyDiagnostics = { ...(context.diagnostics || {}), eventType: "answer_key" };
   const solver = await raceQwenStructuredModels({
     options: answerKeyOptions,
     models: getQwenModelCandidates(QWEN_GUIDE_MODEL, process.env.QWEN_ANSWER_KEY_FALLBACK_MODELS
       ? parseQwenModelList(process.env.QWEN_ANSWER_KEY_FALLBACK_MODELS)
       : []),
     isValid: (candidate) => {
-      const normalized = normalizeAnswerKeySolver(candidate, context);
-      return answerKeySolverHasMinimumEvidence(normalized);
+      const issues = answerKeySolverValidationIssues(normalizeAnswerKeySolver(candidate, context));
+      answerKeyDiagnostics.answerKeyValidationIssues = issues;
+      return issues.length === 0;
     },
-    diagnostics: { ...(context.diagnostics || {}), eventType: "answer_key" },
+    getValidationIssues: (candidate) => answerKeySolverValidationIssues(
+      normalizeAnswerKeySolver(candidate, context)
+    ),
+    diagnostics: answerKeyDiagnostics,
     label: "answer-key"
   });
 
   normalizeAnswerKeySolver(solver, context);
+  const reconciledSolver = reconcileAnswerKeyWithSolutionOutline(solver);
+  Object.assign(solver, reconciledSolver.answerKey);
 
   // Normalization is idempotent and is deliberately shared by the race
   // validator and the final trusted-answer construction below.
 
   const hasVerifiableWork = solver.solutionOutline.length > 0 && solver.verificationChecks.length > 0;
+  const terminalAnswer = deriveTerminalScalarAnswer(solver.solutionOutline);
+  const minimumConfidence = terminalAnswer
+    ? ANSWER_KEY_DERIVED_MIN_CONFIDENCE
+    : ANSWER_KEY_MIN_CONFIDENCE;
   if (
     solver.status !== "solved" ||
-    Number(solver.confidence) < ANSWER_KEY_MIN_CONFIDENCE ||
+    Number(solver.confidence) < minimumConfidence ||
     !solver.canonicalAnswer ||
     !hasVerifiableWork
   ) {
@@ -8450,8 +8908,7 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     };
   }
 
-  // 选项语义已经由标准答案模型在同一次看图解题中返回。
-  // 不再串行调用第二个答案复核模型，避免把 C/D 的含义重新解释并拖慢板书反馈。
+  // Check choice completeness before paying for the independent image-based verifier.
   const solverQuestionContext = {
     ...solver,
     problemText: solver.problemText || context.problemText || ""
@@ -8471,9 +8928,53 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     };
   }
 
+  let independentVerification;
+  try {
+    independentVerification = await verifyAnswerKeyWithKimi(questionImage, {
+      ...solver,
+      choiceAnalysis: solverChoiceAnalysis
+    }, { ...context, deadlineAt });
+  } catch (error) {
+    console.warn("[answer-key] Kimi independent verification unavailable", {
+      model: KIMI_VERIFY_MODEL,
+      questionId: String(context.questionId || ""),
+      code: error?.code || "kimi_verification_error",
+      message: error?.message || String(error)
+    });
+    return {
+      trusted: false,
+      status: error?.code || "kimi-verification-unavailable",
+      confidence: Number(solver.confidence) || 0,
+      reason: error?.message || "Kimi 独立验算暂不可用",
+      solutionOutline: solver.solutionOutline.slice(0, 8),
+      verificationChecks: solver.verificationChecks.slice(0, 8),
+      elapsedMs: Date.now() - startedAt
+    };
+  }
+  const independentIssues = independentAnswerKeyValidationIssues(solver, independentVerification);
+  if (independentIssues.length) {
+    console.warn("[answer-key] Kimi independent verification rejected candidate", {
+      model: KIMI_VERIFY_MODEL,
+      questionId: String(context.questionId || ""),
+      issues: independentIssues,
+      confidence: Number(independentVerification.confidence) || 0,
+      verificationSummary: String(independentVerification.verificationSummary || "").slice(0, 400)
+    });
+    return {
+      trusted: false,
+      status: "independent-verification-failed",
+      confidence: Number(solver.confidence) || 0,
+      reason: `Kimi 独立验算未通过：${independentIssues.join("、")}`,
+      verificationIssues: independentIssues,
+      solutionOutline: solver.solutionOutline.slice(0, 8),
+      verificationChecks: solver.verificationChecks.slice(0, 8),
+      elapsedMs: Date.now() - startedAt
+    };
+  }
+
   return {
     trusted: true,
-    status: "structured-single-pass",
+    status: "verified-by-qwen-and-kimi-k3",
     canonicalAnswer: String(solver.canonicalAnswer).trim(),
     acceptedAnswers: answerKeyCandidates(solver),
     givenConditions: normalizeGivenConditions(solver.givenConditions),
@@ -8489,8 +8990,16 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
       isStudentAnswerCorrect: false,
       wrongReason: ""
     },
+    independentVerification: {
+      model: KIMI_VERIFY_MODEL,
+      verified: true,
+      stepsVerified: true,
+      confidence: Number(independentVerification.confidence) || 0,
+      summary: String(independentVerification.verificationSummary || "").trim(),
+      elapsedMs: Number(independentVerification.elapsedMs) || 0
+    },
     confidence: Number(solver.confidence) || 0,
-    reason: "标准答案模型已返回结构化答案、选项语义和关键步骤",
+    reason: "Qwen 标准答案已通过 Kimi 独立解题、答案比对和步骤验算",
     elapsedMs: Date.now() - startedAt
   };
 
@@ -8608,11 +9117,16 @@ function isExplicitGivenConditionStep(step, givenConditions = []) {
   const candidate = String(step || "").trim();
   if (!candidate) return false;
   return normalizeGivenConditions(givenConditions).some((condition) => {
-    const left = normalizeProgressText(candidate);
+    const bareCandidate = candidate
+      .replace(/^\s*(?:已知|条件|题目给出|由题意得|题设|给定)\s*[:：]?\s*/u, "")
+      .replace(/[。；;]\s*$/u, "");
+    const left = normalizeProgressText(bareCandidate);
     const right = normalizeProgressText(condition);
     if (!left || !right) return false;
     if (left === right) return true;
-    if (left.includes(right) || right.includes(left)) return true;
+    // A worked step can cite a given condition and then substitute it.
+    // Containing that condition does not make the whole step a duplicate.
+    if (!/^[a-z0-9_()+\-*/.^=]+$/i.test(left) || (left.match(/=/g) || []).length !== 1) return false;
     const candidateEquation = extractLinearEquationText(left);
     const conditionEquation = extractLinearEquationText(right);
     return Boolean(candidateEquation && conditionEquation && equationsEquivalent(candidateEquation, conditionEquation));
@@ -8679,6 +9193,253 @@ function extractLinearEquationText(value) {
   return match ? match[0] : "";
 }
 
+function normalizeProgressFormula(value) {
+  return String(value || "")
+    .replace(/\\(?:left|right)\b/g, "")
+    .replace(/\\(?:cdot|times)\b/g, "*")
+    .replace(/\\(?:dfrac|tfrac|frac)\{([^{}]+)\}\{([^{}]+)\}/g, "(($1)/($2))")
+    .replace(/[²]/g, "^2")
+    .replace(/[³]/g, "^3")
+    .normalize("NFKC")
+    .replace(/[−–—]/g, "-")
+    .replace(/[×·]/g, "*")
+    .replace(/\s+/g, "")
+    .replace(/[$]/g, "")
+    .toLowerCase();
+}
+
+function extractProgressEquationCandidates(value) {
+  const text = normalizeProgressFormula(value);
+  const matches = text.match(/[a-z0-9(][a-z0-9_()+\-*/.^]*=[a-z0-9(][a-z0-9_()+\-*/.^]*/gi) || [];
+  return [...new Set(matches.filter((match) => match.includes("=")))];
+}
+
+function tokenizeProgressExpression(value) {
+  const text = normalizeProgressFormula(value);
+  const tokens = [];
+  let cursor = 0;
+  while (cursor < text.length) {
+    const rest = text.slice(cursor);
+    const number = rest.match(/^(?:\d+(?:\.\d*)?|\.\d+)/);
+    if (number) {
+      tokens.push(number[0]);
+      cursor += number[0].length;
+      continue;
+    }
+    // In school algebra, adjacent single-letter variables mean multiplication
+    // (for example, 2ab), while an underscore can keep indexed names together.
+    const variable = rest.match(/^[a-z](?:_[a-z0-9]+)?/i);
+    if (variable) {
+      tokens.push(variable[0]);
+      cursor += variable[0].length;
+      continue;
+    }
+    const operator = rest.match(/^[()+\-*/^]/);
+    if (operator) {
+      tokens.push(operator[0]);
+      cursor += 1;
+      continue;
+    }
+    return null;
+  }
+  return tokens;
+}
+
+function polynomialMonomialKey(variables) {
+  return JSON.stringify([...variables.entries()].filter(([, power]) => power).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function polynomialFromExpression(value) {
+  const tokens = tokenizeProgressExpression(value);
+  if (!tokens?.length || tokens.length > 160) return null;
+  let cursor = 0;
+  const maxDegree = 4;
+  const maxTerms = 64;
+  const constant = (number) => new Map([["[]", number]]);
+  const variable = (name) => new Map([[polynomialMonomialKey(new Map([[name, 1]])), 1]]);
+  const add = (left, right, sign = 1) => {
+    if (!left || !right) return null;
+    const result = new Map(left);
+    for (const [key, coefficient] of right) {
+      result.set(key, (result.get(key) || 0) + sign * coefficient);
+    }
+    for (const [key, coefficient] of result) {
+      if (Math.abs(coefficient) < 1e-9) result.delete(key);
+    }
+    return result.size <= maxTerms ? result : null;
+  };
+  const multiply = (left, right) => {
+    if (!left || !right || left.size * right.size > maxTerms) return null;
+    const result = new Map();
+    for (const [leftKey, leftCoefficient] of left) {
+      const leftVariables = new Map(JSON.parse(leftKey));
+      for (const [rightKey, rightCoefficient] of right) {
+        const variables = new Map(leftVariables);
+        for (const [name, power] of JSON.parse(rightKey)) {
+          variables.set(name, (variables.get(name) || 0) + power);
+        }
+        const degree = [...variables.values()].reduce((sum, power) => sum + power, 0);
+        if (degree > maxDegree) return null;
+        const key = polynomialMonomialKey(variables);
+        result.set(key, (result.get(key) || 0) + leftCoefficient * rightCoefficient);
+      }
+    }
+    for (const [key, coefficient] of result) {
+      if (Math.abs(coefficient) < 1e-9) result.delete(key);
+    }
+    return result.size <= maxTerms ? result : null;
+  };
+  const scale = (polynomial, factor) => polynomial
+    ? new Map([...polynomial].map(([key, coefficient]) => [key, coefficient * factor]))
+    : null;
+
+  const parseExpression = () => {
+    let result = parseProduct();
+    while (tokens[cursor] === "+" || tokens[cursor] === "-") {
+      const operator = tokens[cursor++];
+      result = add(result, parseProduct(), operator === "+" ? 1 : -1);
+    }
+    return result;
+  };
+  const parseProduct = () => {
+    let result = parseUnary();
+    while (cursor < tokens.length) {
+      const operator = tokens[cursor];
+      if (operator === "*" || operator === "/") {
+        cursor += 1;
+        const right = parseUnary();
+        if (operator === "*") {
+          result = multiply(result, right);
+          continue;
+        }
+        if (!right || right.size !== 1 || !right.has("[]") || Math.abs(right.get("[]")) < 1e-9) return null;
+        result = scale(result, 1 / right.get("[]"));
+        continue;
+      }
+      if (operator === "(" || /^[a-z0-9]/i.test(operator)) {
+        result = multiply(result, parseUnary());
+        continue;
+      }
+      break;
+    }
+    return result;
+  };
+  const parseUnary = () => {
+    if (tokens[cursor] === "+") {
+      cursor += 1;
+      return parseUnary();
+    }
+    if (tokens[cursor] === "-") {
+      cursor += 1;
+      return scale(parseUnary(), -1);
+    }
+    let result = parseAtom();
+    if (tokens[cursor] === "^") {
+      cursor += 1;
+      const exponent = Number(tokens[cursor++]);
+      if (!Number.isInteger(exponent) || exponent < 0 || exponent > maxDegree) return null;
+      let powered = constant(1);
+      for (let index = 0; index < exponent; index += 1) powered = multiply(powered, result);
+      result = powered;
+    }
+    return result;
+  };
+  const parseAtom = () => {
+    const token = tokens[cursor++];
+    if (token === "(") {
+      const result = parseExpression();
+      if (tokens[cursor++] !== ")") return null;
+      return result;
+    }
+    if (/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(token || "")) return constant(Number(token));
+    if (/^[a-z](?:_[a-z0-9]+)?$/i.test(token || "")) return variable(token.toLowerCase());
+    return null;
+  };
+
+  const parsed = parseExpression();
+  return cursor === tokens.length ? parsed : null;
+}
+
+function progressEquationSignature(value) {
+  const equation = normalizeProgressFormula(value);
+  const equalsAt = equation.indexOf("=");
+  if (equalsAt < 0 || equation.indexOf("=", equalsAt + 1) >= 0) return null;
+  const left = polynomialFromExpression(equation.slice(0, equalsAt));
+  const right = polynomialFromExpression(equation.slice(equalsAt + 1));
+  if (!left || !right) return null;
+  const difference = new Map(left);
+  for (const [key, coefficient] of right) {
+    difference.set(key, (difference.get(key) || 0) - coefficient);
+  }
+  for (const [key, coefficient] of difference) {
+    if (Math.abs(coefficient) < 1e-9) difference.delete(key);
+  }
+  if (!difference.size) return null;
+  const firstCoefficient = [...difference].sort(([a], [b]) => a.localeCompare(b))[0][1];
+  const sign = firstCoefficient < 0 ? -1 : 1;
+  return new Map([...difference].map(([key, coefficient]) => [key, coefficient * sign]));
+}
+
+function guideProgressMatchScore(expectedStep, evidenceText) {
+  const expected = normalizeProgressText(expectedStep);
+  const evidence = normalizeProgressText(evidenceText);
+  if (!expected || !evidence) return 0;
+  if (evidence.includes(expected)) return 100;
+
+  const expectedEquations = extractProgressEquationCandidates(expectedStep);
+  const evidenceEquations = extractProgressEquationCandidates(evidenceText);
+  let bestScore = 0;
+  for (const expectedEquation of expectedEquations) {
+    for (const evidenceEquation of evidenceEquations) {
+      if (normalizeProgressFormula(expectedEquation) === normalizeProgressFormula(evidenceEquation)) {
+        bestScore = Math.max(bestScore, 100);
+        continue;
+      }
+      const expectedSignature = progressEquationSignature(expectedEquation);
+      const evidenceSignature = progressEquationSignature(evidenceEquation);
+      if (
+        expectedSignature && evidenceSignature &&
+        expectedSignature.size === evidenceSignature.size &&
+        [...expectedSignature].every(([key, coefficient]) =>
+          Math.abs(coefficient - (evidenceSignature.get(key) || 0)) < 1e-7
+        )
+      ) bestScore = Math.max(bestScore, 80);
+    }
+  }
+  if (!expectedEquations.length && !evidenceEquations.length && evidence.includes(expected)) {
+    return 100;
+  }
+  return bestScore;
+}
+
+function collectGuideProgressEvidence(result, latestStudentSpeech = "") {
+  const sources = [
+    result?.ocrRecognizedText,
+    result?.detectedWriting,
+    result?.recognizedText,
+    result?.mathExpression,
+    ...(Array.isArray(result?.completedSteps)
+      ? result.completedSteps.map((step) => typeof step === "object" ? step.evidence || step.text || "" : step)
+      : []),
+    latestStudentSpeech
+  ];
+  const seen = new Set();
+  const evidence = [];
+  for (const source of sources) {
+    for (const line of String(source || "").split(/[\r\n]+/).map((part) => part.trim()).filter(Boolean)) {
+      const equations = extractProgressEquationCandidates(line);
+      const fragments = equations.length ? equations : [line];
+      for (const fragment of fragments) {
+        const key = normalizeProgressFormula(fragment);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        evidence.push(fragment);
+      }
+    }
+  }
+  return evidence;
+}
+
 function evidenceContainsStep(expectedStep, evidenceText) {
   const expected = normalizeProgressText(expectedStep);
   const evidence = normalizeProgressText(evidenceText);
@@ -8709,15 +9470,28 @@ function deriveGuideProgress({
     : {};
   const knownConditions = normalizeGivenConditions(givenConditions);
   const usableGuideSteps = filterGuideStepsByKnownConditions(verifiedGuideSteps, knownConditions);
-  const boardEvidence = [
-    result.detectedWriting,
-    result.recognizedText,
-    result.mathExpression,
-    ...(Array.isArray(result.completedSteps)
-      ? result.completedSteps.map((step) => typeof step === "object" ? step.evidence || step.text || "" : step)
-      : [])
-  ].filter(Boolean).join("\n");
-  const evidence = `${boardEvidence}\n${String(latestStudentSpeech || "")}`;
+  const evidenceFragments = collectGuideProgressEvidence(result, latestStudentSpeech);
+  const matches = [];
+  for (let stepIndex = 0; stepIndex < usableGuideSteps.length; stepIndex += 1) {
+    for (let evidenceIndex = 0; evidenceIndex < evidenceFragments.length; evidenceIndex += 1) {
+      const score = guideProgressMatchScore(usableGuideSteps[stepIndex], evidenceFragments[evidenceIndex]);
+      if (score > 0) matches.push({ stepIndex, evidenceIndex, score });
+    }
+  }
+  // One observed line should not complete several outline steps just because
+  // they are algebraically equivalent. Prefer exact matches, then the earliest
+  // remaining step when an equivalent expression could describe several steps.
+  matches.sort((left, right) => right.score - left.score || left.stepIndex - right.stepIndex || left.evidenceIndex - right.evidenceIndex);
+  const matchedSteps = new Map();
+  const usedEvidence = new Set();
+  for (const match of matches) {
+    if (matchedSteps.has(match.stepIndex) || usedEvidence.has(match.evidenceIndex)) continue;
+    matchedSteps.set(match.stepIndex, evidenceFragments[match.evidenceIndex]);
+    usedEvidence.add(match.evidenceIndex);
+  }
+  // Seeing a later step is evidence that the learner has already passed the
+  // earlier ones, even when OCR captured only the latest board line.
+  const furthestMatchedStep = matchedSteps.size ? Math.max(...matchedSteps.keys()) : -1;
   const completedSteps = [];
   const resolved = new Set(
     [...(Array.isArray(askedConcepts) ? askedConcepts : []), ...(Array.isArray(resolvedConcepts) ? resolvedConcepts : [])]
@@ -8726,12 +9500,13 @@ function deriveGuideProgress({
   for (let index = 0; index < usableGuideSteps.length; index += 1) {
     const step = String(usableGuideSteps[index] || "").trim();
     const stepId = `step_${index + 1}`;
-    if (!step || !evidenceContainsStep(step, evidence)) continue;
-    completedSteps.push({ stepId, evidence: step });
+    if (!step || index > furthestMatchedStep) continue;
+    completedSteps.push({ stepId, evidence: matchedSteps.get(index) || "根据后续步骤推定已完成" });
     resolved.add(stepId);
     const equation = canonicalLinearEquation(step);
     if (equation) resolved.add(`equation:${equation.join(",")}`);
   }
+  const evidence = evidenceFragments.join("\n");
   const previousGuideQuestionAnswered = Boolean(previousGuideQuestion && evidenceContainsStep(previousGuideQuestion, evidence));
   const currentIndex = usableGuideSteps
     .findIndex((step, index) => !completedSteps.some((item) => item.stepId === `step_${index + 1}`));
@@ -8846,6 +9621,7 @@ function isLatestGuideRequest(sessionId, questionId, requestId) {
 }
 
 function buildQuestionMemory(questionId, answerKey = {}, memoryId = "", sessionId = 0) {
+  answerKey = reconcileAnswerKeyWithSolutionOutline(answerKey).answerKey;
   const ready = Boolean(answerKey.trusted);
   return {
     version: 1,
@@ -8872,9 +9648,12 @@ function buildQuestionMemory(questionId, answerKey = {}, memoryId = "", sessionI
       : [],
     verificationChecks: ready && Array.isArray(answerKey.verificationChecks) ? answerKey.verificationChecks : [],
     studentTrace: ready ? answerKey.studentTrace || null : null,
+    independentVerification: ready && answerKey.independentVerification
+      ? answerKey.independentVerification
+      : null,
     reason: String(answerKey.reason || "").trim(),
     elapsedMs: Number(answerKey.elapsedMs) || 0,
-    provider: "qwen-structured-single-pass-question-memory",
+    provider: "qwen-kimi-independent-question-memory",
     createdAt: new Date().toISOString()
   };
 }
@@ -8923,6 +9702,7 @@ function questionMemoryToAnswerKey(questionMemory, expectedQuestionId = "", expe
     verificationChecks: trusted && Array.isArray(questionMemory.verificationChecks)
       ? questionMemory.verificationChecks
       : [],
+    independentVerification: trusted ? questionMemory.independentVerification || null : null,
     studentTrace: trusted ? questionMemory.studentTrace || null : null,
     reason: String(questionMemory.reason || "").trim(),
     elapsedMs: Number(questionMemory.elapsedMs) || 0
@@ -9779,13 +10559,32 @@ function getSilenceGuidePolicy(stage) {
   };
 }
 
+function buildGuideEvidenceContent({
+  studentStrokeImage = "",
+  recognizedBoardProgress = null,
+  handwritingRecognitionMode = ""
+} = {}) {
+  const mode = String(handwritingRecognitionMode || recognizedBoardProgress?.handwritingRecognitionMode || "");
+  const recognizedText = String(
+    recognizedBoardProgress?.recognizedText ||
+    recognizedBoardProgress?.detectedWriting ||
+    recognizedBoardProgress?.ocrRecognizedText || ""
+  ).trim();
+  if (mode === "aliyun-ocr-text" && recognizedText) return [];
+  if (recognizedBoardProgress?.ocrRecognizedText) return [];
+  if (studentStrokeImage) {
+    return [{
+      type: "input_image",
+      label: "仅包含学生新增笔迹的隔离层（OCR 无有效结果时的兜底证据）",
+      image_url: studentStrokeImage,
+      detail: "high"
+    }];
+  }
+  return [];
+}
+
 async function handleGuide(req, res) {
   const body = await readJsonBody(req);
-  const currentBoardImage = body.boardImage || body.questionImage || "";
-  if (!currentBoardImage) {
-    sendJson(res, 400, { error: "缺少当前黑板截图 boardImage" });
-    return;
-  }
 
   const guideSessionId = String(body.sessionId || "").trim();
   const guideQuestionId = String(body.questionId || "").trim();
@@ -9831,11 +10630,8 @@ async function handleGuide(req, res) {
       });
     } else {
       // Do not serialize a second multimodal answer-key request in front of
-      // every guide request. On a cold question that created a 45s + 45s
-      // chain, while the browser gives the guide request only ~52s. The guide
-      // model already receives the question image and can produce the next
-      // concrete step directly; a verified key is reused only when the frozen
-      // Question Memory is ready.
+      // every guide request. The guide request does not resend the question
+      // image; it relies on frozen Question Memory and recognized board text.
       console.info("[guide] answer-key lookup skipped for single-pass guide", {
         questionId: body.questionId || "",
         hasQuestionMemory: Boolean(body.questionMemory),
@@ -9849,6 +10645,20 @@ async function handleGuide(req, res) {
     console.warn(`[guide] answer-key unavailable: ${error?.code || "unknown"} ${error?.message || error}`);
     answerKey = makeUnavailableAnswerKey(error);
   }
+  const currentStudentStrokeImage = String(body.studentStrokeImage || "");
+  const recognizedBoardText = String(
+    body.recognizedBoardProgress?.recognizedText ||
+    body.recognizedBoardProgress?.detectedWriting ||
+    body.recognizedBoardProgress?.mathExpression || ""
+  ).trim();
+  if (!currentStudentStrokeImage && !recognizedBoardText && !answerKey?.trusted) {
+    sendJson(res, 409, {
+      error: "标准答案记忆尚未就绪，当前也没有可用板书证据",
+      code: "guide_evidence_unavailable",
+      stage: "guide"
+    });
+    return;
+  }
 
   console.info("[guide] qwen request-start", {
     eventType: body.eventType || "normal",
@@ -9861,13 +10671,13 @@ async function handleGuide(req, res) {
   const answerReference = !answerKey?.trusted && allowUnverifiedFinalAnswer
     ? {
         trusted: false,
-        instruction: "No verified answer key is available. At silence stage 4, solve the problem directly from the question image, derive the key equations, check the arithmetic, and state the final answer. Do not withhold the solution merely because the reference key is unavailable."
+        instruction: "No verified answer key is available. Use knownProblemText and available guide context to derive only what can be checked. If the source problem is insufficient, do not invent a solution or claim to have inspected an image."
       }
     : privateAnswerReference(answerKey);
 
-  // The question image is the authority, and the answer-key outline is the
-  // authority for concrete guidance. The client can send a board/OCR-derived
-  // hint, but that hint must never replace a verified step: OCR fragments can
+  // The saved Question Memory and answer-key outline are the authority for
+  // concrete guidance. The client can send board OCR text, but that text must
+  // never replace a verified step: OCR fragments can
   // concatenate unrelated symbols and create equations that are not in the
   // question.
   const givenConditions = answerKey?.trusted
@@ -9924,12 +10734,16 @@ async function handleGuide(req, res) {
   console.info("[guide] payload-images", {
     questionId: body.questionId || "",
     questionImageChars: 0,
-    boardImageChars: String(currentBoardImage).length,
-    studentStrokeImageChars: String(body.studentStrokeImage || "").length,
-    totalImageChars: String(currentBoardImage).length + String(body.studentStrokeImage || "").length
+    boardImageChars: 0,
+    ignoredLegacyBoardImageChars: String(body.boardImage || body.questionImage || "").length,
+    studentStrokeImageChars: currentStudentStrokeImage.length,
+    recognizedTextChars: recognizedBoardText.length,
+    recognitionMode: body.handwritingRecognitionMode || "",
+    totalImageChars: currentStudentStrokeImage.length
   });
   const guideModelRequest = {
     model: QWEN_GUIDE_MODEL,
+    reasoningEffort: getGuideReasoningEffort(QWEN_GUIDE_MODEL),
     eventType: body.eventType || "normal",
     schema: guideSchema,
     instructions: [
@@ -9940,9 +10754,9 @@ async function handleGuide(req, res) {
       STATEMENT_EVALUATION_RULES,
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
-      "Concrete guidance source: prefer verifiedGuideSteps and verifiedAnswerReference.solutionOutline. When Question Memory is unavailable, derive only one non-final next operation from the current screenshot's visible equation and the question image; never copy an unverified OCR fragment or invent a relation that is not visible.",
+      "Concrete guidance source: use verifiedGuideSteps and verifiedAnswerReference.solutionOutline as the standard. When handwritingRecognitionMode is aliyun-ocr-text, recognizedBoardProgress is the completed Qwen board judgment; use its recognized writing and completed steps, not a new image. If OCR was unavailable, use only the isolated student-stroke image when provided. A transcription is evidence of what was written, never proof that it is correct.",
     "ACTIVE GUIDANCE OUTPUT CONTRACT: when the event is silence, silence_followup, silence_escalation, active_help, stuck, repeat_wrong, next_step, jump, check, or answer_to_lian_question, copy guideProgress.currentStepId exactly into nextStepId and return exactly one guidanceCandidate selected as that current step. It must include a short speech plus a concrete formulaOrStep or studentAction; if the provider returns only top-level speech/formulaOrStep/studentAction, the server will use that single response. Do not return alternatives or candidate lists.",
-    `HIGHEST PRIORITY SILENCE OVERRIDE: eventType=${body.eventType || "normal"}, stage ${silenceStage}. For silence, silence_followup, silence_escalation, active_help, or next_step, ignore the default Listening rule: return shouldSpeak=true with non-empty Chinese speech and either a concrete formulaOrStep or a concrete studentAction. Stage 1 must identify the first missing problem-specific relation or operation; stage 2 must use a different, next operation based on stage 1 and never repeat its wording; stage 3 must give the next key equation or transformation and ask the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer. At stage 4, solve from the question image when no verified reference is available, and check the arithmetic before speaking. Never invent an answer, never repeat an earlier weaker hint, and never reuse an operation already present in recentGuideHistory.`,
+    `HIGHEST PRIORITY SILENCE OVERRIDE: eventType=${body.eventType || "normal"}, stage ${silenceStage}. For silence, silence_followup, silence_escalation, active_help, or next_step, ignore the default Listening rule: return shouldSpeak=true with non-empty Chinese speech and either a concrete formulaOrStep or a concrete studentAction. Stage 1 must identify the first missing problem-specific relation or operation; stage 2 must use a different, next operation based on stage 1 and never repeat its wording; stage 3 must give the next key equation or transformation and ask the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer from saved problem memory and solution steps. Never invent an answer, never repeat an earlier weaker hint, and never reuse an operation already present in recentGuideHistory.`,
     ].join("\n\n"),
     content: [
       {
@@ -9989,30 +10803,31 @@ async function handleGuide(req, res) {
           recentGuideHistory: Array.isArray(body.recentGuideHistory) ? body.recentGuideHistory.slice(-8) : [],
           boardPendingRecognition: Boolean(body.boardPendingRecognition),
           recognizedBoardProgress: body.recognizedBoardProgress || null,
+          handwritingRecognitionMode: body.handwritingRecognitionMode || "",
           verifiedAnswerReference: answerReference,
           boundaryRules: [
             "When silenceStage is at least 1 and silenceContextStep is present, use that exact problem-specific relation as formulaOrStep and explain only that one next step; do not replace it with generic wording.",
             "givenConditions 是题目明确给出的已知条件，优先级高于所有推导步骤。绝对不要询问 givenConditions 中的关系式是如何由其他式子推出的；已列入 givenConditions 的关系只能作为已知条件使用，不能再要求学生重新推导它。",
             "At silenceStage 1, one concrete relation or formula is allowed, but the final answer is still forbidden until the verified-answer stage.",
-            "At silenceStage 4, give the complete problem-specific explanation, key equations, and final answer even when the standard answer reference is unavailable; derive and check it from the question image instead of returning a generic retry message.",
+            "At silenceStage 4, give the complete problem-specific explanation, key equations, and final answer from saved problem memory and solution steps. If those are unavailable, do not invent missing problem content.",
             "如果 eventType=answer_to_lian_question，必须优先回应 lianQuestion 和 latestStudentSpeech 的对应关系，shouldSpeak=true，通常一句话确认后再给一个很小的下一步。",
             "如果学生回答的是要讲哪一道题、哪一步或哪种方式，先接受这个选择，不要根据黑板截图另行改成别的题号。",
             "lectureUnlocked=false 时只能启发引导或微提示，hintLevel 只能为 encourage/light。",
             "lectureUnlocked=false 时 speech 不得包含最终答案、中间完整算式或完整解题步骤。",
             "lectureUnlocked=true 时默认只讲一个小步骤；但 silenceStage>=4 且学生持续沉默时，必须一次性完成当前题的详细讲解，给出关键式和最终答案。",
-            `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2必须在阶段1基础上换成下一个具体运算或关系，不能重复阶段1；阶段3必须给出再下一步关键式子并要求学生写下或复述，不能重复阶段1/2；阶段4如果学生持续沉默，直接根据题图完成详细讲解，给出关键式和最终答案，不需要等待标准答案核验，但必须先自行检查计算。`,
+            `沉默引导阶段=${silenceStage}：阶段1必须直接指出下一步要使用的具体条件或关系，不得只问“卡在哪里”；阶段2必须在阶段1基础上换成下一个具体运算或关系，不能重复阶段1；阶段3必须给出再下一步关键式子并要求学生写下或复述，不能重复阶段1/2；阶段4如果学生持续沉默，依据已保存的题目记忆和步骤给出详细讲解、关键式和答案；信息不足时不得编造。`,
             "选择题推进闸门：当 recognizedBoardProgress.finalAnswer 为空或 hasFinalAnswer=false 时，绝不进入结论/选项核验；即使 m、n、8 的关系式已经列出，也必须先继续下一条未完成的推导关系（例如相减、代入、消元或判断结论的依据），不能把‘已列出关系式’当成最终答案或核验条件。",
             "沉默时间越长，引导必须越具体：不能在后续阶段重复阶段1的泛泛提问，也不能把已经给过的提示原样重复。",
             "recentGuideHistory 中已经出现的关系式、运算或目标不得再次用同义话术重复；必须根据已完成步骤推进到下一个操作，或把上一条拆成更小且不同的前置动作。",
             "每次互动讲解后 studentAction 必须要求学生复述、继续说或写回黑板。",
             "如果 eventType=active_help，学生已经明确提问或表示不会，必须 shouldSpeak=true，并直接回应这个问题；只给当前最需要的一个小步骤，不要先泛泛鼓励。",
             "当 studentStrokeLayerStatus=empty 或 hasBoardInk=false 时，合成黑板图中导入题目图片里的红叉、圈画、批注、选项和公式都不是学生本次输入；不得说‘你画了红叉’、‘你写出了……’或据此推进核验，只能明确说明还没有看到新增学生板书，并要求写第一条具体关系式或计算步骤。",
-            "普通沉默达到 60 秒时，必须 shouldSpeak=true，并直接给出贴着题目和学生当前进度的具体关系或下一步操作；不要再给泛泛的‘你卡在哪里’。只有 silenceStage>=3 才能逐步给出关键式；silenceStage>=4 且学生持续沉默时，允许直接完成题目讲解并给出最终答案，即使标准答案参考暂不可用，也必须从题图推导并检查。",
+            "普通沉默达到 60 秒时，必须 shouldSpeak=true，并直接给出贴着题目和学生当前进度的具体关系或下一步操作；不要再给泛泛的‘你卡在哪里’。只有 silenceStage>=3 才能逐步给出关键式；silenceStage>=4 且学生持续沉默时，依据已保存的题目记忆和步骤完成讲解；缺少必要信息时不得编造。",
             "如果 eventType=thought_complete 且学生只是半句话、过渡句或仍在铺垫，shouldSpeak=false。",
             "如果 eventType=thought_complete 且确实需要回应，speech 只能是一句短回应；不要展开完整讲解、不要连续解释多个概念。",
             "lectureComplete 默认必须为 false；只有 answerVerified=true、boardCompletionVerified=true，且学生已经讲完关键思路时才设为 true。点击‘我讲完了’本身不是完成证据。",
             "lectureComplete=true 后 speech 只做一次收束，不得继续追问、要求复述或重复已经说过的选项。",
-            "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致；但 silenceStage>=4 且 allowUnverifiedFinalAnswer=true 时，允许直接从题目图片推导并检查后给出关键式和最终答案，不要因为 trusted=false 而退回泛泛提示。",
+            "任何对错判断、算式、选项或答案都必须与 verifiedAnswerReference 一致；silenceStage>=4 且 allowUnverifiedFinalAnswer=true 时，只有已知题目文字足以独立推导并检查，才可给出关键式和最终答案；信息不足时不得编造。",
             "verifiedAnswerReference.trusted=true 时，禁止给出与 canonicalAnswer 不一致的候选最终答案；指出错误时只说具体错在常数项、符号、对应关系或公式，不要说“或者另一个答案”。",
             "如果 verifiedAnswerReference.choiceAnalysis 存在，选项字母只能和其中同标签的 selectedOptionText 一起使用；不要重新猜测 C、D 或其他字母的含义。涉及结论 I/II 时，必须依据 statementVerdicts 的 correct 判断说明。",
             "不要把题目图片里被划掉、红叉或旁边批改的原错答案当作可能正确答案。",
@@ -10021,17 +10836,13 @@ async function handleGuide(req, res) {
           styleRules: LIAN_STYLE_RULES
         })
       },
-      { type: "input_image", label: "当前黑板区域截图（首页导入题图+导入后合成画布）", image_url: currentBoardImage, detail: "high" },
-      ...(body.studentStrokeImage
-        ? [{
-            type: "input_image",
-            label: "导入后新增的学生笔迹隔离层（唯一的本次书写证据）",
-            image_url: body.studentStrokeImage,
-            detail: "high"
-          }]
-        : [])
+      ...buildGuideEvidenceContent({
+        studentStrokeImage: currentStudentStrokeImage,
+        handwritingRecognitionMode: body.handwritingRecognitionMode,
+        recognizedBoardProgress: body.recognizedBoardProgress
+      })
     ],
-    maxOutputTokens: 1200,
+    maxOutputTokens: 650,
     deadlineAt: guideRequestDeadlineAt
   };
   const guideDiagnostics = {
@@ -10041,15 +10852,34 @@ async function handleGuide(req, res) {
     sessionId: guideSessionId,
     guideValidationContext
   };
-  let guideResult = await callGuideQwenMultimodalJson(guideModelRequest, guideDiagnostics);
-  let guideValidation = validateGuideResultForDelivery(guideResult, guideValidationContext);
+  let guideResult = null;
+  let guideRequestError = null;
+  try {
+    guideResult = await callGuideQwenMultimodalJson(guideModelRequest, guideDiagnostics);
+  } catch (error) {
+    guideRequestError = error;
+    console.warn("[guide] model request failed; checking trusted-step fallback", {
+      eventType: body.eventType || "",
+      questionId: guideQuestionId,
+      code: error?.code || "guide_model_failed",
+      elapsedMs: Date.now() - guideRequestStartedAt
+    });
+  }
+  let guideValidation = guideRequestError
+    ? { valid: false, result: null, reason: guideRequestError.code || "guide_model_failed" }
+    : validateGuideResultForDelivery(guideResult, guideValidationContext);
   let guideModelAttempts = 1;
 
   // Active guidance is a product contract, not a best-effort prompt. An
   // invalid, vague, repeated, or out-of-order model result receives one
   // bounded correction attempt with the deterministic next step and recent
   // instructions explicitly marked as forbidden.
-  if (isActiveGuideEvent(body.eventType) && !guideValidation.valid) {
+  const remainingGuideBudgetMs = guideRequestDeadlineAt - Date.now();
+  if (
+    isActiveGuideEvent(body.eventType) &&
+    !guideValidation.valid &&
+    remainingGuideBudgetMs >= 6000
+  ) {
     console.warn("[guide] delivery validation failed; retrying once", {
       eventType: body.eventType || "",
       questionId: guideQuestionId,
@@ -10110,6 +10940,12 @@ async function handleGuide(req, res) {
         reason: retryError?.code || "guide_retry_failed"
       };
     }
+  } else if (isActiveGuideEvent(body.eventType) && !guideValidation.valid && !guideRequestError) {
+    console.info("[guide] correction retry skipped; using trusted step to protect response time", {
+      eventType: body.eventType || "",
+      questionId: guideQuestionId,
+      remainingBudgetMs: Math.max(0, remainingGuideBudgetMs)
+    });
   }
 
   if (guideValidation.valid) {
@@ -10184,7 +11020,7 @@ async function handleGuide(req, res) {
     requestId: guideRequestId,
     sessionId: guideSessionId,
     questionId: guideQuestionId,
-    answerVerification: answerKey.trusted ? "structured-single-pass" : answerKey.status,
+    answerVerification: answerKey.trusted ? "qwen-and-kimi-independent" : answerKey.status,
     provider: "qwen-structured-answer-guidance",
     fallbackFrom: guideResult?.fallbackFrom || "",
     guideSpeechSource: guideResult?.guideSpeechSource || "qwen",
@@ -10287,12 +11123,14 @@ async function handleHandwritingInternal(req, res, task) {
     });
     return;
   }
-  if (!body.boardImage) {
-    sendJson(res, 400, { error: "缺少当前黑板截图 boardImage" });
+  if (!body.studentStrokeImage) {
+    sendJson(res, 400, {
+      error: "缺少仅包含学生新增笔迹的图层",
+      code: "empty_student_stroke_layer",
+      stage: "handwriting-snapshot"
+    });
     return;
   }
-
-  const boardImage = body.boardImage;
   const diagnostics = summarizeHandwritingDiagnostics(body.handwritingDiagnostics);
   task.taskId = String(body.taskId || body.handwritingDiagnostics?.taskId || task.taskId);
   task.boardVersion = Number(diagnostics.boardVersion || 0);
@@ -10360,22 +11198,61 @@ async function handleHandwritingInternal(req, res, task) {
     board_version: task.boardVersion
   });
   console.log("[handwriting] request", diagnostics);
-  if (String(boardImage || "").length < 100) {
+  if (String(body.studentStrokeImage || "").length < 100) {
     sendJson(res, 400, {
-      error: "板书快照为空或过小，请保留板书后重试",
-      code: "empty_board_snapshot",
+      error: "学生笔迹图层为空或过小，请保留板书后重试",
+      code: "empty_student_stroke_layer",
       stage: "snapshot"
     });
     return;
   }
   // The handwriting request consumes the frozen Question Memory created when
-  // the question was entered. The same multimodal call now compares visible
-  // board work with that trusted reference; no second answer-check call is
-  // needed for the normal completion path.
+  // the question was entered. It compares OCR text (or the isolated stroke
+  // image fallback) with that trusted reference in one structured call.
   const answerKey = questionMemoryToAnswerKey(body.questionMemory, questionId, memoryId);
   console.log(
     `[handwriting-timing] question-memory=${Date.now() - requestStartedAt}ms trusted=${answerKey.trusted} q=${diagnostics.questionId} v=${diagnostics.boardVersion}`
   );
+
+  let aliyunHandwritingOcr = null;
+  body.aliyunHandwritingTranscription = "";
+  if (body.hasBoardInk === true && ALIYUN_HANDWRITING_OCR_ENABLED) {
+    try {
+      console.info("[handwriting-ocr] starting Aliyun handwritten-text recognition", {
+        task_id: task.taskId,
+        image_source: getStudentStrokeImageForHandwriting(body) ? "student-strokes" : "missing-student-strokes"
+      });
+      aliyunHandwritingOcr = await recognizeAliyunHandwriting(
+        getStudentStrokeImageForHandwriting(body),
+        task.abortController.signal
+      );
+      if (aliyunHandwritingOcr?.text) {
+        body.aliyunHandwritingTranscription = aliyunHandwritingOcr.text;
+      }
+    } catch (error) {
+      if (task.abortController.signal.aborted) {
+        throw createAbortError("客户端已断开", "qwen_client_disconnected");
+      }
+      console.warn("[handwriting-ocr] Aliyun OCR unavailable; falling back to student-stroke image recognition", {
+        task_id: task.taskId,
+        code: error?.code || "aliyun_handwriting_ocr_failed",
+        message: error?.message || String(error)
+      });
+    }
+  }
+
+  const handwritingRecognitionMode = aliyunHandwritingOcr?.text
+    ? "aliyun-ocr-text"
+    : "student-stroke-image-fallback";
+  if (!String(body.studentStrokeImage || "").startsWith("data:image/")) {
+    sendJson(res, 400, {
+      error: "缺少仅包含学生新增笔迹的图层，无法识别板书",
+      code: "empty_student_stroke_layer",
+      stage: "handwriting-ocr"
+    });
+    return;
+  }
+  body.handwritingRecognitionMode = handwritingRecognitionMode;
 
   task.qwenStartTime = new Date().toISOString();
   diagnostics.qwen_start_time = task.qwenStartTime;
@@ -10383,9 +11260,12 @@ async function handleHandwritingInternal(req, res, task) {
     task_id: task.taskId,
     stage: "handwriting-model",
     model_name: QWEN_HANDWRITING_MODEL,
+    recognition_mode: handwritingRecognitionMode,
+    ocr_text_chars: String(body.aliyunHandwritingTranscription || "").length,
+    qwen_image_count: handwritingRecognitionMode === "student-stroke-image-fallback" ? 1 : 0,
     start_time: task.qwenStartTime
   });
-  let result = await callHandwritingQwenJson({
+  const resultFromModel = await callHandwritingQwenJson({
     model: diagnostics.winnerModel || QWEN_HANDWRITING_MODEL,
     schema: handwritingSchema,
     instructions: HANDWRITING_PROMPT,
@@ -10399,17 +11279,20 @@ async function handleHandwritingInternal(req, res, task) {
           studentSpeechTranscript: String(body.studentSpeechTranscript || "").trim(),
           hasBoardInk: body.hasBoardInk === true,
           studentStrokeLayerStatus: body.hasBoardInk === true ? "non_empty" : "empty",
+          aliyunHandwritingTranscription: String(body.aliyunHandwritingTranscription || ""),
+          handwritingRecognitionMode,
           instruction:
-            "只依据当前黑板区域截图和‘导入后新增的学生笔迹隔离层’判断当前状态和下一动作；首页导入图片里的原有内容不算本次笔迹，学生后来写在图片上、图片内或图片旁边的新增笔迹算本次笔迹；笔迹优先于本题完整语音记录 studentSpeechTranscript 及 latestStudentSpeech；当 hasBoardInk=false 或 studentStrokeLayerStatus=empty 时，即使合成图里看见红叉、圈画、批注、选项或公式，也必须全部按首页导入图片内容处理，不能说成学生画的、写的或算的；当截图中出现最终答案和关键步骤时，使用 verifiedAnswerReference 直接完成核验；如果新增笔迹隔离层为空只能提醒写板书；不要读取或复述任何旧识别结果。",
+            handwritingRecognitionMode === "aliyun-ocr-text"
+              ? "当前是 OCR 文字模式：只使用 aliyunHandwritingTranscription 作为学生新增笔迹转写，不要期待或要求图片输入；OCR 文字是识别证据而非正确性结论，必须与 verifiedAnswerReference 对照；若关键符号含混或证据不足，返回 unclear。"
+              : "当前是学生笔迹图片兜底模式：只根据新增学生笔迹隔离层图片识别和判断；不要期待题目图片或合成黑板截图；只判断图片中明确可辨的本次笔迹，无法确认时返回 unclear。",
           verifiedAnswerReference: privateAnswerReference(answerKey)
         })
       },
-      { type: "input_image", label: "当前黑板区域截图（首页导入题图+导入后合成画布）", image_url: boardImage, detail: "high" },
-      ...(body.studentStrokeImage
+      ...(handwritingRecognitionMode === "student-stroke-image-fallback"
         ? [{
             type: "input_image",
-            label: "导入后新增的学生笔迹隔离层（唯一的本次书写证据）",
-            image_url: body.studentStrokeImage,
+            label: "仅包含导入后新增学生笔迹的隔离层（OCR 无结果时的兜底证据，不含题目图片）",
+            image_url: getStudentStrokeImageForHandwriting(body),
             detail: "high"
           }]
         : [])
@@ -10417,7 +11300,8 @@ async function handleHandwritingInternal(req, res, task) {
     maxOutputTokens: 700,
     signal: task.abortController.signal,
     timeoutMs: QWEN_HANDWRITING_TOTAL_TIMEOUT_MS
-  }, diagnostics);
+    }, diagnostics);
+  let result = resultFromModel;
   task.qwenResponseTime = new Date().toISOString();
   diagnostics.qwen_response_time = task.qwenResponseTime;
   console.info("[handwriting-task] qwen_response", {
@@ -10427,11 +11311,8 @@ async function handleHandwritingInternal(req, res, task) {
   });
   console.log(`[handwriting-timing] initial=${Date.now() - requestStartedAt}ms`);
 
-  result = await auditHandwritingResult(result, answerKey, body, boardImage, {
-    signal: task.abortController.signal,
-    timeoutMs: QWEN_HANDWRITING_TOTAL_TIMEOUT_MS,
-    diagnostics
-  });
+  // The OCR text and frozen answer steps are already in the primary Qwen
+  // judgment. Local safety/progress checks below do not make another call.
   result = applyStatementEvaluationSafety(result, answerKey);
   result = buildHandwritingProcessFeedback(result, answerKey, body);
   result = applyHandwritingAnswerVerification(result, answerKey);
@@ -10479,8 +11360,13 @@ async function handleHandwritingInternal(req, res, task) {
     });
     return;
   }
+  const publicResult = { ...result };
+  delete publicResult.ocrRecognizedText;
+  delete publicResult.aliyunHandwritingTranscription;
   sendJson(res, 200, {
-    ...result,
+    ...publicResult,
+    handwritingRecognitionMode,
+    handwritingOcrProvider: body.aliyunHandwritingTranscription ? "aliyun-recognize-all-text-handwriting" : "",
     requestId: Number(body.requestId || 0),
     sessionId: Number(sessionId),
     questionId,
@@ -10556,6 +11442,10 @@ function makeHandwritingUncertain(result, reason = "板书判断还需要再核�
   };
 }
 
+function getStudentStrokeImageForHandwriting(body = {}) {
+  return String(body.studentStrokeImage || "");
+}
+
 function normalizeVisibleCompletedSteps(value) {
   const seen = new Set();
   return (Array.isArray(value) ? value : [])
@@ -10602,7 +11492,20 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   const memorySteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
     ? answerKey.solutionOutline.map((step) => String(step || "").trim()).filter(Boolean)
     : [];
-  const nextMemoryStep = memorySteps.find((step) => !completedSteps.some((item) => evidenceContainsStep(step, item))) || "";
+  // Match all visible equations, including OCR lines that the model omitted
+  // from completedSteps. This stays server-side and cannot turn OCR into a
+  // correctness verdict: only an already-correct model judgment may advance.
+  const boardProgress = deriveGuideProgress({
+    verifiedGuideSteps: memorySteps,
+    givenConditions: answerKey?.givenConditions,
+    latestHandwritingResult: {
+      ...result,
+      ocrRecognizedText: String(body.aliyunHandwritingTranscription || "")
+    }
+  });
+  const nextMemoryStep = boardProgress.completedSteps.length
+    ? boardProgress.currentStep
+    : memorySteps.find((step) => !completedSteps.some((item) => evidenceContainsStep(step, item))) || "";
   const latestVisibleStep = completedSteps.at(-1) || "";
   const output = {
     ...(result || {}),
@@ -10630,7 +11533,7 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   if (modelAction) {
     if (
       result?.calculationStatus === "correct" &&
-      completedSteps.length > 0 &&
+      (completedSteps.length > 0 || boardProgress.completedSteps.length > 0) &&
       ["continue_guidance", "ask_for_board"].includes(modelAction) &&
       nextMemoryStep
     ) {
@@ -10638,6 +11541,18 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
         ...output,
         guidance: `下一步直接做：${nextMemoryStep}`,
         expectedNextStep: nextMemoryStep
+      };
+    }
+    if (
+      result?.calculationStatus === "correct" &&
+      boardProgress.completedSteps.length > 0 &&
+      !nextMemoryStep &&
+      ["continue_guidance", "ask_for_board"].includes(modelAction) &&
+      !String(result?.finalAnswer || "").trim()
+    ) {
+      return {
+        ...output,
+        guidance: "接下来把结果整理成最终答案。"
       };
     }
     return output;
@@ -10810,7 +11725,7 @@ function applyHandwritingAudit(result, audit) {
   };
 }
 
-async function auditHandwritingResult(result, answerKey, body, boardImage, control = {}) {
+async function auditHandwritingResult(result, answerKey, body, control = {}) {
   if (!shouldAuditHandwritingResult(result, answerKey, body)) {
     console.log(
       `[handwriting-audit] skipped status=${result?.calculationStatus || ""} confidence=${result?.confidence || 0}`
@@ -10828,17 +11743,20 @@ async function auditHandwritingResult(result, answerKey, body, boardImage, contr
           text: JSON.stringify({
             trigger: body.reason || "",
             boardIdleSeconds: Math.max(0, Number(body.boardIdleSeconds) || 0),
+            handwritingRecognitionMode: body.handwritingRecognitionMode || "student-stroke-image-fallback",
             instruction:
-              "只根据当前黑板区域截图和导入后新增的学生笔迹隔离层独立审校可见步骤，并参考 verifiedAnswerReference 审校可见最终答案。首页导入图片中的原有内容不是本次笔迹；不得读取旧识别结果、补全未写步骤或生成反馈；wrong 必须同时给出明确错误位置和来自新增笔迹的证据。",
+              body.handwritingRecognitionMode === "aliyun-ocr-text"
+                ? "OCR 模式只依据 aliyunHandwritingTranscription 独立审校可见步骤，并参考 verifiedAnswerReference 审校答案；不要期待图片输入。OCR 是识字参考而非正确性结论，文字或关键符号含混时降低置信度，不要判错。不得补全未写步骤或生成反馈；wrong 必须给出明确错误位置和来自转写的证据。"
+                : "图片兜底模式只根据新增学生笔迹隔离层图片独立审校可见步骤，并参考 verifiedAnswerReference 审校答案；不要期待题目图片或合成黑板截图。无法辨认时降低置信度，不要判错。不得补全未写步骤或生成反馈；wrong 必须给出明确错误位置和来自笔迹的证据。",
+            aliyunHandwritingTranscription: String(body.aliyunHandwritingTranscription || ""),
             verifiedAnswerReference: privateAnswerReference(answerKey)
           })
         },
-        { type: "input_image", label: "当前黑板区域截图（首页导入题图+导入后合成画布）", image_url: boardImage, detail: "high" },
-        ...(body.studentStrokeImage
+        ...(body.handwritingRecognitionMode !== "aliyun-ocr-text" && body.studentStrokeImage
           ? [{
               type: "input_image",
-              label: "导入后新增的学生笔迹隔离层（唯一的本次书写证据）",
-              image_url: body.studentStrokeImage,
+              label: "仅包含导入后新增学生笔迹的隔离层（不含题目图片）",
+              image_url: getStudentStrokeImageForHandwriting(body),
               detail: "high"
             }]
           : [])
@@ -11062,15 +11980,20 @@ async function handleRequest(req, res) {
         qwenModels: QWEN_VL_MODEL_CANDIDATES,
         qwenGuideModel: QWEN_GUIDE_MODEL,
         qwenGuideModels: QWEN_GUIDE_MODEL_CANDIDATES,
+        kimiAnswerVerifierConfigured: Boolean(KIMI_API_KEY && KIMI_BASE_URL),
+        kimiAnswerVerifierModel: KIMI_VERIFY_MODEL,
         qwenHandwritingModel: QWEN_HANDWRITING_MODEL,
         qwenHandwritingModels: QWEN_HANDWRITING_MODEL_CANDIDATES,
         qwenModelCooldownMs: QWEN_MODEL_COOLDOWN_MS,
         qwenRequestTimeoutMs: QWEN_REQUEST_TIMEOUT_MS,
         qwenHandwritingRetryCount: QWEN_HANDWRITING_RETRY_COUNT,
-        handwritingAuditEnabled: HANDWRITING_AUDIT_ENABLED,
+        handwritingAuditEnabled: false,
         aliyunOcrConfigured: Boolean(ALIYUN_OCR_APPCODE),
         aliyunOcrEnabled: ALIYUN_OCR_ENABLED,
         aliyunOfficialEduPaperCutConfigured: Boolean(ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET),
+        aliyunHandwritingOcrConfigured: Boolean(
+          ALIYUN_HANDWRITING_OCR_ENABLED && ALIYUN_OCR_ACCESS_KEY_ID && ALIYUN_OCR_ACCESS_KEY_SECRET
+        ),
         azureTtsConfigured: Boolean(AZURE_TTS_KEY && AZURE_TTS_REGION),
         azureTtsVoice: AZURE_TTS_VOICE,
         aliyunSpeechConfigured: aliyunSpeechConfigured(),
@@ -11170,9 +12093,13 @@ module.exports = {
   guideContradictsVerifiedAnswer,
   makeAnswerLockedGuideSafe,
   answerValuesEquivalent,
+  deriveTerminalScalarAnswer,
+  reconcileAnswerKeyWithSolutionOutline,
+  answerKeySolverValidationIssues,
   normalizeChoiceAnalysis,
   choiceAnalysesAgree,
   answerKeyResultsAgree,
+  independentAnswerKeyValidationIssues,
   makeUnverifiedGuideSafe,
   studentAnswerMatchesVerifiedKey,
   isOnlyDirectAnswerWriting,
@@ -11191,6 +12118,8 @@ module.exports = {
   buildQuestionMemory,
   questionMemoryToAnswerKey,
   deriveGuideProgress,
+  buildGuideEvidenceContent,
+  getGuideReasoningEffort,
   normalizeGivenConditions,
   filterGuideStepsByKnownConditions,
   canonicalLinearEquation,
@@ -11204,6 +12133,11 @@ module.exports = {
   raceQwenStructuredModels,
   registerQuestionMemoryIdentity,
   registerHandwritingRequest,
+  decodeDataImage,
+  withTemporaryKimiImageUrl,
+  extractAliyunHandwritingContent,
+  recognizeAliyunHandwriting,
+  getStudentStrokeImageForHandwriting,
   isLatestHandwritingRequest,
   getSilenceGuidePolicy
 };
