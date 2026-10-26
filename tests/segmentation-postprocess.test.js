@@ -813,6 +813,36 @@ test("handwriting guidance advances past an OCR-visible step omitted from model 
   assert.doesNotMatch(result.guidance, /将两个方程相加/);
 });
 
+test("a verified key equation advances guidance even when the model labels the solution unfinished", () => {
+  const answerKey = {
+    trusted: true,
+    givenConditions: ["x-y=-1"],
+    solutionOutline: [
+      "将左边相加得到 5x-5y",
+      "将右边 (7m+1)+(3m-6) 相加",
+      "把 x-y=-1 代入并求 m"
+    ]
+  };
+  const result = buildHandwritingProcessFeedback({
+    writingState: "in_progress",
+    completedSteps: ["5x-5y"],
+    detectedWriting: "5x-5y",
+    calculationStatus: "incomplete",
+    confidence: 0.87,
+    nextAction: "continue_guidance",
+    guidance: "接下来把等式右边相加。"
+  }, answerKey, {
+    boardIdleSeconds: 7,
+    aliyunHandwritingTranscription: "5x-5y=10m-5"
+  });
+
+  assert.deepEqual(result.recognizedKeyStepIds, ["step_1", "step_2"]);
+  assert.equal(result.expectedNextStep, answerKey.solutionOutline[2]);
+  assert.match(result.guidance, /代入/);
+  assert.doesNotMatch(result.guidance, /右边相加/);
+  assert.equal(result.ocrRecognizedText, undefined);
+});
+
 test("only gives stalled guidance from Question Memory standard steps", () => {
   const answerKey = questionMemoryToAnswerKey(buildQuestionMemory("q-1", {
     trusted: true,

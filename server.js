@@ -458,6 +458,7 @@ const HANDWRITING_PROMPT = [
   "当 finalAnswer 与关键步骤都明确时，禁止继续询问学生是否正确；必须直接核验。选择题如果已写出选项/结论且至少有一条有效计算、代入、消元或反例步骤，直接依据标准答案核验。",
   "当前没有 finalAnswer 时，只能引导当前关系式、代入、消元、计算或推理步骤；不得要求提前写最终答案。",
   "如果 calculationStatus=correct，已完成步骤不得要求重写，guidance 应推进到 verifiedGuideSteps 中尚未完成的下一步；如果 calculationStatus=wrong，必须说清错处和正确改法。",
+  "按关键数学结果判断进度，不要求学生逐行照抄 solutionOutline。若板书已经给出某次运算后完整且正确的等式，左右两边相应的化简都视为完成；即使省略展开、合并等中间行，也直接引导下一项尚未完成的关键操作。尤其不要在右边结果已写出的情况下再次要求计算等式右边。",
   "guidance 必须说明具体下一步，不能泛泛地说继续或再想一想。",
   "如果输入证据中没有学生关键笔迹，返回 answerVerificationStatus=\"not_present\"、nextAction=ask_for_board，并只提醒学生写下当前关键关系式或计算步骤。",
   "输出必须严格遵守 JSON schema。"
@@ -9380,6 +9381,43 @@ function progressEquationSignature(value) {
   return new Map([...difference].map(([key, coefficient]) => [key, coefficient * sign]));
 }
 
+function guideKeyExpression(step) {
+  if (extractProgressEquationCandidates(step).length) return "";
+  const text = String(step || "");
+  // A cited expression is not proof that a substitution has been performed.
+  if (/代入/.test(text)) return "";
+  const compact = normalizeProgressFormula(text);
+  const formulas = compact.match(/[a-z0-9(][a-z0-9_()+\-*/.^)]*/gi) || [];
+  const valid = formulas.filter((formula) =>
+    (/[+\-*/^]/.test(formula) || /\d[a-z]/i.test(formula)) &&
+    polynomialFromExpression(formula)
+  );
+  if (!valid.length) return "";
+  const formulaOnly = valid.length === 1 && valid[0] === compact;
+  if (!formulaOnly && !/相加|相减|化简|合并|计算|算出|得到|得出|整理/.test(text)) return "";
+  return valid.at(-1);
+}
+
+function guideKeyExpressionMatch(expectedStep, evidenceText) {
+  const keyExpression = guideKeyExpression(expectedStep);
+  if (!keyExpression) return 0;
+  const expectedPolynomial = polynomialFromExpression(keyExpression);
+  for (const equation of extractProgressEquationCandidates(evidenceText)) {
+    for (const side of equation.split("=")) {
+      if (normalizeProgressFormula(side) === keyExpression) return 95;
+      const sidePolynomial = polynomialFromExpression(side);
+      if (
+        expectedPolynomial && sidePolynomial &&
+        expectedPolynomial.size === sidePolynomial.size &&
+        [...expectedPolynomial].every(([key, coefficient]) =>
+          Math.abs(coefficient - (sidePolynomial.get(key) || 0)) < 1e-7
+        )
+      ) return 75;
+    }
+  }
+  return 0;
+}
+
 function guideProgressMatchScore(expectedStep, evidenceText) {
   const expected = normalizeProgressText(expectedStep);
   const evidence = normalizeProgressText(evidenceText);
@@ -9406,6 +9444,7 @@ function guideProgressMatchScore(expectedStep, evidenceText) {
       ) bestScore = Math.max(bestScore, 80);
     }
   }
+  bestScore = Math.max(bestScore, guideKeyExpressionMatch(expectedStep, evidenceText));
   if (!expectedEquations.length && !evidenceEquations.length && evidence.includes(expected)) {
     return 100;
   }
@@ -9489,9 +9528,26 @@ function deriveGuideProgress({
     matchedSteps.set(match.stepIndex, evidenceFragments[match.evidenceIndex]);
     usedEvidence.add(match.evidenceIndex);
   }
+  // One complete equation can contain two distinct key results, such as the
+  // simplified left and right sides. It need not be written as two lines.
+  for (const match of matches) {
+    if (match.score !== 95 && match.score !== 75) continue;
+    if (!matchedSteps.has(match.stepIndex)) {
+      matchedSteps.set(match.stepIndex, evidenceFragments[match.evidenceIndex]);
+    }
+  }
   // Seeing a later step is evidence that the learner has already passed the
   // earlier ones, even when OCR captured only the latest board line.
-  const furthestMatchedStep = matchedSteps.size ? Math.max(...matchedSteps.keys()) : -1;
+  const recognizedKeyStepIds = ["correct", "incomplete"].includes(result.calculationStatus) &&
+    Array.isArray(result.recognizedKeyStepIds)
+    ? result.recognizedKeyStepIds.filter((id) => /^step_[1-8]$/.test(String(id)))
+    : [];
+  const rememberedIndex = recognizedKeyStepIds.reduce((furthest, id) =>
+    Math.max(furthest, Number(id.slice(5)) - 1), -1);
+  const furthestMatchedStep = Math.max(
+    matchedSteps.size ? Math.max(...matchedSteps.keys()) : -1,
+    rememberedIndex
+  );
   const completedSteps = [];
   const resolved = new Set(
     [...(Array.isArray(askedConcepts) ? askedConcepts : []), ...(Array.isArray(resolvedConcepts) ? resolvedConcepts : [])]
@@ -11506,11 +11562,25 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   const nextMemoryStep = boardProgress.completedSteps.length
     ? boardProgress.currentStep
     : memorySteps.find((step) => !completedSteps.some((item) => evidenceContainsStep(step, item))) || "";
+  const canAdvanceKeyStep = Boolean(
+    boardProgress.completedSteps.length > 0 &&
+    result?.isRelevant !== false &&
+    result?.hasPossibleIssue !== true &&
+    (
+      result?.calculationStatus === "correct" ||
+      (result?.calculationStatus === "incomplete" && Number(result?.confidence) >= 0.65)
+    )
+  );
   const latestVisibleStep = completedSteps.at(-1) || "";
   const output = {
     ...(result || {}),
     writingState,
     completedSteps,
+    // Only the server-derived milestone IDs leave this endpoint. Raw OCR
+    // remains private to the handwriting request.
+    recognizedKeyStepIds: canAdvanceKeyStep
+      ? boardProgress.completedSteps.map((step) => step.stepId)
+      : [],
     errorLocation: explicitWrong ? errorLocation : "",
     errorEvidence: explicitWrong ? errorEvidence : "",
     expectedNextStep: "",
@@ -11532,7 +11602,7 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
   // next trusted step so completed work is never requested again.
   if (modelAction) {
     if (
-      result?.calculationStatus === "correct" &&
+      canAdvanceKeyStep &&
       (completedSteps.length > 0 || boardProgress.completedSteps.length > 0) &&
       ["continue_guidance", "ask_for_board"].includes(modelAction) &&
       nextMemoryStep
@@ -11544,7 +11614,7 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
       };
     }
     if (
-      result?.calculationStatus === "correct" &&
+      canAdvanceKeyStep &&
       boardProgress.completedSteps.length > 0 &&
       !nextMemoryStep &&
       ["continue_guidance", "ask_for_board"].includes(modelAction) &&

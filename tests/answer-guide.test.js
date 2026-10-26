@@ -276,6 +276,71 @@ test("a later exact board step advances past the earlier outline even if OCR mis
   assert.equal(progress.currentStepId, "");
 });
 
+test("one complete equation satisfies distinct left and right simplification milestones", () => {
+  const progress = deriveGuideProgress({
+    verifiedGuideSteps: [
+      "将左边相加得到 5x-5y",
+      "将右边 (7m+1)+(3m-6) 相加",
+      "把 x-y=-1 代入并求 m"
+    ],
+    latestHandwritingResult: {
+      ocrRecognizedText: "5x - 5y = 10m - 5"
+    }
+  });
+
+  assert.deepEqual(progress.completedSteps.map((step) => step.stepId), ["step_1", "step_2"]);
+  assert.equal(progress.currentStepId, "step_3");
+});
+
+test("key-result matching works across variables but does not accept a wrong right side", () => {
+  const verifiedGuideSteps = [
+    "合并左边得 5a-b",
+    "合并右边 (4c+1)+(2c-1)",
+    "用题目条件求 c"
+  ];
+  const correct = deriveGuideProgress({
+    verifiedGuideSteps,
+    latestHandwritingResult: { ocrRecognizedText: "5a-b=6c" }
+  });
+  const wrong = deriveGuideProgress({
+    verifiedGuideSteps,
+    latestHandwritingResult: { ocrRecognizedText: "5a-b=6c+1" }
+  });
+
+  assert.equal(correct.currentStepId, "step_3");
+  assert.equal(wrong.currentStepId, "step_2");
+});
+
+test("a cited but unperformed substitution is not marked complete", () => {
+  const progress = deriveGuideProgress({
+    verifiedGuideSteps: ["将 5x-5y 化简", "把 x-y 代入 5(x-y)"],
+    latestHandwritingResult: { ocrRecognizedText: "5x-5y=10m-5" }
+  });
+
+  assert.equal(progress.currentStepId, "step_2");
+});
+
+test("server-confirmed key milestones survive when the model transcription omits a board side", () => {
+  const progress = deriveGuideProgress({
+    verifiedGuideSteps: ["化简左边得 5x-5y", "化简右边得 10m-5", "代入条件求 m"],
+    latestHandwritingResult: {
+      calculationStatus: "incomplete",
+      detectedWriting: "5x-5y",
+      recognizedKeyStepIds: ["step_1", "step_2"]
+    }
+  });
+
+  assert.equal(progress.currentStepId, "step_3");
+  const wrongProgress = deriveGuideProgress({
+    verifiedGuideSteps: ["化简左边得 5x-5y", "化简右边得 10m-5", "代入条件求 m"],
+    latestHandwritingResult: {
+      calculationStatus: "wrong",
+      recognizedKeyStepIds: ["step_1", "step_2"]
+    }
+  });
+  assert.equal(wrongProgress.currentStepId, "step_1");
+});
+
 test("Case 4: stale request metadata cannot be treated as current", () => {
   const requestA = { requestId: 10, boardVersion: 10 };
   const current = { requestId: 11, boardVersion: 11 };

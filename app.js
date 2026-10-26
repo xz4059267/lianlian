@@ -4093,6 +4093,9 @@ function normalizeHandwritingResult(result) {
     completedSteps: Array.isArray(result.completedSteps)
       ? result.completedSteps.map((step) => String(step || "").trim()).filter(Boolean).slice(0, 8)
       : [],
+    recognizedKeyStepIds: Array.isArray(result.recognizedKeyStepIds)
+      ? result.recognizedKeyStepIds.filter((id) => /^step_[1-8]$/.test(String(id))).slice(0, 8)
+      : [],
     errorLocation: String(result.errorLocation || "").trim(),
     errorEvidence: String(result.errorEvidence || "").trim(),
     boardComplete: result.boardComplete === true,
@@ -6641,6 +6644,9 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
     ? {
         completedSteps: Array.isArray(state.latestHandwritingResult.completedSteps)
           ? state.latestHandwritingResult.completedSteps.slice(0, 8)
+          : [],
+        recognizedKeyStepIds: Array.isArray(state.latestHandwritingResult.recognizedKeyStepIds)
+          ? state.latestHandwritingResult.recognizedKeyStepIds.slice(0, 8)
           : [],
         // Preserve the model's complete current-board transcription so the
         // guide can recognize assignments/choices that were visible but not
