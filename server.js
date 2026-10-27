@@ -3665,19 +3665,16 @@ function isGuideResultUsableAfterSafety(result, diagnostics = {}) {
 }
 
 function isValidHandwritingResult(result) {
-  if (!result || typeof result !== "object") return false;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
   const writingState = String(result.writingState || "").trim().toLowerCase();
   const calculationStatus = String(result.calculationStatus || "").trim().toLowerCase();
   const status = String(result.status || "").trim().toLowerCase();
-  const uncertainStates = new Set(["unclear", "uncertain", "unknown", "不确定", "无法判断"]);
-  // An explicit uncertain response is not a winner in a parallel race. It
-  // must leave room for the other model to return an actually usable board
-  // interpretation.
-  if ([writingState, calculationStatus, status].some((value) => uncertainStates.has(value))) {
-    return false;
-  }
-  const confidence = Number(result.confidence);
-  if (Number.isFinite(confidence) && confidence < 0.35) return false;
+  const invalidStates = new Set(["uncertain", "unknown", "不确定", "无法判断"]);
+  if ([writingState, calculationStatus, status].some((value) => invalidStates.has(value))) return false;
+  // "unclear" is an expected, safe judgment when OCR or a key symbol is
+  // ambiguous. Do not turn it into a format error, even with low confidence
+  // or no legible transcription. The caller will suppress definitive advice.
+  if (writingState === "unclear" || calculationStatus === "unclear") return true;
   const hasVisibleContent = Boolean(
     String(result.detectedWriting || "").trim() ||
     String(result.mathExpression || "").trim() ||
@@ -11357,7 +11354,7 @@ async function handleHandwritingInternal(req, res, task) {
     signal: task.abortController.signal,
     timeoutMs: QWEN_HANDWRITING_TOTAL_TIMEOUT_MS
     }, diagnostics);
-  let result = resultFromModel;
+  let result = normalizeUnclearHandwritingResult(resultFromModel);
   task.qwenResponseTime = new Date().toISOString();
   diagnostics.qwen_response_time = task.qwenResponseTime;
   console.info("[handwriting-task] qwen_response", {
@@ -11495,6 +11492,26 @@ function makeHandwritingUncertain(result, reason = "板书判断还需要再核�
     guidance: "",
     positiveFeedback: "",
     confidence: Math.min(Number(result?.confidence) || 0.5, 0.55)
+  };
+}
+
+function normalizeUnclearHandwritingResult(result) {
+  const confidence = Number(result?.confidence);
+  const uncertain = String(result?.writingState || "").trim().toLowerCase() === "unclear" ||
+    String(result?.calculationStatus || "").trim().toLowerCase() === "unclear" ||
+    (Number.isFinite(confidence) && confidence < 0.35);
+  if (!uncertain) return result;
+  return {
+    ...makeHandwritingUncertain(result, String(result?.calculationCheck || "板书内容暂时无法可靠判断。").trim()),
+    writingState: "unclear",
+    nextAction: "ask_for_board",
+    boardComplete: false,
+    recognizedKeyStepIds: [],
+    expectedNextStep: "",
+    missingBoardContent: String(result?.missingBoardContent || "请把关键等式或符号写清楚，或补充说明。").trim(),
+    answerVerificationStatus: String(result?.finalAnswer || "").trim() ? "unclear" : "not_present",
+    answerFeedback: "",
+    answerHint: ""
   };
 }
 
@@ -12199,6 +12216,7 @@ module.exports = {
   isTransientQwenError,
   isConcreteGuideResult,
   isValidHandwritingResult,
+  normalizeUnclearHandwritingResult,
   requestQwenChatCompletionOnce,
   raceQwenStructuredModels,
   registerQuestionMemoryIdentity,

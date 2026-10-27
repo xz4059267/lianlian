@@ -4,6 +4,8 @@ const assert = require("node:assert/strict");
 const {
   isConcreteGuideResult,
   isValidHandwritingResult,
+  normalizeUnclearHandwritingResult,
+  buildHandwritingProcessFeedback,
   requestQwenChatCompletionOnce,
   raceQwenStructuredModels
 } = require("../server.js");
@@ -37,7 +39,7 @@ test("guide validator rejects empty and generic failure messages", () => {
   );
 });
 
-test("handwriting validator rejects uncertain empty output", () => {
+test("handwriting validator accepts explicit unclear but still rejects malformed statuses", () => {
   assert.equal(
     isValidHandwritingResult({
       detectedWriting: "",
@@ -46,7 +48,7 @@ test("handwriting validator rejects uncertain empty output", () => {
       calculationStatus: "unclear",
       confidence: 0.2
     }),
-    false
+    true
   );
   assert.equal(
     isValidHandwritingResult({
@@ -57,6 +59,9 @@ test("handwriting validator rejects uncertain empty output", () => {
     }),
     false
   );
+  assert.equal(isValidHandwritingResult({ message: "无法判断" }), false);
+  assert.equal(isValidHandwritingResult([]), false);
+  assert.equal(isValidHandwritingResult({ detectedWriting: "x=1", calculationStatus: "correct", confidence: 0.2 }), true);
   assert.equal(
     isValidHandwritingResult({
       detectedWriting: "x - 2y = m",
@@ -67,6 +72,68 @@ test("handwriting validator rejects uncertain empty output", () => {
       confidence: 0.88
     }),
     true
+  );
+});
+
+test("an unclear handwriting result returns normally without claiming progress or correctness", async () => {
+  const modelResult = {
+    detectedWriting: "x - ?y = 10m - 5",
+    mathExpression: "",
+    writingState: "unclear",
+    calculationStatus: "unclear",
+    nextAction: "continue_guidance",
+    guidance: "把两边相加得到答案",
+    boardComplete: true,
+    finalAnswer: "m=1",
+    answerVerificationStatus: "correct",
+    confidence: 0.18
+  };
+  const result = await raceQwenStructuredModels({
+    options: {},
+    models: ["handwriting-model"],
+    label: "handwriting",
+    isValid: isValidHandwritingResult,
+    invokeModel: async () => modelResult
+  });
+  assert.deepEqual(result, modelResult);
+
+  const normalized = normalizeUnclearHandwritingResult(result);
+  assert.equal(normalized.calculationStatus, "unclear");
+  assert.equal(normalized.nextAction, "ask_for_board");
+  assert.equal(normalized.guidance, "");
+  assert.equal(normalized.boardComplete, false);
+  assert.equal(normalized.answerVerificationStatus, "unclear");
+  assert.deepEqual(normalized.recognizedKeyStepIds, []);
+  const feedback = buildHandwritingProcessFeedback(normalized, {
+    trusted: true,
+    solutionOutline: ["先列关系式", "再求最终答案"]
+  });
+  assert.equal(feedback.guidance, "");
+  assert.deepEqual(feedback.recognizedKeyStepIds, []);
+
+  const lowConfidenceVerdict = normalizeUnclearHandwritingResult({
+    detectedWriting: "x=1",
+    writingState: "complete",
+    calculationStatus: "correct",
+    nextAction: "finished",
+    boardComplete: true,
+    confidence: 0.2
+  });
+  assert.equal(lowConfidenceVerdict.calculationStatus, "unclear");
+  assert.equal(lowConfidenceVerdict.nextAction, "ask_for_board");
+  assert.equal(lowConfidenceVerdict.boardComplete, false);
+});
+
+test("malformed handwriting output remains a format error", async () => {
+  await assert.rejects(
+    raceQwenStructuredModels({
+      options: {},
+      models: ["handwriting-model"],
+      label: "handwriting",
+      isValid: isValidHandwritingResult,
+      invokeModel: async () => ({ message: "无法判断" })
+    }),
+    (error) => error.code === "invalid_model_output"
   );
 });
 

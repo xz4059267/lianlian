@@ -3579,8 +3579,8 @@ function explainHandwritingError(error) {
   }
   if (code === "invalid_model_output") {
     return {
-      pill: "模型返回格式异常",
-      log: `板书图片已送达 Qwen，但${stage ? `${stage}阶段` : "模型"}没有返回可解析的结构化结果；已保留本次板书，下一版板书会重新识别。`,
+      pill: "模型结果格式异常",
+      log: `Qwen 在${stage ? `${stage}阶段` : "板书判断阶段"}的返回内容未通过解析或字段校验；这不是板书内容判错。本次板书已保留，但尚未完成判断。`,
       pauseMs: 0
     };
   }
@@ -3669,6 +3669,14 @@ async function runHandwritingRecognition(reason) {
         recognitionStartedWith: recognitionInputSnapshot
       });
       dom.recognitionPill.textContent = "板书已记录，按最新语音继续";
+      return;
+    }
+
+    if (result.writingState === "unclear" || result.calculationStatus === "unclear") {
+      dom.recognitionPill.textContent = "板书内容待确认";
+      addLog("提示", "这次板书还不能可靠识别或判断，尚未判对错。请把关键等式或符号写清楚，或把这一行读给恋恋。", {
+        key: `handwriting-unclear:${question.id}:${boardVersion}`
+      });
       return;
     }
 
