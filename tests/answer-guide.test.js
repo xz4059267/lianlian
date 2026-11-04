@@ -12,7 +12,9 @@ const {
   reconcileAnswerKeyWithSolutionOutline,
   answerKeySolverValidationIssues,
   independentAnswerKeyValidationIssues,
-  buildQuestionMemory
+  buildQuestionMemory,
+  buildHandwritingProcessFeedback,
+  validateGuideResultForDelivery
 } = require("../server");
 
 test("question memory answer follows the model's derived terminal step, not a conflicting answer field", () => {
@@ -339,6 +341,88 @@ test("server-confirmed key milestones survive when the model transcription omits
     }
   });
   assert.equal(wrongProgress.currentStepId, "step_1");
+});
+
+test("model-judged board progress advances guidance without literal formula matching", () => {
+  const steps = ["先用图中的等面积关系建立等式", "把已知长度代入并求未知量"];
+  const result = buildHandwritingProcessFeedback({
+    detectedWriting: "两个阴影面积相等",
+    completedSteps: ["两个阴影面积相等"],
+    completedGuideStepIds: ["step_1"],
+    calculationStatus: "incomplete",
+    confidence: 0.9,
+    isRelevant: true,
+    hasPossibleIssue: false,
+    nextAction: "continue_guidance",
+    guidance: "先建立面积相等的关系",
+    writingState: "in_progress"
+  }, { trusted: true, solutionOutline: steps, givenConditions: [] }, {
+    aliyunHandwritingTranscription: "两个阴影面积相等"
+  });
+
+  assert.deepEqual(result.recognizedKeyStepIds, ["step_1"]);
+  assert.equal(result.expectedNextStep, steps[1]);
+  assert.equal(result.guidance, `下一步直接做：${steps[1]}`);
+});
+
+test("model-judged progress is ignored when board judgment is wrong", () => {
+  const result = buildHandwritingProcessFeedback({
+    completedGuideStepIds: ["step_2"],
+    calculationStatus: "wrong",
+    confidence: 0.9,
+    hasPossibleIssue: true,
+    nextAction: "continue_guidance"
+  }, { trusted: true, solutionOutline: ["步骤一", "步骤二"], givenConditions: [] });
+
+  assert.deepEqual(result.recognizedKeyStepIds, []);
+});
+
+test("guide model can advance beyond the tentative formula-matching step", () => {
+  const steps = ["写出关系式 a+b=c", "将 a=2 代入并得到 b=c-2"];
+  const result = validateGuideResultForDelivery({
+    shouldSpeak: true,
+    speech: "把 a=2 代入 a+b=c，写出 b=c-2。",
+    formulaOrStep: "b=c-2",
+    studentAction: "写出 b=c-2",
+    nextStepId: "step_2",
+    lectureComplete: false
+  }, {
+    eventType: "active_help",
+    hasBoardInk: true,
+    guideProgress: { currentStepId: "step_1", currentStep: steps[0], givenConditions: [] },
+    verifiedGuideSteps: steps,
+    recognizedBoardProgress: { detectedWriting: "a+b=c", completedSteps: ["a+b=c"] },
+    recentGuideHistory: []
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.result.nextStepId, "step_2");
+});
+
+test("guide does not ask for a proportion already written as a fraction", () => {
+  const step = "按顺序列出比例式 2:3=x:6";
+  const progress = deriveGuideProgress({
+    verifiedGuideSteps: [step, "交叉相乘得到 3x=12"],
+    latestHandwritingResult: { detectedWriting: "2/3=x/6" }
+  });
+  assert.equal(progress.currentStepId, "step_2");
+
+  const repeated = validateGuideResultForDelivery({
+    shouldSpeak: true,
+    speech: "先按顺序写出 2:3=x:6。",
+    formulaOrStep: "2:3=x:6",
+    studentAction: "写出 2:3=x:6",
+    nextStepId: "step_1",
+    lectureComplete: false
+  }, {
+    eventType: "active_help",
+    hasBoardInk: true,
+    guideProgress: progress,
+    verifiedGuideSteps: [step, "交叉相乘得到 3x=12"],
+    recognizedBoardProgress: { detectedWriting: "2/3=x/6" },
+    recentGuideHistory: []
+  });
+  assert.equal(repeated.valid, false);
 });
 
 test("Case 4: stale request metadata cannot be treated as current", () => {

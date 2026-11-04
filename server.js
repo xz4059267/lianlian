@@ -340,7 +340,7 @@ const LIAN_GUIDE_PROMPT = [
   "当板书为空或还没有可确认的学生笔迹时，speech 仍必须从当前题目图片或可信 Question Memory 中指出第一条具体关系的对象和来源；例如明确说‘先根据图中指向 m 的两个量列出 m 的关系式’，不能只说‘先写第一个关系式’或‘把式子写到黑板上’。如果题目图片也无法可靠读出对象，必须直接说明缺少哪一条视觉关系，不能用‘第一个’、‘那个’、‘这一步’代替。",
   "选择题的推导闸门：只写出题目给定关系式、部分中间式或单个结论时，不能跳到结论/选项核验。只要当前可见 finalAnswer 为空，或关键推导尚未完成，speech 必须继续给 verifiedGuideSteps 中尚未完成的下一项具体变形、代入、相减、消元或结论推导；不得说‘现在验证结论 II’、‘核对选项’或任何等价的提前核验话术。只有最终答案和关键步骤都在当前板书中可见时，才进入核验。",
   "你是恋恋，面向初中学生的费曼学习法多模态引导学伴。目标是让学生自己把错题讲明白，不是替学生直接做题。",
-  "最高优先级的证据分层规则：当前黑板截图同时包含首页导入的题目图片和学生在导入后新增的黑板笔迹。先在视觉上分离两层，再只依据导入后新增的学生笔迹（以及完整语音中对当前笔迹的意图说明）判断学生已经写了什么、做到哪一步。首页导入图片中原本就有的印刷公式、选项、红笔批注、勾叉、旧答案或任何原有手写内容，只能作为题目条件或背景，绝不能当成学生本次列出的式子、答案或步骤。学生后来在导入图片上方、图片内部或图片旁边写出的浅色笔迹，仍然是学生笔迹；如果同时提供‘导入后新增的学生笔迹隔离层’，以该隔离层确认本次书写。引导必须贴着学生当前新增笔迹推进，不能用导入图片中的内容替代学生板书，也不能根据旧识别结果补写学生没有写出的内容。",
+  "最高优先级的证据分层规则：题目图片已在进入讲解页时生成 Question Memory；本次引导通常只收到最近一次板书判断 recognizedBoardProgress，不会再收到题目图片。OCR 成功时依据这份板书判断中的笔迹转写、已完成步骤和步骤 ID；OCR 失败时才可能收到新增学生笔迹隔离层图片。原题印刷内容、旧批注和旧答案只是题目背景，不是学生本次板书。不得声称看到了本次请求未提供的图片，也不得把旧识别结果当作新板书。",
   "最高优先级的可执行输出规则：只要 eventType 是 silence、silence_followup、silence_escalation、stuck、active_help、next_step 或 answer_to_lian_question，就必须 shouldSpeak=true，speech 非空，并且 formulaOrStep 或 studentAction 至少有一个非空且能立即执行；关系式要写出具体对象/符号，动作要写清楚要代入、移项、相减、比较、复述或写下什么。禁止只返回‘继续想想’、‘再看看’、‘我来核对’等空泛话术。",
   "具体列式硬规则：凡是要求学生‘把某个量用其他量表示’、‘列出关系式’、‘写出方程’或‘开始列式’，不能只说‘把 m、n 用 x、y 表示’这类方向性话术；必须给出完整等式，或给出同样明确的列式方法：指出先看哪两个具体对象/位置，依据什么关系，以及进行相加、相减、代入、移项等哪一种运算、结果放到哪个量。无法可靠读出等式或列式方法时，必须明确说明缺少哪一条视觉关系，不能用变量名或省略号代替下一步。",
   "列式方法的最低可执行格式：当暂时不适合直接给完整等式时，至少说清‘先读取/取哪两个具体量或位置’、‘依据哪条关系做什么运算’、‘把结果记到哪个量’；可用‘先用___和___按___关系相减/相加，把结果记为___’这样的句式。只说‘把 m、n 用 x、y 表示出来’、‘列出三个式子’或‘把过程写清楚’都不合格。",
@@ -359,13 +359,13 @@ const LIAN_GUIDE_PROMPT = [
   "如果前端传入 lectureUnlocked=false，你只能输出 encourage 或 light 级别内容，不能输出 formula/worked_step/summary。",
   "如果前端传入 lectureUnlocked=true，默认只给一小步并把话交还给学生；但 silenceStage>=4 且学生持续沉默时，必须直接完成当前题的详细讲解，给出关键式和最终答案，并先自行检查计算。",
   "引导接口不得以任何形式向学生索取对错确认，也不得把核验责任交给学生；禁止‘对不对/正确吗/是不是/算对了吗/有没有错/你同意吗/你觉得呢/要不要检查/请你确认’及其同义表达，不得用反问、选择问或确认式追问让学生判断答案、步骤、算式、选项或结论。核验结果必须由板书多模态模型给出；如果模型返回了明确错误位置和证据，直接复述具体哪一行、哪个数字、符号、运算或选项不一致；如果还没有核验结果，只给下一步操作或补写要求，不做对错判断。",
-  "必须以当前黑板区域截图（其中包含当前题目图片和学生原始笔迹）为准；不要沿用上一道题的变量、答案、比例式或知识点。",
-  "如果 recognizedBoardProgress.completedSteps 中已经列出某个板书步骤，视为该步骤已写出并由最近一次板书识别确认；不得再次询问学生写出、说明或确认这一条，必须直接引导到 verifiedGuideSteps 中尚未完成的下一步。",
+  "必须以当前题的 Question Memory 和最新 recognizedBoardProgress 为准；只有 OCR 失败且收到学生笔迹隔离层图片时才使用图片。不要沿用上一道题的变量、答案、比例式或知识点。",
+  "如果 recognizedBoardProgress.completedSteps 中已经列出某个板书步骤，视为已写。它与 recognizedKeyStepIds 都来自最近一次板书判断。逐项按数学含义对照 verifiedGuideSteps；若板书已经写出结果，即使省略中间行或写法不同，也应选下一条尚未完成的步骤，不得重复要求写已出现的内容。guideProgress.currentStepId 只是保守提示，你可以根据板书证据选择更后的 step ID。",
   "选择题进入后必须把 verifiedAnswerReference.canonicalAnswer 与 choiceAnalysis 视为已经固定的唯一标准答案；不得重新猜测选项字母或结论组合，也不得把学生板书与结论的差异改写成‘是不是算错了’式引导。核对某个结论时直接说明它支持或不支持该结论；未解锁最终答案时可以暂不说出选项，但不能要求学生确认对错。",
-  "如果当前黑板区域截图里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
+  "如果当前题的 Question Memory 和板书判断里没有出现 x、y、比例式等内容，不要主动提这些符号或关系。",
   "每次需要引导时，必须给出一个学生立刻能执行的单一步骤：明确写出要使用的关系式、要代入的数、要移项/消元的对象，或要计算的等式两边，并在 studentAction 中说明写什么。禁止只说‘请把当前这一步写出来’、‘继续下一步’、‘再看看怎么来’等没有对象和操作的空泛话术。",
   "主动引导时只生成 guidanceCandidates 中的一条引导，选择当前最符合学生板书进度的下一步；必须有 speech，并在 formulaOrStep 或 studentAction 中给出具体对象和操作，不能返回候选列表或多条重复表达。",
-  "如果 Question Memory 暂不可用，仍须先从当前黑板截图和题目图片中读出可见的最后一行，给出不涉及最终答案的具体下一步操作；只有确实无法辨认任何关系式时，才明确说明缺少哪一行，并要求学生按‘左边=右边’补全该行，不能伪造公式。",
+  "如果 Question Memory 暂不可用，只根据本次可用的板书判断或学生笔迹隔离层给出不涉及最终答案的具体下一步；无法辨认关系式时说明需要哪条证据，不能假称读到了题目图片或伪造公式。",
   "输出必须严格遵守 JSON schema；speech 用中文口语。普通讲解停顿只说一句且不超过 45 个汉字；主动求助或分步讲解最多两句且不超过 75 个汉字。"
 ].join("\n");
 
@@ -447,6 +447,7 @@ const HANDWRITING_PROMPT = [
   "OCR 转写不完整、关键符号含混或无法可靠对应题目时返回 unclear，不得猜测。只核验学生本次新增的板书，不要把题目原文、批注或旧答案误认成学生作答。",
   "你的职责是忠实转写板书证据、列出明确完成的步骤、定位明确错误，并将已写出的步骤和答案与 verifiedAnswerReference 对比。禁止补出未写步骤或最终答案。",
   "detectedWriting 和 mathExpression 必须忠实对应输入证据；completedSteps 只能包含明确出现且可辨认的步骤。无法可靠核算时返回 unclear。",
+  "verifiedGuideSteps 带有步骤 ID。completedGuideStepIds 应按数学含义标出板书已经达到的步骤，不要求逐字写出中间行；仅凭题目已知条件不能算完成。板书可见结果若已涵盖多个中间变形，可标出这些步骤；看不清或算错时返回空数组。",
   "writingState=in_progress 表示学生只完成部分步骤；只有长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
   "只有能指出具体 errorLocation，并在 errorEvidence 中说明转写或笔迹证据里的明确数字、符号、运算或结论冲突时，才返回 calculationStatus=wrong。",
   "可见步骤与题意和 verifiedAnswerReference 一致时返回 correct，但这只说明已写步骤成立；最终答案必须另行填写 answerVerificationStatus。",
@@ -629,7 +630,7 @@ const guideSchema = {
       },
       nextStepId: {
         type: "string",
-        description: "For active guidance, copy guideProgress.currentStepId exactly. Use an empty string only when guideProgress has no current step."
+        description: "For active guidance, choose the first not-yet-satisfied step ID from verifiedGuideSteps after independently comparing recognizedBoardProgress with the solution. guideProgress.currentStepId is only a conservative hint."
       },
       guidanceCandidates: {
         type: "array",
@@ -707,6 +708,11 @@ const handwritingSchema = {
         items: { type: "string" },
         description: "Only steps explicitly visible and already completed on the board. Never infer missing steps."
       },
+      completedGuideStepIds: {
+        type: "array",
+        items: { type: "string" },
+        description: "IDs from verifiedGuideSteps already satisfied by the visible board mathematics, including intermediate steps implied by a later correct result. Empty when unclear or wrong."
+      },
       isRelevant: {
         type: "boolean",
         description: "Whether the handwriting appears related to the current problem."
@@ -765,6 +771,7 @@ const handwritingSchema = {
       "guidance",
       "writingState",
       "completedSteps",
+      "completedGuideStepIds",
       "isRelevant",
       "calculationStatus",
       "calculationCheck",
@@ -9201,6 +9208,10 @@ function normalizeProgressFormula(value) {
     .normalize("NFKC")
     .replace(/[−–—]/g, "-")
     .replace(/[×·]/g, "*")
+    // A written proportion and its fraction form express the same relation.
+    // Normalize before extracting equations; otherwise `2:3=x:6` is
+    // accidentally truncated to the unrelated fragment `3=x`.
+    .replace(/:/g, "/")
     .replace(/\s+/g, "")
     .replace(/[$]/g, "")
     .toLowerCase();
@@ -10403,7 +10414,10 @@ function ensureGuideFormulaMatchesTrustedSteps(result, context = {}) {
     // trusted question condition or verified step.
     const formulaEquation = extractLinearEquationText(formula);
     const stepEquation = extractLinearEquationText(step);
-    return Boolean(formulaEquation && stepEquation && equationsEquivalent(formulaEquation, stepEquation));
+    return Boolean(
+      (formulaEquation && stepEquation && equationsEquivalent(formulaEquation, stepEquation)) ||
+      guideProgressMatchScore(step, formula) > 0
+    );
   });
   if (isAnchored) return output;
 
@@ -10501,7 +10515,20 @@ function validateGuideResultForDelivery(result, context = {}) {
 
   const expectedNextStepId = String(context.guideProgress?.currentStepId || "").trim();
   const returnedNextStepId = String(output.nextStepId || "").trim();
-  if (expectedNextStepId && returnedNextStepId !== expectedNextStepId) {
+  const verifiedSteps = Array.isArray(context.verifiedGuideSteps) ? context.verifiedGuideSteps : [];
+  const selectedIndex = /^step_[1-8]$/.test(returnedNextStepId)
+    ? Number(returnedNextStepId.slice(5)) - 1
+    : -1;
+  const firstUnfinishedIndex = /^step_[1-8]$/.test(expectedNextStepId)
+    ? Number(expectedNextStepId.slice(5)) - 1
+    : -1;
+  // Local formula matching can miss handwriting that is mathematically the
+  // same step in a different form. Let Qwen move forward, but never backward
+  // past a step the board judgment has already confirmed.
+  if (verifiedSteps.length && (
+    selectedIndex < 0 || selectedIndex >= verifiedSteps.length ||
+    (firstUnfinishedIndex < 0 || selectedIndex < firstUnfinishedIndex)
+  )) {
     return {
       valid: false,
       result: synchronizeGuideResultCandidate({
@@ -10510,13 +10537,33 @@ function validateGuideResultForDelivery(result, context = {}) {
         speech: "",
         formulaOrStep: "",
         studentAction: "",
-        guideUnavailableReason: "model_next_step_id_mismatch"
+        guideUnavailableReason: "model_next_step_id_out_of_range"
       }),
-      reason: "model_next_step_id_mismatch"
+      reason: "model_next_step_id_out_of_range"
     };
   }
 
-  if (!guideResultTargetsCurrentStep(output, context)) {
+  const selectedStep = selectedIndex >= 0 ? verifiedSteps[selectedIndex] : "";
+  const boardEvidence = collectGuideProgressEvidence(context.recognizedBoardProgress);
+  if (selectedStep && boardEvidence.some((evidence) => guideProgressMatchScore(selectedStep, evidence) >= 75)) {
+    return {
+      valid: false,
+      result: synchronizeGuideResultCandidate({
+        ...output,
+        shouldSpeak: false,
+        speech: "",
+        formulaOrStep: "",
+        studentAction: "",
+        guideUnavailableReason: "model_repeats_written_step"
+      }),
+      reason: "model_repeats_written_step"
+    };
+  }
+  if (!guideResultTargetsCurrentStep(output, {
+    ...context,
+    nextStep: selectedStep,
+    guideProgress: { ...context.guideProgress, currentStep: selectedStep }
+  })) {
     return {
       valid: false,
       result: synchronizeGuideResultCandidate({
@@ -10534,10 +10581,7 @@ function validateGuideResultForDelivery(result, context = {}) {
   return {
     valid: true,
     reason: "",
-    result: synchronizeGuideResultCandidate({
-      ...output,
-      nextStepId: expectedNextStepId
-    })
+    result: synchronizeGuideResultCandidate(output)
   };
 }
 
@@ -10589,13 +10633,13 @@ function buildGuideCorrectionInstruction(context = {}, reason = "") {
   return [
     "CORRECTION RETRY — the previous response failed the server delivery contract.",
     `failureReason=${String(reason || "unknown")}`,
-    `requiredNextStepId=${nextStepId || "unavailable"}`,
-    `requiredNextStep=${nextStep || "unavailable"}`,
+    `tentativeFirstUnfinishedStepId=${nextStepId || "unavailable"}`,
+    `tentativeFirstUnfinishedStep=${nextStep || "unavailable"}`,
     `forbiddenPreviousInstructions=${JSON.stringify(forbiddenHistory)}`,
     "Return exactly one new actionable guidance item. speech must independently name the concrete object and operation; formulaOrStep or studentAction must be non-empty.",
     nextStep
-      ? "The response must implement only requiredNextStep and must not return a completed, earlier, or later step."
-      : "No trusted next step is available, so do not invent a formula; give only a concrete evidence-gathering action grounded in the visible image.",
+      ? "Compare the latest recognized board with every verified step. Choose tentativeFirstUnfinishedStep or a later step only when the board already satisfies the earlier one; never ask for mathematics already written."
+      : "No unfinished trusted step is known. Do not invent a formula or repeat an earlier step; use the verified answer and board evidence to conclude or request one missing piece of evidence.",
     "Do not paraphrase any forbiddenPreviousInstructions."
   ].join("\n");
 }
@@ -10739,10 +10783,9 @@ async function handleGuide(req, res) {
   const verifiedGuideSteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
     ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, givenConditions)
     : [];
-  // The current screenshot is the visual source of board progress. A fresh
-  // structured result from the immediately preceding multimodal recognition
-  // may additionally mark already-confirmed steps, so the guide can advance
-  // instead of asking for the same written line again.
+  // The preceding board judgment is the source of board progress. OCR text
+  // remains server-side; its structured step IDs and visible writing let the
+  // guide advance without asking for a line the student has already written.
   const guideProgress = deriveGuideProgress({
     verifiedGuideSteps,
     givenConditions,
@@ -10808,7 +10851,7 @@ async function handleGuide(req, res) {
       COMPANION_DIALOGUE_POLICY,
       LECTURE_COMPLETION_RULES,
       "Concrete guidance source: use verifiedGuideSteps and verifiedAnswerReference.solutionOutline as the standard. When handwritingRecognitionMode is aliyun-ocr-text, recognizedBoardProgress is the completed Qwen board judgment; use its recognized writing and completed steps, not a new image. If OCR was unavailable, use only the isolated student-stroke image when provided. A transcription is evidence of what was written, never proof that it is correct.",
-    "ACTIVE GUIDANCE OUTPUT CONTRACT: when the event is silence, silence_followup, silence_escalation, active_help, stuck, repeat_wrong, next_step, jump, check, or answer_to_lian_question, copy guideProgress.currentStepId exactly into nextStepId and return exactly one guidanceCandidate selected as that current step. It must include a short speech plus a concrete formulaOrStep or studentAction; if the provider returns only top-level speech/formulaOrStep/studentAction, the server will use that single response. Do not return alternatives or candidate lists.",
+    "ACTIVE GUIDANCE OUTPUT CONTRACT: for an active guidance event, independently compare the recognized board with verifiedGuideSteps. Choose the first genuinely unfinished step and return its step ID in nextStepId; guideProgress.currentStepId is a conservative hint, not a command to repeat that step. Never choose a step earlier than the confirmed progress. Return exactly one short guidanceCandidate and a concrete formulaOrStep or studentAction. Do not return alternatives.",
     `HIGHEST PRIORITY SILENCE OVERRIDE: eventType=${body.eventType || "normal"}, stage ${silenceStage}. For silence, silence_followup, silence_escalation, active_help, or next_step, ignore the default Listening rule: return shouldSpeak=true with non-empty Chinese speech and either a concrete formulaOrStep or a concrete studentAction. Stage 1 must identify the first missing problem-specific relation or operation; stage 2 must use a different, next operation based on stage 1 and never repeat its wording; stage 3 must give the next key equation or transformation and ask the student to write or repeat it; stage 4 gives a concise but complete explanation with the key equations and final answer from saved problem memory and solution steps. Never invent an answer, never repeat an earlier weaker hint, and never reuse an operation already present in recentGuideHistory.`,
     ].join("\n\n"),
     content: [
@@ -10853,13 +10896,14 @@ async function handleGuide(req, res) {
           resolvedConcepts: guideProgress.resolvedConcepts,
           silenceContextStep: guideBody.silenceContextStep || "",
           verifiedGuideSteps,
+          guideStepOptions: verifiedGuideSteps.map((text, index) => ({ stepId: `step_${index + 1}`, text })),
           recentGuideHistory: Array.isArray(body.recentGuideHistory) ? body.recentGuideHistory.slice(-8) : [],
           boardPendingRecognition: Boolean(body.boardPendingRecognition),
           recognizedBoardProgress: body.recognizedBoardProgress || null,
           handwritingRecognitionMode: body.handwritingRecognitionMode || "",
           verifiedAnswerReference: answerReference,
           boundaryRules: [
-            "When silenceStage is at least 1 and silenceContextStep is present, use that exact problem-specific relation as formulaOrStep and explain only that one next step; do not replace it with generic wording.",
+            "When silenceStage is at least 1, use the first step that remains unfinished after inspecting recognizedBoardProgress; silenceContextStep is tentative and must be skipped if its mathematics is already on the board.",
             "givenConditions 是题目明确给出的已知条件，优先级高于所有推导步骤。绝对不要询问 givenConditions 中的关系式是如何由其他式子推出的；已列入 givenConditions 的关系只能作为已知条件使用，不能再要求学生重新推导它。",
             "At silenceStage 1, one concrete relation or formula is allowed, but the final answer is still forbidden until the verified-answer stage.",
             "At silenceStage 4, give the complete problem-specific explanation, key equations, and final answer from saved problem memory and solution steps. If those are unavailable, do not invent missing problem content.",
@@ -10968,8 +11012,8 @@ async function handleGuide(req, res) {
             text: JSON.stringify({
               correctionRetry: true,
               validationFailure: guideValidation.reason,
-              requiredNextStepId: guideProgress.currentStepId || "",
-              requiredNextStep: guideProgress.currentStep || "",
+              tentativeFirstUnfinishedStepId: guideProgress.currentStepId || "",
+              tentativeFirstUnfinishedStep: guideProgress.currentStep || "",
               forbiddenPreviousInstructions: guideValidationContext.recentGuideHistory
             })
           }
@@ -11004,19 +11048,28 @@ async function handleGuide(req, res) {
   if (guideValidation.valid) {
     guideResult = guideValidation.result;
   } else {
-    const fallback = buildTrustedStepGuideFallback(guideValidationContext, {
+    const fallbackCandidate = buildTrustedStepGuideFallback(guideValidationContext, {
       eventType: body.eventType || "",
       guideState,
       silenceStage,
       reason: guideValidation.reason
     });
+    const fallbackAlreadyWritten = Boolean(fallbackCandidate &&
+      collectGuideProgressEvidence(body.recognizedBoardProgress).some((evidence) =>
+        guideProgressMatchScore(fallbackCandidate.formulaOrStep, evidence) >= 75
+      ));
+    const fallbackRepeatsHistory = Boolean(fallbackCandidate &&
+      guideResultRepeatsRecentInstruction(fallbackCandidate, guideValidationContext.recentGuideHistory));
+    const fallback = fallbackAlreadyWritten || fallbackRepeatsHistory ? null : fallbackCandidate;
     if (!fallback) {
       console.error("[guide] final contract violation", {
         eventType: body.eventType || "",
         questionId: guideQuestionId,
         reason: guideValidation.reason,
         modelAttempts: guideModelAttempts,
-        hasTrustedNextStep: false
+        hasTrustedNextStep: Boolean(fallbackCandidate),
+        fallbackAlreadyWritten,
+        fallbackRepeatsHistory
       });
       sendJson(res, 502, {
         error: "模型返回的引导不符合主动引导格式，且没有可信下一步可安全展示",
@@ -11338,7 +11391,11 @@ async function handleHandwritingInternal(req, res, task) {
             handwritingRecognitionMode === "aliyun-ocr-text"
               ? "当前是 OCR 文字模式：只使用 aliyunHandwritingTranscription 作为学生新增笔迹转写，不要期待或要求图片输入；OCR 文字是识别证据而非正确性结论，必须与 verifiedAnswerReference 对照；若关键符号含混或证据不足，返回 unclear。"
               : "当前是学生笔迹图片兜底模式：只根据新增学生笔迹隔离层图片识别和判断；不要期待题目图片或合成黑板截图；只判断图片中明确可辨的本次笔迹，无法确认时返回 unclear。",
-          verifiedAnswerReference: privateAnswerReference(answerKey)
+          verifiedAnswerReference: privateAnswerReference(answerKey),
+          verifiedGuideSteps: answerKey?.trusted
+            ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
+                .map((text, index) => ({ stepId: `step_${index + 1}`, text }))
+            : []
         })
       },
       ...(handwritingRecognitionMode === "student-stroke-image-fallback"
@@ -11558,12 +11615,25 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
       ...makeHandwritingUncertain(result, "没有同时确认明确错误位置和可核对证据，暂不打断学生。"),
       writingState: writingState === "complete" ? "unclear" : writingState,
       completedSteps,
+      recognizedKeyStepIds: [],
       expectedNextStep: ""
     };
   }
 
   const memorySteps = answerKey?.trusted && Array.isArray(answerKey.solutionOutline)
-    ? answerKey.solutionOutline.map((step) => String(step || "").trim()).filter(Boolean)
+    ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
+    : [];
+  const hasTranscribedBoardEvidence = Boolean(
+    String(body.aliyunHandwritingTranscription || "").trim() ||
+    String(result?.detectedWriting || "").trim() ||
+    String(result?.mathExpression || "").trim() ||
+    completedSteps.length
+  );
+  const modelCompletedGuideStepIds = ["correct", "incomplete"].includes(result?.calculationStatus) &&
+    Number(result?.confidence) >= 0.65 && result?.hasPossibleIssue !== true && hasTranscribedBoardEvidence
+    ? [...new Set((Array.isArray(result?.completedGuideStepIds) ? result.completedGuideStepIds : [])
+        .map((id) => String(id || "").trim())
+        .filter((id) => /^step_[1-8]$/.test(id) && Number(id.slice(5)) <= memorySteps.length))]
     : [];
   // Match all visible equations, including OCR lines that the model omitted
   // from completedSteps. This stays server-side and cannot turn OCR into a
@@ -11573,6 +11643,7 @@ function buildHandwritingProcessFeedback(result, answerKey, body = {}) {
     givenConditions: answerKey?.givenConditions,
     latestHandwritingResult: {
       ...result,
+      recognizedKeyStepIds: modelCompletedGuideStepIds,
       ocrRecognizedText: String(body.aliyunHandwritingTranscription || "")
     }
   });

@@ -260,7 +260,7 @@ test("hard delivery validation accepts only the current next step and synchroniz
   assert.doesNotMatch(validated.result.guidanceCandidates[0].speech, /下一步只做这一项/);
 });
 
-test("hard delivery validation requires the exact nextStepId", () => {
+test("delivery validation rejects missing, out-of-range, or regressive nextStepId", () => {
   const context = {
     eventType: "next_step",
     guideProgress: {
@@ -280,11 +280,15 @@ test("hard delivery validation requires the exact nextStepId", () => {
 
   const missing = validateGuideResultForDelivery(response, context);
   assert.equal(missing.valid, false);
-  assert.equal(missing.reason, "model_next_step_id_mismatch");
+  assert.equal(missing.reason, "model_next_step_id_out_of_range");
 
   const wrong = validateGuideResultForDelivery({ ...response, nextStepId: "step_3" }, context);
   assert.equal(wrong.valid, false);
-  assert.equal(wrong.reason, "model_next_step_id_mismatch");
+  assert.equal(wrong.reason, "model_next_step_id_out_of_range");
+
+  const regressive = validateGuideResultForDelivery({ ...response, nextStepId: "step_1" }, context);
+  assert.equal(regressive.valid, false);
+  assert.equal(regressive.reason, "model_next_step_id_out_of_range");
 });
 
 test("trusted fallback exposes only the deterministic Question Memory next step", () => {
@@ -331,8 +335,8 @@ test("guide progress assigns a stable nextStepId and correction retry forbids ol
       studentAction: "写出2x=4。"
     }]
   }, "model_repeated_previous_guidance");
-  assert.match(instruction, /requiredNextStepId=step_2/);
-  assert.match(instruction, /requiredNextStep=x=2/);
+  assert.match(instruction, /tentativeFirstUnfinishedStepId=step_2/);
+  assert.match(instruction, /tentativeFirstUnfinishedStep=x=2/);
   assert.match(instruction, /forbiddenPreviousInstructions=/);
   assert.match(instruction, /model_repeated_previous_guidance/);
 });
@@ -646,7 +650,7 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(serverSource, /VISUAL_RELATION_RULES/);
   assert.match(serverSource, /图形、箭头、表格、坐标/);
   assert.match(serverSource, /最高优先级的证据分层规则/);
-  assert.match(serverSource, /首页导入图片中原本就有的印刷公式、选项、红笔批注/);
+  assert.match(serverSource, /原题印刷内容、旧批注和旧答案只是题目背景/);
   assert.match(serverSource, /导入后新增的学生笔迹隔离层/);
   assert.match(serverSource, /当前是 OCR 文字模式/);
   assert.match(serverSource, /图片兜底模式只根据新增学生笔迹隔离层图片/);
