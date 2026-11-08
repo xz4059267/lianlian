@@ -635,6 +635,45 @@ test("student stroke snapshot crops ink and gives OCR black writing on white", a
   assert.deepEqual(colorAt(44, 29), [127, 127, 127, 255]);
 });
 
+test("manual send rechecks existing board without restarting guidance", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const helperSource = appSource.slice(
+    appSource.indexOf("function retryCurrentBoardFromManualSend"),
+    appSource.indexOf("dom.sendTranscriptBtn.addEventListener")
+  ).trim();
+  const calls = [];
+  const state = {
+    currentQuestionCompleted: false,
+    finalAnswerVerified: false,
+    boardCompletionVerified: false,
+    handwritingRequestInFlight: false,
+    recognitionTimer: 42
+  };
+  const context = {
+    state,
+    currentPageQuestion: () => ({ id: "question-1" }),
+    hasCurrentBoardInk: () => true,
+    markUserInput: (type) => calls.push(`input:${type}`),
+    clearTimeout: (timer) => calls.push(`clear:${timer}`),
+    clearHandwritingRetryTimer: () => calls.push("clear-retry"),
+    runHandwritingRecognition: (reason) => calls.push(`review:${reason}`),
+    saveCurrentQuestionAndContinue: () => calls.push("save"),
+    dom: {
+      recognitionPill: { classList: { remove() {} }, textContent: "" },
+      lianState: { textContent: "" }
+    }
+  };
+  const retry = vm.runInNewContext(`(${helperSource})`, context);
+  assert.equal(retry(), true);
+  assert.deepEqual(calls, ["input:manual", "clear:42", "clear-retry", "review:手动重新核对当前板书"]);
+  assert.equal(context.dom.lianState.textContent, "正在核对已写的答案和步骤");
+
+  state.handwritingRequestInFlight = true;
+  calls.length = 0;
+  assert.equal(retry(), true);
+  assert.equal(calls.some((call) => call.startsWith("review:")), false);
+});
+
 test("guide sends OCR text and only uses isolated strokes as image fallback", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const serverSource = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");

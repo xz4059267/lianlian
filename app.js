@@ -4751,9 +4751,31 @@ dom.muteBtn.addEventListener("click", () => {
 });
 
 dom.micBtn.addEventListener("click", toggleListening);
+function retryCurrentBoardFromManualSend() {
+  const question = currentPageQuestion();
+  if (!question || !hasCurrentBoardInk(question)) return false;
+  if (state.currentQuestionCompleted && state.finalAnswerVerified && state.boardCompletionVerified) {
+    void saveCurrentQuestionAndContinue();
+    return true;
+  }
+
+  markUserInput("manual");
+  clearTimeout(state.recognitionTimer);
+  state.recognitionTimer = null;
+  clearHandwritingRetryTimer();
+  dom.recognitionPill.textContent = "正在重新核对当前板书";
+  dom.recognitionPill.classList.remove("hidden");
+  dom.lianState.textContent = "正在核对已写的答案和步骤";
+  if (!state.handwritingRequestInFlight) {
+    void runHandwritingRecognition("手动重新核对当前板书");
+  }
+  return true;
+}
+
 dom.sendTranscriptBtn.addEventListener("click", () => {
   const text = dom.transcriptInput.value.trim();
   if (!text) {
+    if (retryCurrentBoardFromManualSend()) return;
     lianSpeak(
       pickPrompt("first-thought", [
         "先说说你的思路就好，比如题目给了哪些条件。",
