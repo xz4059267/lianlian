@@ -4002,9 +4002,8 @@ async function createCurrentBoardSnapshot(options = {}) {
 
 // The flattened board snapshot is useful for spatial context, but it cannot
 // tell the model whether a mark was already inside the imported question image
-// or was drawn by the student after import. Send the transparent canvas layer
-// separately so post-import handwriting remains identifiable even when it is
-// written directly over the imported image.
+// or was drawn by the student after import. Convert only the student stroke
+// layer to cropped, high-contrast black ink on white for handwriting OCR.
 async function createCurrentStudentStrokeSnapshot(options = {}) {
   const question = currentPageQuestion();
   if (!question) return "";
@@ -4012,7 +4011,49 @@ async function createCurrentStudentStrokeSnapshot(options = {}) {
   const pages = pagesForQuestion(question.id);
   const strokes = pages[0] || getBoardImageForGuide();
   if (!strokes) return "";
-  return prepareGuideImage(strokes, {
+  const image = await loadImage(strokes);
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  const source = document.createElement("canvas");
+  source.width = width;
+  source.height = height;
+  const sourceContext = source.getContext("2d", { willReadFrequently: true });
+  sourceContext.drawImage(image, 0, 0);
+  const pixels = sourceContext.getImageData(0, 0, width, height);
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (pixels.data[(y * width + x) * 4 + 3] < 12) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  if (maxX < minX || maxY < minY) return "";
+
+  const padding = Math.max(24, Math.round(Math.min(width, height) * 0.025));
+  const left = Math.max(0, minX - padding);
+  const top = Math.max(0, minY - padding);
+  const cropWidth = Math.min(width, maxX + padding + 1) - left;
+  const cropHeight = Math.min(height, maxY + padding + 1) - top;
+  const cropped = document.createElement("canvas");
+  cropped.width = cropWidth;
+  cropped.height = cropHeight;
+  const croppedContext = cropped.getContext("2d");
+  const ink = sourceContext.getImageData(left, top, cropWidth, cropHeight);
+  for (let index = 0; index < ink.data.length; index += 4) {
+    const gray = 255 - ink.data[index + 3];
+    ink.data[index] = gray;
+    ink.data[index + 1] = gray;
+    ink.data[index + 2] = gray;
+    ink.data[index + 3] = 255;
+  }
+  croppedContext.putImageData(ink, 0, 0);
+  return prepareGuideImage(cropped.toDataURL("image/png"), {
     maxSide: options.maxSide || HANDWRITING_IMAGE_MAX_SIDE,
     quality: options.quality || HANDWRITING_IMAGE_JPEG_QUALITY
   });

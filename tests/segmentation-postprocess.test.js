@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const {
   groupOcrBlocksIntoLines,
@@ -558,7 +559,6 @@ test("handwriting sends stroke-only OCR text to Qwen and uses stroke-only image 
   assert.doesNotMatch(appHandwritingRequest, /boardOnlyImage|createCurrentBoardOnlySnapshot|composeStrokeOcrSnapshot/);
   assert.doesNotMatch(snapshotSource, /question\.image/);
   assert.match(snapshotSource, /prepareGuideImage/);
-  assert.doesNotMatch(snapshotSource, /getImageData|putImageData|threshold|二值化/);
   assert.match(appHandwritingRun, /handleHandwritingAnswerVerification\(result\)/);
   assert.match(handlerSource, /verifiedAnswerReference: privateAnswerReference\(answerKey\)/);
   assert.match(handlerSource, /latestStudentSpeech/);
@@ -572,6 +572,67 @@ test("handwriting sends stroke-only OCR text to Qwen and uses stroke-only image 
   assert.match(appHandwritingRun, /finalAnswerCandidate/);
   assert.doesNotMatch(appHandwritingRun, /isCurrentInteraction\(responseToken\)/);
   assert.doesNotMatch(appHandwritingRun, /getVerifiedAnswerKey\(|fetch\("\/api\/answer-key"/);
+});
+
+test("student stroke snapshot crops ink and gives OCR black writing on white", async () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const snapshotSource = appSource.slice(
+    appSource.indexOf("async function createCurrentStudentStrokeSnapshot"),
+    appSource.indexOf("function isIncompleteHandwritingIssue")
+  ).trim();
+  const width = 100;
+  const height = 100;
+  const sourceData = new Uint8ClampedArray(width * height * 4);
+  sourceData[(50 * width + 40) * 4 + 3] = 255;
+  sourceData[(55 * width + 60) * 4 + 3] = 128;
+  const crop = {};
+  let canvasCount = 0;
+  const sourceContext = {
+    drawImage() {},
+    getImageData(left, top, cropWidth, cropHeight) {
+      const data = new Uint8ClampedArray(cropWidth * cropHeight * 4);
+      for (let y = 0; y < cropHeight; y += 1) {
+        for (let x = 0; x < cropWidth; x += 1) {
+          const from = ((top + y) * width + left + x) * 4;
+          const to = (y * cropWidth + x) * 4;
+          data.set(sourceData.subarray(from, from + 4), to);
+        }
+      }
+      return { data };
+    }
+  };
+  const cropContext = {
+    putImageData(imageData) { crop.data = imageData.data; }
+  };
+  const context = {
+    currentPageQuestion: () => ({ id: "question-1" }),
+    saveCurrentPage() {},
+    pagesForQuestion: () => ["data:image/png;base64,student-strokes"],
+    getBoardImageForGuide: () => "",
+    loadImage: async () => ({ naturalWidth: width, naturalHeight: height }),
+    document: {
+      createElement() {
+        const isSource = canvasCount++ === 0;
+        return {
+          set width(value) { (isSource ? crop.sourceSize ||= {} : crop).width = value; },
+          set height(value) { (isSource ? crop.sourceSize ||= {} : crop).height = value; },
+          getContext: () => isSource ? sourceContext : cropContext,
+          toDataURL: () => "data:image/png;base64,processed"
+        };
+      }
+    },
+    prepareGuideImage: async (image) => image,
+    HANDWRITING_IMAGE_MAX_SIDE: 1400,
+    HANDWRITING_IMAGE_JPEG_QUALITY: 0.9
+  };
+  const createSnapshot = vm.runInNewContext(`(${snapshotSource})`, context);
+  assert.equal(await createSnapshot(), "data:image/png;base64,processed");
+  assert.equal(crop.width, 69);
+  assert.equal(crop.height, 54);
+  const colorAt = (x, y) => [...crop.data.slice((y * crop.width + x) * 4, (y * crop.width + x) * 4 + 4)];
+  assert.deepEqual(colorAt(0, 0), [255, 255, 255, 255]);
+  assert.deepEqual(colorAt(24, 24), [0, 0, 0, 255]);
+  assert.deepEqual(colorAt(44, 29), [127, 127, 127, 255]);
 });
 
 test("guide sends OCR text and only uses isolated strokes as image fallback", () => {

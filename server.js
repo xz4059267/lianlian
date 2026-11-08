@@ -11426,6 +11426,15 @@ async function handleHandwritingInternal(req, res, task) {
   result = applyStatementEvaluationSafety(result, answerKey);
   result = buildHandwritingProcessFeedback(result, answerKey, body);
   result = applyHandwritingAnswerVerification(result, answerKey);
+  console.info("[handwriting-task] verdict", {
+    task_id: task.taskId,
+    calculation_status: result.calculationStatus || "",
+    board_complete: result.boardComplete === true,
+    completed_step_count: Array.isArray(result.completedSteps) ? result.completedSteps.length : 0,
+    final_answer_present: Boolean(String(result.finalAnswer || "").trim()),
+    answer_verification_status: result.answerVerificationStatus || "",
+    next_action: result.nextAction || ""
+  });
 
   if (!answerKey.trusted && ["correct", "wrong"].includes(result.calculationStatus)) {
     result = {
