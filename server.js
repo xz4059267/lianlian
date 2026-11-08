@@ -1783,7 +1783,7 @@ function extractAliyunHandwritingContent(payload) {
   const parsed = parseAliyunOfficialPayload(payload);
   const data = parsed?.Data || parsed?.data || parsed?.result || {};
   let content = data?.Content ?? data?.content ?? parsed?.Content ?? parsed?.content ?? "";
-  if (typeof content !== "string") return "";
+  if (typeof content !== "string") content = "";
   content = content.trim();
   if (content.startsWith('"') && content.endsWith('"')) {
     try {
@@ -1792,7 +1792,38 @@ function extractAliyunHandwritingContent(payload) {
       // Keep the original OCR text if it is not a JSON-encoded string.
     }
   }
-  return String(content || "").trim();
+  const summary = String(content || "").trim();
+  const blocks = extractAliyunHandwritingBlocks(parsed);
+  const blockText = blocks.join("\n");
+  return blockText.replace(/\s/g, "").length > summary.replace(/\s/g, "").length + 2
+    ? blockText
+    : summary;
+}
+
+function extractAliyunHandwritingBlocks(payload) {
+  const parsed = parseAliyunOfficialPayload(payload);
+  const data = parsed?.Data || parsed?.data || parsed?.result || {};
+  const images = Array.isArray(data?.SubImages) ? data.SubImages : [];
+  const containers = [data, ...images];
+  return containers.flatMap((item) => {
+    const details = item?.BlockInfo?.BlockDetails || item?.blockInfo?.blockDetails || [];
+    return Array.isArray(details)
+      ? details.map((block) => String(block?.BlockContent || block?.blockContent || "").trim()).filter(Boolean)
+      : [];
+  });
+}
+
+function isAliyunHandwritingOcrIncomplete(result, metrics = {}) {
+  const text = String(result?.text || "").replace(/\s/g, "");
+  if (!text) return false;
+  const bands = Math.max(0, Math.min(20, Math.floor(Number(metrics?.inkRowBandCount) || 0)));
+  const aspect = Math.max(0, Math.min(100, Number(metrics?.inkAspectRatio) || 0));
+  const blocks = Math.max(0, Math.floor(Number(result?.blockCount) || 0));
+  if (bands >= 2) {
+    if (blocks > 0 && blocks < bands && text.length < bands * 8) return true;
+    if (blocks === 0 && text.length < bands * 6) return true;
+  }
+  return bands === 1 && aspect > 6 && text.length < 5;
 }
 
 async function recognizeAliyunHandwriting(imageDataUrl, signal = null) {
@@ -1816,6 +1847,7 @@ async function recognizeAliyunHandwriting(imageDataUrl, signal = null) {
     Version: "2021-07-07",
     RegionId: ALIYUN_OCR_REGION_ID,
     Type: "HandWriting",
+    OutputCoordinate: "rectangle",
     Format: "JSON",
     AccessKeyId: ALIYUN_OCR_ACCESS_KEY_ID,
     SignatureMethod: "HMAC-SHA1",
@@ -1858,12 +1890,14 @@ async function recognizeAliyunHandwriting(imageDataUrl, signal = null) {
     }
 
     const text = extractAliyunHandwritingContent(payload);
+    const blockCount = extractAliyunHandwritingBlocks(payload).length;
     console.info("[handwriting-ocr] Aliyun RecognizeAllText completed", {
       elapsed_ms: Date.now() - startedAt,
       text_length: text.length,
+      block_count: blockCount,
       request_id: payload?.RequestId || payload?.requestId || ""
     });
-    return { text, provider: "aliyun-recognize-all-text-handwriting" };
+    return { text, blockCount, provider: "aliyun-recognize-all-text-handwriting" };
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener("abort", abortFromParent);
@@ -11321,6 +11355,7 @@ async function handleHandwritingInternal(req, res, task) {
   );
 
   let aliyunHandwritingOcr = null;
+  let handwritingOcrIncomplete = false;
   body.aliyunHandwritingTranscription = "";
   if (body.hasBoardInk === true && ALIYUN_HANDWRITING_OCR_ENABLED) {
     try {
@@ -11333,7 +11368,20 @@ async function handleHandwritingInternal(req, res, task) {
         task.abortController.signal
       );
       if (aliyunHandwritingOcr?.text) {
-        body.aliyunHandwritingTranscription = aliyunHandwritingOcr.text;
+        handwritingOcrIncomplete = isAliyunHandwritingOcrIncomplete(
+          aliyunHandwritingOcr,
+          body.studentStrokeMetrics
+        );
+        if (handwritingOcrIncomplete) {
+          console.warn("[handwriting-ocr] incomplete transcription; using isolated student-stroke image", {
+            task_id: task.taskId,
+            text_length: aliyunHandwritingOcr.text.length,
+            block_count: aliyunHandwritingOcr.blockCount,
+            ink_row_bands: Number(body.studentStrokeMetrics?.inkRowBandCount) || 0
+          });
+        } else {
+          body.aliyunHandwritingTranscription = aliyunHandwritingOcr.text;
+        }
       }
     } catch (error) {
       if (task.abortController.signal.aborted) {
@@ -11347,7 +11395,7 @@ async function handleHandwritingInternal(req, res, task) {
     }
   }
 
-  const handwritingRecognitionMode = aliyunHandwritingOcr?.text
+  const handwritingRecognitionMode = body.aliyunHandwritingTranscription
     ? "aliyun-ocr-text"
     : "student-stroke-image-fallback";
   if (!String(body.studentStrokeImage || "").startsWith("data:image/")) {
@@ -11367,6 +11415,7 @@ async function handleHandwritingInternal(req, res, task) {
     stage: "handwriting-model",
     model_name: QWEN_HANDWRITING_MODEL,
     recognition_mode: handwritingRecognitionMode,
+    incomplete_ocr_fallback: handwritingOcrIncomplete,
     ocr_text_chars: String(body.aliyunHandwritingTranscription || "").length,
     qwen_image_count: handwritingRecognitionMode === "student-stroke-image-fallback" ? 1 : 0,
     start_time: task.qwenStartTime
@@ -12304,6 +12353,8 @@ module.exports = {
   decodeDataImage,
   withTemporaryKimiImageUrl,
   extractAliyunHandwritingContent,
+  extractAliyunHandwritingBlocks,
+  isAliyunHandwritingOcrIncomplete,
   recognizeAliyunHandwriting,
   getStudentStrokeImageForHandwriting,
   isLatestHandwritingRequest,

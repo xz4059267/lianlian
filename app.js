@@ -1240,11 +1240,11 @@ function loadImage(src) {
   });
 }
 
-async function prepareGuideImage(dataUrl, { maxSide = GUIDE_IMAGE_MAX_SIDE, quality = GUIDE_IMAGE_JPEG_QUALITY } = {}) {
+async function prepareGuideImage(dataUrl, { maxSide = GUIDE_IMAGE_MAX_SIDE, quality = GUIDE_IMAGE_JPEG_QUALITY, format = "jpeg" } = {}) {
   if (!dataUrl || typeof dataUrl !== "string") return "";
   if (!dataUrl.startsWith("data:image/")) return dataUrl;
 
-  const cacheKey = `${maxSide}:${quality}:${dataUrl.length}:${dataUrl.slice(0, 24)}:${dataUrl.slice(-24)}`;
+  const cacheKey = `${maxSide}:${quality}:${format}:${dataUrl.length}:${dataUrl.slice(0, 24)}:${dataUrl.slice(-24)}`;
   const cached = guideImageCache.get(cacheKey);
   if (cached) return cached;
 
@@ -1261,7 +1261,9 @@ async function prepareGuideImage(dataUrl, { maxSide = GUIDE_IMAGE_MAX_SIDE, qual
   canvas.height = height;
   const context = canvas.getContext("2d");
   context.drawImage(image, 0, 0, width, height);
-  const prepared = canvas.toDataURL("image/jpeg", quality);
+  const prepared = format === "png"
+    ? canvas.toDataURL("image/png")
+    : canvas.toDataURL("image/jpeg", quality);
 
   guideImageCache.set(cacheKey, prepared);
   while (guideImageCache.size > GUIDE_IMAGE_CACHE_LIMIT) {
@@ -3880,10 +3882,12 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
   }
   // Send the transparent student-stroke layer only. The imported question is
   // deliberately excluded from OCR and from the handwriting image fallback.
-  const studentStrokeImage = await createCurrentStudentStrokeSnapshot({
+  const studentStrokeSnapshot = await createCurrentStudentStrokeSnapshot({
     maxSide: HANDWRITING_IMAGE_MAX_SIDE,
-    quality: HANDWRITING_IMAGE_JPEG_QUALITY
+    quality: HANDWRITING_IMAGE_JPEG_QUALITY,
+    withMetrics: true
   });
+  const studentStrokeImage = studentStrokeSnapshot.image;
   const boardIdleSeconds = Math.max(0, Math.round((Date.now() - (state.lastBoardWriteAt || Date.now())) / 1000));
   const diagnostics = {
     requestId,
@@ -3895,6 +3899,7 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
     canvasWidth: Number(dom.canvas.width || 0),
     canvasHeight: Number(dom.canvas.height || 0),
     studentStrokeImageBytes: String(studentStrokeImage || "").length,
+    studentStrokeInkBands: studentStrokeSnapshot.inkRowBandCount,
     capturedAt: new Date().toISOString()
   };
   console.log("[handwriting] request snapshot", diagnostics);
@@ -3912,6 +3917,10 @@ async function requestHandwritingAnalysis(question, reason, requestMeta = {}) {
         memoryId: requestMeta.memoryId,
         questionMemory,
         studentStrokeImage,
+        studentStrokeMetrics: {
+          inkRowBandCount: studentStrokeSnapshot.inkRowBandCount,
+          inkAspectRatio: studentStrokeSnapshot.inkAspectRatio
+        },
         reason,
         boardIdleSeconds,
         latestStudentSpeech: state.latestStudentSpeechText || "",
@@ -4006,11 +4015,15 @@ async function createCurrentBoardSnapshot(options = {}) {
 // layer to cropped, high-contrast black ink on white for handwriting OCR.
 async function createCurrentStudentStrokeSnapshot(options = {}) {
   const question = currentPageQuestion();
-  if (!question) return "";
+  if (!question) return options.withMetrics
+    ? { image: "", inkRowBandCount: 0, inkAspectRatio: 0 }
+    : "";
   saveCurrentPage();
   const pages = pagesForQuestion(question.id);
   const strokes = pages[0] || getBoardImageForGuide();
-  if (!strokes) return "";
+  if (!strokes) return options.withMetrics
+    ? { image: "", inkRowBandCount: 0, inkAspectRatio: 0 }
+    : "";
   const image = await loadImage(strokes);
   const width = image.naturalWidth || image.width;
   const height = image.naturalHeight || image.height;
@@ -4020,6 +4033,7 @@ async function createCurrentStudentStrokeSnapshot(options = {}) {
   const sourceContext = source.getContext("2d", { willReadFrequently: true });
   sourceContext.drawImage(image, 0, 0);
   const pixels = sourceContext.getImageData(0, 0, width, height);
+  const inkPixelsByRow = new Uint32Array(height);
   let minX = width;
   let minY = height;
   let maxX = -1;
@@ -4027,19 +4041,45 @@ async function createCurrentStudentStrokeSnapshot(options = {}) {
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       if (pixels.data[(y * width + x) * 4 + 3] < 12) continue;
+      inkPixelsByRow[y] += 1;
       minX = Math.min(minX, x);
       minY = Math.min(minY, y);
       maxX = Math.max(maxX, x);
       maxY = Math.max(maxY, y);
     }
   }
-  if (maxX < minX || maxY < minY) return "";
+  if (maxX < minX || maxY < minY) {
+    return options.withMetrics
+      ? { image: "", inkRowBandCount: 0, inkAspectRatio: 0 }
+      : "";
+  }
 
   const padding = Math.max(24, Math.round(Math.min(width, height) * 0.025));
   const left = Math.max(0, minX - padding);
   const top = Math.max(0, minY - padding);
   const cropWidth = Math.min(width, maxX + padding + 1) - left;
   const cropHeight = Math.min(height, maxY + padding + 1) - top;
+  const bandGap = Math.max(7, Math.round(Math.min(width, height) * 0.008));
+  const minimumBandPixels = Math.max(12, Math.round(cropWidth * 0.02));
+  let inkRowBandCount = 0;
+  let bandStart = -1;
+  let lastInkRow = -1;
+  let bandPixels = 0;
+  const finishBand = () => {
+    if (lastInkRow - bandStart >= 2 && bandPixels >= minimumBandPixels) inkRowBandCount += 1;
+  };
+  for (let y = minY; y <= maxY; y += 1) {
+    if (!inkPixelsByRow[y]) continue;
+    if (bandStart < 0) bandStart = y;
+    else if (y - lastInkRow > bandGap) {
+      finishBand();
+      bandStart = y;
+      bandPixels = 0;
+    }
+    lastInkRow = y;
+    bandPixels += inkPixelsByRow[y];
+  }
+  if (bandStart >= 0) finishBand();
   const cropped = document.createElement("canvas");
   cropped.width = cropWidth;
   cropped.height = cropHeight;
@@ -4053,10 +4093,18 @@ async function createCurrentStudentStrokeSnapshot(options = {}) {
     ink.data[index + 3] = 255;
   }
   croppedContext.putImageData(ink, 0, 0);
-  return prepareGuideImage(cropped.toDataURL("image/png"), {
+  const prepared = await prepareGuideImage(cropped.toDataURL("image/png"), {
     maxSide: options.maxSide || HANDWRITING_IMAGE_MAX_SIDE,
-    quality: options.quality || HANDWRITING_IMAGE_JPEG_QUALITY
+    quality: options.quality || HANDWRITING_IMAGE_JPEG_QUALITY,
+    format: "png"
   });
+  return options.withMetrics
+    ? {
+        image: prepared,
+        inkRowBandCount: Math.max(1, inkRowBandCount),
+        inkAspectRatio: cropWidth / Math.max(1, cropHeight)
+      }
+    : prepared;
 }
 
 function isIncompleteHandwritingIssue(result) {

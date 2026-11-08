@@ -621,18 +621,36 @@ test("student stroke snapshot crops ink and gives OCR black writing on white", a
         };
       }
     },
-    prepareGuideImage: async (image) => image,
+    prepareGuideImage: async (image, options) => {
+      crop.imageOptions = options;
+      return image;
+    },
     HANDWRITING_IMAGE_MAX_SIDE: 1400,
     HANDWRITING_IMAGE_JPEG_QUALITY: 0.9
   };
   const createSnapshot = vm.runInNewContext(`(${snapshotSource})`, context);
   assert.equal(await createSnapshot(), "data:image/png;base64,processed");
+  assert.equal(crop.imageOptions.format, "png");
+  canvasCount = 0;
+  const snapshotWithMetrics = await createSnapshot({ withMetrics: true });
+  assert.equal(snapshotWithMetrics.image, "data:image/png;base64,processed");
+  assert.equal(snapshotWithMetrics.inkRowBandCount, 1);
   assert.equal(crop.width, 69);
   assert.equal(crop.height, 54);
   const colorAt = (x, y) => [...crop.data.slice((y * crop.width + x) * 4, (y * crop.width + x) * 4 + 4)];
   assert.deepEqual(colorAt(0, 0), [255, 255, 255, 255]);
   assert.deepEqual(colorAt(24, 24), [0, 0, 0, 255]);
   assert.deepEqual(colorAt(44, 29), [127, 127, 127, 255]);
+  for (const [firstY, lastY] of [[10, 18], [75, 83]]) {
+    for (let y = firstY; y <= lastY; y += 1) {
+      for (let x = 30; x <= 60; x += 1) {
+        sourceData[(y * width + x) * 4 + 3] = 255;
+      }
+    }
+  }
+  canvasCount = 0;
+  const multilineSnapshot = await createSnapshot({ withMetrics: true });
+  assert.equal(multilineSnapshot.inkRowBandCount, 2);
 });
 
 test("manual send rechecks existing board without restarting guidance", () => {
