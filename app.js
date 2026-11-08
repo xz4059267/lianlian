@@ -146,6 +146,7 @@ const GUIDE_REQUEST_TIMEOUT_MS = 22000;
 // result after 24 seconds and accidentally start over on the same board.
 const HANDWRITING_REQUEST_TIMEOUT_MS = 285000;
 const LIAN_TTS_REQUEST_TIMEOUT_MS = 9000;
+const LIAN_TTS_PERMISSION_RETRY_MS = 5 * 60 * 1000;
 const LIAN_TEXT_PUBLISH_WATCHDOG_MS = 10000;
 // Each additional full idle interval moves the guide closer to a concrete
 // equation and the verified answer. Student input resets the level.
@@ -311,6 +312,7 @@ const state = {
   lianAudioUnlockPromise: null,
   lianTtsPrefetch: null,
   lianTtsPrefetchPromise: null,
+  lianTtsPermissionDeniedUntil: 0,
   lianVoiceIdentity: "",
   lianVoiceSelectionLocked: false,
   lianSpeechRequestId: 0,
@@ -1072,9 +1074,15 @@ function unlockLianAudio() {
   return state.lianAudioUnlockPromise;
 }
 
+function isCloudTtsPermissionFailure(status, responseText) {
+  return status === 401 || status === 403 ||
+    /aliyun_nls_token_failed|40020503|no permission/i.test(String(responseText || ""));
+}
+
 function primeLianCloudSpeech(text) {
   const speechText = prepareLianSpeechText(text);
   if (state.isMuted || !speechText) return Promise.resolve(null);
+  if (Date.now() < state.lianTtsPermissionDeniedUntil) return Promise.resolve(null);
   if (state.lianTtsPrefetch?.text === speechText) return Promise.resolve(state.lianTtsPrefetch.blob);
   if (state.lianTtsPrefetchPromise?.text === speechText) return state.lianTtsPrefetchPromise.promise;
 
@@ -1087,7 +1095,13 @@ function primeLianCloudSpeech(text) {
         body: JSON.stringify({ text: speechText, responseId: "lian-prefetch" }),
         signal: requestControl.signal
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        if (isCloudTtsPermissionFailure(response.status, errorText)) {
+          state.lianTtsPermissionDeniedUntil = Date.now() + LIAN_TTS_PERMISSION_RETRY_MS;
+        }
+        return null;
+      }
       const blob = await response.blob();
       if (!blob.size) return null;
       state.lianTtsPrefetch = { text: speechText, blob, createdAt: Date.now() };
@@ -7477,6 +7491,7 @@ async function playCloudLianSpeech(
       state.lianTtsPrefetch = null;
     }
   }
+  if (!audioBlob && Date.now() < state.lianTtsPermissionDeniedUntil) return false;
 
   // 首句可能遇到云端令牌刚建立、网络瞬时抖动等情况，云端请求最多重试一次。
   for (let attempt = 0; !audioBlob && attempt < 2; attempt += 1) {
@@ -7496,6 +7511,10 @@ async function playCloudLianSpeech(
       } else {
         const errorText = await response.text().catch(() => "");
         console.warn(`[tts] cloud request status=${response.status}:`, errorText.slice(0, 160));
+        if (isCloudTtsPermissionFailure(response.status, errorText)) {
+          state.lianTtsPermissionDeniedUntil = Date.now() + LIAN_TTS_PERMISSION_RETRY_MS;
+          break;
+        }
       }
     } catch (error) {
       console.warn(`[tts] cloud request attempt=${attempt + 1} failed:`, error?.message || error);
@@ -7758,6 +7777,7 @@ function lianSpeak(text, options = {}) {
           if (
             !playedCloud &&
             options.isOpeningSpeech === true &&
+            Date.now() >= state.lianTtsPermissionDeniedUntil &&
             speechRequestId === state.lianSpeechRequestId &&
             isCurrentInteraction(responseToken) &&
             isCurrentGuide()
@@ -7790,9 +7810,11 @@ function lianSpeak(text, options = {}) {
         finishSpeaking();
         return;
       }
-      // 恋恋的声音必须保持云端同一音色。云端失败时保留文字并记录状态，
-      // 不再静默切换到浏览器自带语音，避免第一句和后续声音不一致。
-      if (options.allowBrowserFallback === true && playBrowserSpeech()) return;
+      // Keep a spoken response while cloud credentials or the speech service
+      // are unavailable. The browser voice is a temporary substitute; cloud
+      // speech resumes automatically after the permission retry interval.
+      dom.lianState.textContent = "正在使用备用语音";
+      if (playBrowserSpeech()) return;
       dom.lianState.textContent = "云端语音暂时不可用";
       publishText();
       fallbackTimer = setTimeout(finishSpeaking, 260);
