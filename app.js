@@ -2566,7 +2566,7 @@ function initCurrentQuestion() {
   dom.eventLog.innerHTML = "";
   dom.studentState.textContent = "准备讲题";
   setGuideState(GUIDE_STATES.HEURISTIC);
-  // 开场提示由 lianSpeak 统一发布，避免文字先出现但对应语音尚未播放。
+  // 开场提示由 lianSpeak 统一发布，文字立即显示，语音随后播放同一句。
   dom.lianBubble.textContent = "";
   const now = Date.now();
   state.lastGuideAt = 0;
@@ -7505,6 +7505,10 @@ function lianSpeak(text, options = {}) {
   const abortController = new AbortController();
   state.lianTtsAbortController = abortController;
   const pausedRecognition = pauseRecognitionForLianSpeech();
+
+  // The opening line is fixed text, so show it as soon as the teach view opens.
+  // Cloud TTS may take several seconds; its playback still uses this same line.
+  if (options.isOpeningSpeech === true) publishText();
 
   return new Promise((resolve) => {
     let finished = false;
