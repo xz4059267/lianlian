@@ -812,6 +812,39 @@ test("handwriting verification decides guide versus save from the same board req
   assert.match(appSource, /const guideFailureStillCooling =\s*!isSilenceGuide/);
 });
 
+test("save readiness accepts one key step plus the verified final answer", () => {
+  const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
+  const readinessSource = appSource.slice(
+    appSource.indexOf("function isDirectHandwritingAnswerLine"),
+    appSource.indexOf("function extractAnswerTextFromHandwriting")
+  ).trim();
+  const context = {
+    normalizeBoardMathText: (value) => String(value || "")
+      .normalize("NFKC")
+      .replace(/\s+/g, "")
+      .replace(/[，,。；;！!？?、]/g, ""),
+    isHandwritingCalculationCorrect: (result) => result.calculationStatus === "correct" && result.confidence >= 0.5,
+    isHandwritingCalculationWrong: () => false
+  };
+  const { hasIndependentHandwritingKeyStep, isModelBoardReadyForFinalCheck } = vm.runInNewContext(
+    `(() => { ${readinessSource}; return { hasIndependentHandwritingKeyStep, isModelBoardReadyForFinalCheck }; })()`,
+    context
+  );
+  const complete = {
+    isRelevant: true,
+    calculationStatus: "correct",
+    confidence: 0.9,
+    finalAnswer: "x=4",
+    completedSteps: ["列出比例式 2:3=x:6", "x=4"]
+  };
+  assert.equal(hasIndependentHandwritingKeyStep(complete), true);
+  assert.equal(isModelBoardReadyForFinalCheck(complete), true);
+
+  const answerOnly = { ...complete, completedSteps: ["x=4"] };
+  assert.equal(hasIndependentHandwritingKeyStep(answerOnly), false);
+  assert.equal(isModelBoardReadyForFinalCheck(answerOnly), false);
+});
+
 test("waits for a fixed choice answer before requesting guide output", () => {
   const appSource = fs.readFileSync(path.join(__dirname, "..", "app.js"), "utf8");
   const guideGate = appSource.slice(

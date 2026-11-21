@@ -14,6 +14,7 @@ const {
   independentAnswerKeyValidationIssues,
   buildQuestionMemory,
   buildHandwritingProcessFeedback,
+  promoteVerifiedHandwritingCompletion,
   validateGuideResultForDelivery
 } = require("../server");
 
@@ -363,6 +364,41 @@ test("model-judged board progress advances guidance without literal formula matc
   assert.deepEqual(result.recognizedKeyStepIds, ["step_1"]);
   assert.equal(result.expectedNextStep, steps[1]);
   assert.equal(result.guidance, `下一步直接做：${steps[1]}`);
+});
+
+test("a correct final answer plus one independent key step is ready to save", () => {
+  const result = promoteVerifiedHandwritingCompletion({
+    finalAnswer: "x=4",
+    completedSteps: ["列出比例式 2:3=x:6", "x=4"],
+    isRelevant: true,
+    calculationStatus: "correct",
+    answerVerificationStatus: "correct",
+    confidence: 0.88,
+    hasPossibleIssue: false,
+    writingState: "in_progress",
+    nextAction: "continue_guidance",
+    guidance: "交叉相乘得到 3x=12"
+  });
+
+  assert.equal(result.boardComplete, true);
+  assert.equal(result.writingState, "complete");
+  assert.equal(result.nextAction, "verify_answer");
+  assert.equal(result.guidance, "");
+});
+
+test("an isolated final answer is not promoted to a save-ready board", () => {
+  const result = promoteVerifiedHandwritingCompletion({
+    finalAnswer: "x=4",
+    completedSteps: ["x=4"],
+    isRelevant: true,
+    calculationStatus: "correct",
+    answerVerificationStatus: "correct",
+    confidence: 0.88,
+    hasPossibleIssue: false,
+    boardComplete: false
+  });
+
+  assert.equal(result.boardComplete, false);
 });
 
 test("model-judged progress is ignored when board judgment is wrong", () => {

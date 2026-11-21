@@ -4302,17 +4302,32 @@ function isBoardCompletionVerified(result) {
   return isModelBoardReadyForFinalCheck(result);
 }
 
-// The multimodal handwriting response owns progress detection. The client
-// must not reconstruct readiness from visible strings or legacy confidence
-// heuristics, otherwise a completed board can be sent back into guidance.
+function isDirectHandwritingAnswerLine(value) {
+  const normalized = normalizeBoardMathText(value)
+    .replace(/^(?:最终答案|答案|结果)(?:是|为)?[：:=]?/, "");
+  return /^(?:选)?[A-D](?:选项)?$/i.test(normalized) ||
+    /^[-+]?\d+(?:\.\d+)?(?:\/[-+]?\d+(?:\.\d+)?)?$/.test(normalized) ||
+    /^[a-zA-Z][a-zA-Z0-9_]*=(?:[-+]?\d+(?:\.\d+)?|[-+]?\d+\/-?\d+(?:\.\d+)?)$/.test(normalized);
+}
+
+function hasIndependentHandwritingKeyStep(result) {
+  const answer = normalizeBoardMathText(result?.finalAnswer)
+    .replace(/^(?:最终答案|答案|结果)(?:是|为)?[：:=]?/, "");
+  return Array.isArray(result?.completedSteps) && result.completedSteps.some((step) => {
+    const normalized = normalizeBoardMathText(step)
+      .replace(/^(?:最终答案|答案|结果)(?:是|为)?[：:=]?/, "");
+    return normalized && normalized !== answer &&
+      !isDirectHandwritingAnswerLine(normalized);
+  });
+}
+
+// A verified key step and a correct final answer are enough for the save gate.
+// Missing optional outline rows and old guidance text do not undo that proof.
 function isModelBoardReadyForFinalCheck(result) {
   return Boolean(
     result?.isRelevant !== false &&
-    result?.boardComplete === true &&
-    Array.isArray(result?.completedSteps) &&
-    result.completedSteps.length > 0 &&
-    !isIncompleteHandwritingIssue(result) &&
-    !isHandwritingCalculationWrong(result)
+    hasIndependentHandwritingKeyStep(result) &&
+    isHandwritingCalculationCorrect(result)
   );
 }
 
@@ -4440,7 +4455,7 @@ async function handleHandwritingAnswerVerification(result) {
   const question = currentPageQuestion();
   const status = String(result?.answerVerificationStatus || "").trim();
   const answer = extractHandwritingFinalAnswerCandidate(result);
-  const hasCompletedKeyStep = Array.isArray(result?.completedSteps) && result.completedSteps.length > 0;
+  const hasCompletedKeyStep = hasIndependentHandwritingKeyStep(result);
   const hasVisibleAnswerAndKeyStep = Boolean(
     answer &&
     (hasCompletedKeyStep || result?.boardComplete === true) &&

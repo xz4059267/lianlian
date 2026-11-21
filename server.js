@@ -457,6 +457,7 @@ const HANDWRITING_PROMPT = [
   "finalAnswer 只能来自输入证据中明确出现的最终结果，不能根据题目自行补算。多个明确最终赋值可以一起返回，例如 y=-1，x=1。",
   "当 finalAnswer 明确且至少有一个关键步骤时，必须依据 verifiedAnswerReference 完成核验；错误时 answerHint 要指出具体错误，并填写 errorLocation 与 errorEvidence。仅有答案没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance。",
   "当 finalAnswer 与关键步骤都明确时，禁止继续询问学生是否正确；必须直接核验。选择题如果已写出选项/结论且至少有一条有效计算、代入、消元或反例步骤，直接依据标准答案核验。",
+  "学生只要写出一条可核验且正确的关键步骤和本题最终答案，就直接核对并进入保存；可以省略 verifiedGuideSteps 中其余中间行，不得为了补齐提纲继续要求学生书写。",
   "当前没有 finalAnswer 时，只能引导当前关系式、代入、消元、计算或推理步骤；不得要求提前写最终答案。",
   "如果 calculationStatus=correct，已完成步骤不得要求重写，guidance 应推进到 verifiedGuideSteps 中尚未完成的下一步；如果 calculationStatus=wrong，必须说清错处和正确改法。",
   "按关键数学结果判断进度，不要求学生逐行照抄 solutionOutline。若板书已经给出某次运算后完整且正确的等式，左右两边相应的化简都视为完成；即使省略展开、合并等中间行，也直接引导下一项尚未完成的关键操作。尤其不要在右边结果已写出的情况下再次要求计算等式右边。",
@@ -11475,6 +11476,7 @@ async function handleHandwritingInternal(req, res, task) {
   result = applyStatementEvaluationSafety(result, answerKey);
   result = buildHandwritingProcessFeedback(result, answerKey, body);
   result = applyHandwritingAnswerVerification(result, answerKey);
+  result = promoteVerifiedHandwritingCompletion(result);
   console.info("[handwriting-task] verdict", {
     task_id: task.taskId,
     calculation_status: result.calculationStatus || "",
@@ -11869,6 +11871,39 @@ function applyHandwritingAnswerVerification(result, answerKey) {
     answerVerificationStatus: "unclear",
     answerFeedback: "",
     answerHint: String(result?.answerHint || "最终答案暂时看不清，或还不能与标准答案可靠比较。").trim()
+  };
+}
+
+function promoteVerifiedHandwritingCompletion(result) {
+  const answer = String(result?.finalAnswer || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, "")
+    .replace(/^(?:最终答案|答案|结果)(?:是|为)?[：:=]?/, "");
+  const hasKeyStep = normalizeVisibleCompletedSteps(result?.completedSteps).some((step) => {
+    const normalized = step.normalize("NFKC")
+      .replace(/\s+/g, "")
+      .replace(/^(?:最终答案|答案|结果)(?:是|为)?[：:=]?/, "");
+    return normalized && normalized !== answer &&
+      !isOnlyDirectAnswerWriting(normalized);
+  });
+  if (
+    !answer || !hasKeyStep ||
+    result?.isRelevant === false ||
+    result?.calculationStatus !== "correct" ||
+    result?.answerVerificationStatus !== "correct" ||
+    result?.hasPossibleIssue === true ||
+    Number(result?.confidence) < 0.5
+  ) return result;
+
+  return {
+    ...result,
+    writingState: "complete",
+    boardComplete: true,
+    nextAction: "verify_answer",
+    guidance: "",
+    expectedNextStep: "",
+    missingBoardContent: "",
+    positiveFeedback: ""
   };
 }
 
@@ -12342,6 +12377,7 @@ module.exports = {
   equationsEquivalent,
   classifyQwenError,
   buildHandwritingProcessFeedback,
+  promoteVerifiedHandwritingCompletion,
   isTransientQwenError,
   isConcreteGuideResult,
   isValidHandwritingResult,
