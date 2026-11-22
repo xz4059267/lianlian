@@ -447,17 +447,17 @@ const HANDWRITING_PROMPT = [
   "OCR 转写不完整、关键符号含混或无法可靠对应题目时返回 unclear，不得猜测。只核验学生本次新增的板书，不要把题目原文、批注或旧答案误认成学生作答。",
   "你的职责是忠实转写板书证据、列出明确完成的步骤、定位明确错误，并将已写出的步骤和答案与 verifiedAnswerReference 对比。禁止补出未写步骤或最终答案。",
   "detectedWriting 和 mathExpression 必须忠实对应输入证据；completedSteps 只能包含明确出现且可辨认的步骤。无法可靠核算时返回 unclear。",
-  "verifiedGuideSteps 带有步骤 ID。completedGuideStepIds 应按数学含义标出板书已经达到的步骤，不要求逐字写出中间行；仅凭题目已知条件不能算完成。板书可见结果若已涵盖多个中间变形，可标出这些步骤；看不清或算错时返回空数组。",
+  "verifiedGuideSteps 带有步骤 ID。completedGuideStepIds 应按数学含义标出板书已经达到的步骤，不要求逐字写出中间行；仅凭题目已知条件不能算完成。板书可见结果若已涵盖多个中间变形，可标出这些步骤；看不清或算错时返回空数组。verifiedKeySteps 是标准答案模型挑出的必要核心步骤清单，completedKeyStepIds 只能标出当前板书已经明确写出且数学正确的对应核心步骤 ID；必须逐项判断，不能因其中一条或答案正确就把其他未写的核心步骤算作完成。",
   "writingState=in_progress 表示学生只完成部分步骤；只有长时间无新增且停在未完成步骤时才可判 stalled；不能把未写完当成错误。",
   "只有能指出具体 errorLocation，并在 errorEvidence 中说明转写或笔迹证据里的明确数字、符号、运算或结论冲突时，才返回 calculationStatus=wrong。",
   "可见步骤与题意和 verifiedAnswerReference 一致时返回 correct，但这只说明已写步骤成立；最终答案必须另行填写 answerVerificationStatus。",
-  "writingState=complete 仅在输入明确出现最终结论或完整最终答案时允许；只有关系式、代入式、过程式或一个正确关键步骤时必须返回 in_progress 或 stalled。boardComplete=true 只表示存在可核验关键步骤，不代表已写最终答案。",
+  "writingState=complete 仅在输入明确出现最终结论或完整最终答案时允许；只有关系式、代入式或过程式时返回 in_progress 或 stalled。boardComplete=true 表示 verifiedKeySteps 中全部必要核心步骤均已写对，不代表已经写出最终答案。",
   "不要生成完整解题过程或替学生补写步骤。guidance 只在 nextAction=continue_guidance 或 ask_for_board 时给出一句贴着当前板书的具体引导；nextAction=verify_answer 或 finished 时 guidance 必须为空。",
-  "boardComplete=true 只需满足：板书与本题相关，存在一个数学上成立的关系式、公式、代入、计算步骤或推理依据，并且没有尚未修正的明显错误。孤立最终答案或无法辨认内容不算正确关键步骤。",
+  "boardComplete=true 只表示 verifiedKeySteps 中的必要核心步骤都已在板书上得到数学上正确的体现，并且没有尚未修正的明显错误；若核心步骤缺失，即使已有其他正确步骤也必须为 false。孤立最终答案或无法辨认内容不算正确关键步骤。",
   "finalAnswer 只能来自输入证据中明确出现的最终结果，不能根据题目自行补算。多个明确最终赋值可以一起返回，例如 y=-1，x=1。",
-  "当 finalAnswer 明确且至少有一个关键步骤时，必须依据 verifiedAnswerReference 完成核验；错误时 answerHint 要指出具体错误，并填写 errorLocation 与 errorEvidence。仅有答案没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance。",
-  "当 finalAnswer 与关键步骤都明确时，禁止继续询问学生是否正确；必须直接核验。选择题如果已写出选项/结论且至少有一条有效计算、代入、消元或反例步骤，直接依据标准答案核验。",
-  "学生只要写出一条可核验且正确的关键步骤和本题最终答案，就直接核对并进入保存；可以省略 verifiedGuideSteps 中其余中间行，不得为了补齐提纲继续要求学生书写。",
+  "当 finalAnswer 明确且板书存在关键步骤时，必须依据 verifiedAnswerReference 核验答案和已写步骤；错误时 answerHint 要指出具体错误，并填写 errorLocation 与 errorEvidence。仅有答案没有关键步骤时返回 ask_for_board；仍在推导或没有最终结果时返回 continue_guidance。",
+  "当 finalAnswer 与板书内容都明确时，先核对答案和已写步骤；只有 verifiedKeySteps 全部完成时，才允许 nextAction=verify_answer 并进入保存。选择题的结论判断也必须满足对应的全部必要核心依据。",
+  "学生写出 verifiedKeySteps 中全部必要核心步骤和本题最终答案后，直接核对并进入保存；solutionOutline 中未被标为核心的普通中间行可以省略，不得为了补齐完整提纲继续要求学生书写。若尚缺核心步骤，guidance 只指出下一条缺失核心步骤。",
   "当前没有 finalAnswer 时，只能引导当前关系式、代入、消元、计算或推理步骤；不得要求提前写最终答案。",
   "如果 calculationStatus=correct，已完成步骤不得要求重写，guidance 应推进到 verifiedGuideSteps 中尚未完成的下一步；如果 calculationStatus=wrong，必须说清错处和正确改法。",
   "按关键数学结果判断进度，不要求学生逐行照抄 solutionOutline。若板书已经给出某次运算后完整且正确的等式，左右两边相应的化简都视为完成；即使省略展开、合并等中间行，也直接引导下一项尚未完成的关键操作。尤其不要在右边结果已写出的情况下再次要求计算等式右边。",
@@ -714,6 +714,11 @@ const handwritingSchema = {
         items: { type: "string" },
         description: "IDs from verifiedGuideSteps already satisfied by the visible board mathematics, including intermediate steps implied by a later correct result. Empty when unclear or wrong."
       },
+      completedKeyStepIds: {
+        type: "array",
+        items: { type: "string" },
+        description: "IDs from verifiedKeySteps whose required mathematical evidence is visibly present and correct on the current board."
+      },
       isRelevant: {
         type: "boolean",
         description: "Whether the handwriting appears related to the current problem."
@@ -750,7 +755,7 @@ const handwritingSchema = {
       },
       boardComplete: {
         type: "boolean",
-        description: "Whether the visible board contains at least one relevant, mathematically correct, reviewable key step with no unresolved obvious error. A full derivation or final answer is not required."
+        description: "Whether every required key step listed in verifiedKeySteps is visibly satisfied with no unresolved obvious error. Non-key outline steps and the final answer are evaluated separately."
       },
       missingBoardContent: {
         type: "string",
@@ -773,6 +778,7 @@ const handwritingSchema = {
       "writingState",
       "completedSteps",
       "completedGuideStepIds",
+      "completedKeyStepIds",
       "isRelevant",
       "calculationStatus",
       "calculationCheck",
@@ -8308,6 +8314,7 @@ const answerKeySolverSchema = {
       },
       solutionSteps: { type: "array", items: { type: "string" } },
       solutionOutline: { type: "array", items: { type: "string" } },
+      keySteps: { type: "array", items: { type: "string" } },
       verificationChecks: { type: "array", items: { type: "string" } },
       confidence: { type: "number" },
       uncertainty: { type: "string" },
@@ -8329,6 +8336,7 @@ const answerKeySolverSchema = {
       "choiceAnalysis",
       "solutionSteps",
       "solutionOutline",
+      "keySteps",
       "verificationChecks",
       "confidence",
       "uncertainty",
@@ -8431,7 +8439,7 @@ const ANSWER_KEY_SOLVER_PROMPT = [
   "givenConditions 与 solutionSteps、solutionOutline 必须语义互斥。solutionSteps 和 solutionOutline 只能写对已知条件进行的代入、变形、计算、证明和结论，不能把任何原题条件作为独立步骤重复写入。",
   "如果是选择题，必须返回 choiceAnalysis：逐字抄录可见的 A/B/C/D 选项，分别写入 options；如果题目包含结论 I/II 或多个判断，逐项写入 statementVerdicts，并独立判断 correct；selectedOption 必须根据这些选项文字匹配，selectedOptionText 必须完整写出对应含义。不能只返回字母。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
-  "solutionSteps 和 solutionOutline 要按顺序返回从题目条件到最终答案的完整推导；每一步写出使用的关系、代入或变形结果。verificationChecks 写完整的代入或计算核验，不要只给摘要。",
+  "solutionSteps 和 solutionOutline 要按顺序返回从题目条件到最终答案的完整推导；每一步写出使用的关系、代入或变形结果。另需生成 keySteps：从 solutionOutline 中逐字选出 1 到 8 条对证明答案最关键、学生板书必须具备的步骤；只能原样引用 solutionOutline 条目，不能只选纯最终答案。若答案依赖多个不同关系或计算，必须列出所有不可缺少的核心步骤；可省略机械化简和重复步骤。verificationChecks 写完整的代入或计算核验，不要只给摘要。",
   "如果题图不完整、题意存在多解或无法可靠读取，status 必须为 ambiguous 或 unreadable，不能猜答案。",
   ORDERED_PROPORTION_RULES,
   VISUAL_RELATION_RULES
@@ -8448,7 +8456,7 @@ const STRICT_ANSWER_KEY_SOLVER_PROMPT = [
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
   "finalAnswer 和 canonicalAnswer 都写最终标准答案；acceptedAnswers 写数学上等价的答案表达。",
   "givenConditions 必须单独列出题干、图片、图形、表格和定义中直接给出的全部事实；题目直接给出的关系式必须放入 givenConditions，而不是把它当作需要学生推导的步骤。",
-  "solutionSteps 和 solutionOutline 只能写基于这些条件进行的具体变形或计算，不能重复列出题目原有的关系式。",
+  "solutionSteps 和 solutionOutline 只能写基于这些条件进行的具体变形或计算，不能重复列出题目原有的关系式。keySteps 从 solutionOutline 中逐字选择 1 到 8 条必要核心推导依据；答案必须依赖多条核心依据时要全部列出，不选纯最终答案行。",
   "verification.checks 写代入检查或计算核验过程。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，verification.isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verification.checks 中说明原因。",
   "只返回符合 schema 的 JSON，不要返回 Markdown，不要在 JSON 外输出任何文字。",
@@ -8467,7 +8475,7 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
   "如果题目是选择题，finalAnswer 和 canonicalAnswer 必须包含选项字母和选项含义，例如：C. I 不对，II 对。不要只返回 C。",
   "必须返回 choiceAnalysis：逐字抄录题图中的选项文字，独立填写各结论的 true/false，并用结论组合匹配 selectedOption 和 selectedOptionText。",
   "如果不是选择题，choiceAnalysis 返回空的 options、statementVerdicts，并将 selectedOption 和 selectedOptionText 返回空字符串。",
-  "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 只能写代入、变形、计算、证明和结论，但必须按顺序返回完整推导，不要把关键中间步骤压缩成一句摘要。verificationChecks 写完整的代入检查或计算核验。",
+  "acceptedAnswers 写数学上等价的答案表达；solutionSteps 和 solutionOutline 只能写代入、变形、计算、证明和结论，但必须按顺序返回完整推导，不要把关键中间步骤压缩成一句摘要。另需返回 keySteps：从 solutionOutline 中逐字选出 1 到 8 条对证明答案最关键、学生板书必须具备的步骤；只能原样引用步骤条目，不选纯最终答案行。若答案依赖多个不同关系或计算，必须列出全部必要依据；普通机械化简可省略。verificationChecks 写完整的代入检查或计算核验。",
   "givenConditions 必须覆盖题干、图片、图形箭头、表格、坐标和定义中所有直接给出的事实；题目直接给出的关系式不能作为待推导步骤，也不能在 solutionOutline 中重复出现。",
   "如果无法确定题目内容或答案，不要猜：status 返回 ambiguous 或 unreadable，finalAnswer/canonicalAnswer 为空，isSolved 为 false，confidence 低于 0.6，并在 uncertainty 和 verificationChecks 中说明原因。",
   "只返回符合 schema 的 JSON。不要返回 Markdown，不要在 JSON 外输出任何文字。",
@@ -8478,7 +8486,7 @@ const FLAT_ANSWER_KEY_SOLVER_PROMPT = [
 const ANSWER_KEY_VERIFIER_PROMPT = [
   "你是第二位独立的初中数学解题与验算员。候选答案、步骤和验算都可能是错的，不能顺着候选内容解释。",
   "必须先独立阅读原始题目图片并自己解题，再把独立答案与候选答案比较；不能采用候选推导过程作为自己的解题依据。",
-  "逐行检查候选步骤：每一步必须由题目条件或前一步正确推出。stepsVerified 只有在所有关键步骤都成立且没有跳步造成错误时才能为 true；否则列出具体 stepIssues。",
+  "逐行检查候选 solutionSteps 和 keySteps：每一步必须由题目条件或前一步正确推出。确认 keySteps 确实是答案成立不可缺少的核心依据；若答案依赖多个独立关系或计算，必须包含全部必要依据，不能把纯答案行当成推理步骤。stepsVerified 只有在推导和核心步骤均成立、没有漏掉必要依据时才能为 true；否则列出具体 stepIssues。",
   "你会收到从题图清洗出的题目文本作为辅助；必须以原始题目图片为准，尤其核对图形、表格、A/B/C/D 选项的完整文字和顺序。",
   "如果是选择题，必须返回 choiceAnalysis：重新抄录 options，独立判断 statementVerdicts，并根据选项文字得到 selectedOption 和 selectedOptionText。字母相同但选项含义不同，必须 verified=false。",
   "必须检查题目顺序、正负号、单位、选项、定义域、是否漏解以及题目实际问法。",
@@ -8729,6 +8737,7 @@ async function verifyAnswerKeyWithKimi(questionImage, solver, context = {}) {
                 acceptedAnswers: solver.acceptedAnswers || [],
                 questionType: solver.questionType || "",
                 solutionSteps: solver.solutionOutline || [],
+                keySteps: solver.keySteps || [],
                 verificationChecks: solver.verificationChecks || [],
                 choiceAnalysis: solver.choiceAnalysis || {}
               },
@@ -8799,7 +8808,7 @@ function getAnswerKeyCacheKey(questionImage, context = {}) {
     .createHash("sha256")
     .update(String(questionImage || ""))
     .update(`|problem:${String(context.problemText || "").replace(/\s+/g, " ").trim()}`)
-    .update(`|model:${QWEN_GUIDE_MODEL}|verifier:${KIMI_VERIFY_MODEL}|answer-key:v11-kimi-independent`)
+    .update(`|model:${QWEN_GUIDE_MODEL}|verifier:${KIMI_VERIFY_MODEL}|answer-key:v12-critical-steps-kimi-independent`)
     .digest("hex");
 }
 
@@ -8819,6 +8828,9 @@ function normalizeAnswerKeySolver(solver, context = {}) {
   solver.solutionOutline = Array.isArray(solver.solutionSteps) && solver.solutionSteps.length
     ? solver.solutionSteps
     : (Array.isArray(solver.solutionOutline) ? solver.solutionOutline : []);
+  solver.keySteps = Array.isArray(solver.keySteps)
+    ? solver.keySteps.map((step) => String(step || "").trim()).filter(Boolean).slice(0, 8)
+    : [];
   solver.verificationChecks = Array.isArray(solver.verification?.checks) && solver.verification.checks.length
     ? solver.verification.checks
     : (Array.isArray(solver.verificationChecks) ? solver.verificationChecks : []);
@@ -8835,12 +8847,35 @@ function normalizeAnswerKeySolver(solver, context = {}) {
   return solver;
 }
 
+function filterCriticalStepsByOutline(criticalSteps, solutionOutline) {
+  const allowedSteps = new Set((Array.isArray(solutionOutline) ? solutionOutline : [])
+    .map(normalizeProgressText)
+    .filter(Boolean));
+  const seen = new Set();
+  return (Array.isArray(criticalSteps) ? criticalSteps : [])
+    .map((step) => String(step || "").trim())
+    .filter((step) => {
+      const key = normalizeProgressText(step);
+      if (!key || !allowedSteps.has(key) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 8);
+}
+
 function answerKeySolverValidationIssues(solver) {
   const normalized = normalizeAnswerKeySolver(solver);
   const reconciled = reconcileAnswerKeyWithSolutionOutline(normalized);
   Object.assign(normalized, reconciled.answerKey);
   const issues = [];
   const hasVerifiableWork = normalized.solutionOutline.length > 0 && normalized.verificationChecks.length > 0;
+  const eligibleOutline = filterGuideStepsByKnownConditions(normalized.solutionOutline, normalized.givenConditions);
+  const outlineStepKeys = new Set(eligibleOutline.map(normalizeProgressText));
+  const finalAnswerKey = normalizeProgressText(normalized.canonicalAnswer || normalized.finalAnswer);
+  const hasValidKeySteps = normalized.keySteps.length > 0 && normalized.keySteps.every((step) => {
+    const key = normalizeProgressText(step);
+    return key && key !== finalAnswerKey && outlineStepKeys.has(key);
+  });
   const hasDerivedTerminalAnswer = Boolean(deriveTerminalScalarAnswer(normalized.solutionOutline));
   const minimumConfidence = hasDerivedTerminalAnswer
     ? ANSWER_KEY_DERIVED_MIN_CONFIDENCE
@@ -8852,6 +8887,8 @@ function answerKeySolverValidationIssues(solver) {
     issues.push(`confidence-below-${minimumConfidence.toFixed(2)}`);
   }
   if (!normalized.solutionOutline.length) issues.push("solution-steps-missing");
+  if (!normalized.keySteps.length) issues.push("critical-key-steps-missing");
+  else if (!hasValidKeySteps) issues.push("critical-key-steps-not-a-solution-subset");
   if (!normalized.verificationChecks.length) issues.push("verification-checks-missing");
   const isChoiceAnswer = isChoiceQuestionContext(normalized) || normalized.choiceAnalysis.options.length >= 2;
   if (isChoiceAnswer && !choiceAnalysisIsUsable(normalized.choiceAnalysis)) {
@@ -9023,6 +9060,10 @@ async function solveAndVerifyAnswerKey(questionImage, context = {}) {
     questionType: String(solver.questionType || "").trim(),
     knowledge: String(solver.knowledge || "").trim(),
     solutionOutline: filterGuideStepsByKnownConditions(solver.solutionOutline, solver.givenConditions),
+    keySteps: filterCriticalStepsByOutline(
+      solver.keySteps,
+      filterGuideStepsByKnownConditions(solver.solutionOutline, solver.givenConditions)
+    ),
     verificationChecks: Array.isArray(solver.verificationChecks) ? solver.verificationChecks.slice(0, 8) : [],
     studentTrace: solver.studentTrace || {
       hasStudentAnswer: false,
@@ -9086,6 +9127,10 @@ function privateAnswerReference(answerKey) {
     givenConditions: answerKey.givenConditions,
     choiceAnalysis: normalizeChoiceAnalysis(answerKey.choiceAnalysis),
     solutionOutline: filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions),
+    keySteps: filterCriticalStepsByOutline(
+      answerKey.keySteps,
+      filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
+    ),
     verificationChecks: answerKey.verificationChecks,
     confidence: answerKey.confidence,
     instruction: "这是服务端私有标准答案基线。所有数学判断必须与它一致；选择题必须同时依据 selectedOption 和 selectedOptionText，不得重新猜测字母含义；未解锁讲解时不得把最终答案直接告诉学生。"
@@ -9112,6 +9157,10 @@ function privateQuestionMemoryReference(answerKey) {
       choiceAnalysis: normalizeChoiceAnalysis(answerKey.choiceAnalysis)
     },
     standardSteps: filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions),
+    keySteps: filterCriticalStepsByOutline(
+      answerKey.keySteps,
+      filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
+    ),
     givenConditions: Array.isArray(answerKey.givenConditions) ? answerKey.givenConditions : [],
     verificationChecks: Array.isArray(answerKey.verificationChecks) ? answerKey.verificationChecks : [],
     instruction: "这是唯一题目依据。只比较学生已经写出的可见步骤，不得重解题目、补全步骤或反推完整答案。"
@@ -9130,6 +9179,7 @@ function makeUnavailableAnswerKey(error, status = "answer-key-unavailable") {
     questionType: "",
     knowledge: "",
     solutionOutline: [],
+    keySteps: [],
     verificationChecks: [],
     studentTrace: null,
     reason: error?.message || "standard answer service unavailable",
@@ -9636,6 +9686,7 @@ function questionMemoryFingerprint(questionMemory) {
     givenConditions: normalizeGivenConditions(questionMemory.givenConditions),
     choiceAnalysis: questionMemory.choiceAnalysis || null,
     solutionOutline: Array.isArray(questionMemory.solutionOutline) ? questionMemory.solutionOutline : [],
+    keySteps: Array.isArray(questionMemory.keySteps) ? questionMemory.keySteps : [],
     verificationChecks: Array.isArray(questionMemory.verificationChecks) ? questionMemory.verificationChecks : []
   });
 }
@@ -9721,7 +9772,9 @@ function isLatestGuideRequest(sessionId, questionId, requestId) {
 
 function buildQuestionMemory(questionId, answerKey = {}, memoryId = "", sessionId = 0) {
   answerKey = reconcileAnswerKeyWithSolutionOutline(answerKey).answerKey;
-  const ready = Boolean(answerKey.trusted);
+  const filteredSolutionOutline = filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions);
+  const filteredKeySteps = filterCriticalStepsByOutline(answerKey.keySteps, filteredSolutionOutline);
+  const ready = Boolean(answerKey.trusted && filteredKeySteps.length > 0);
   return {
     version: 1,
     memoryId: String(memoryId || ""),
@@ -9742,9 +9795,8 @@ function buildQuestionMemory(questionId, answerKey = {}, memoryId = "", sessionI
     questionType: ready ? String(answerKey.questionType || "").trim() : "",
     knowledge: ready ? String(answerKey.knowledge || "").trim() : "",
     givenConditions: ready ? normalizeGivenConditions(answerKey.givenConditions) : [],
-    solutionOutline: ready
-      ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
-      : [],
+    solutionOutline: ready ? filteredSolutionOutline : [],
+    keySteps: ready ? filteredKeySteps : [],
     verificationChecks: ready && Array.isArray(answerKey.verificationChecks) ? answerKey.verificationChecks : [],
     studentTrace: ready ? answerKey.studentTrace || null : null,
     independentVerification: ready && answerKey.independentVerification
@@ -9783,7 +9835,9 @@ function questionMemoryToAnswerKey(questionMemory, expectedQuestionId = "", expe
     throw error;
   }
 
-  const trusted = Boolean(questionMemory.ready);
+  const filteredSolutionOutline = filterGuideStepsByKnownConditions(questionMemory.solutionOutline, questionMemory.givenConditions);
+  const filteredKeySteps = filterCriticalStepsByOutline(questionMemory.keySteps, filteredSolutionOutline);
+  const trusted = Boolean(questionMemory.ready && filteredKeySteps.length > 0);
   return {
     trusted,
     status: String(questionMemory.status || (trusted ? "question-memory-ready" : "question-memory-unavailable")),
@@ -9795,9 +9849,8 @@ function questionMemoryToAnswerKey(questionMemory, expectedQuestionId = "", expe
     questionType: trusted ? String(questionMemory.questionType || "").trim() : "",
     knowledge: trusted ? String(questionMemory.knowledge || "").trim() : "",
     givenConditions: trusted ? normalizeGivenConditions(questionMemory.givenConditions) : [],
-    solutionOutline: trusted
-      ? filterGuideStepsByKnownConditions(questionMemory.solutionOutline, questionMemory.givenConditions)
-      : [],
+    solutionOutline: trusted ? filteredSolutionOutline : [],
+    keySteps: trusted ? filteredKeySteps : [],
     verificationChecks: trusted && Array.isArray(questionMemory.verificationChecks)
       ? questionMemory.verificationChecks
       : [],
@@ -11445,6 +11498,12 @@ async function handleHandwritingInternal(req, res, task) {
           verifiedGuideSteps: answerKey?.trusted
             ? filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
                 .map((text, index) => ({ stepId: `step_${index + 1}`, text }))
+            : [],
+          verifiedKeySteps: answerKey?.trusted
+            ? filterCriticalStepsByOutline(
+                answerKey.keySteps,
+                filterGuideStepsByKnownConditions(answerKey.solutionOutline, answerKey.givenConditions)
+              ).map((text, index) => ({ keyStepId: `key_step_${index + 1}`, text }))
             : []
         })
       },
@@ -11476,12 +11535,28 @@ async function handleHandwritingInternal(req, res, task) {
   result = applyStatementEvaluationSafety(result, answerKey);
   result = buildHandwritingProcessFeedback(result, answerKey, body);
   result = applyHandwritingAnswerVerification(result, answerKey);
-  result = promoteVerifiedHandwritingCompletion(result);
+  const requiredKeyStepIds = answerKey?.trusted && Array.isArray(answerKey.keySteps)
+    ? answerKey.keySteps.map((_, index) => `key_step_${index + 1}`)
+    : [];
+  const completedKeyStepIds = ["correct", "incomplete"].includes(result?.calculationStatus) &&
+    result?.isRelevant !== false && result?.hasPossibleIssue !== true
+    ? [...new Set((Array.isArray(result?.completedKeyStepIds) ? result.completedKeyStepIds : [])
+        .map((id) => String(id || "").trim())
+        .filter((id) => requiredKeyStepIds.includes(id)))]
+    : [];
+  result = {
+    ...result,
+    requiredKeyStepIds,
+    completedKeyStepIds
+  };
+  result = promoteVerifiedHandwritingCompletion(result, answerKey);
   console.info("[handwriting-task] verdict", {
     task_id: task.taskId,
     calculation_status: result.calculationStatus || "",
     board_complete: result.boardComplete === true,
     completed_step_count: Array.isArray(result.completedSteps) ? result.completedSteps.length : 0,
+    completed_key_step_count: completedKeyStepIds.length,
+    required_key_step_count: requiredKeyStepIds.length,
     final_answer_present: Boolean(String(result.finalAnswer || "").trim()),
     answer_verification_status: result.answerVerificationStatus || "",
     next_action: result.nextAction || ""
@@ -11511,6 +11586,8 @@ async function handleHandwritingInternal(req, res, task) {
   if (
     /完成讲解前检查/.test(String(body.reason || "")) &&
     result.boardComplete === true &&
+    requiredKeyStepIds.length > 0 &&
+    completedKeyStepIds.length < requiredKeyStepIds.length &&
     isOnlyDirectAnswerWriting(result.detectedWriting || result.mathExpression)
   ) {
     result = {
@@ -11874,22 +11951,54 @@ function applyHandwritingAnswerVerification(result, answerKey) {
   };
 }
 
-function promoteVerifiedHandwritingCompletion(result) {
+function promoteVerifiedHandwritingCompletion(result, answerKey = {}) {
   const answer = String(result?.finalAnswer || "")
     .normalize("NFKC")
     .replace(/\s+/g, "")
     .replace(/^(?:最终答案|答案|结果)(?:是|为)?[：:=]?/, "");
-  const hasKeyStep = normalizeVisibleCompletedSteps(result?.completedSteps).some((step) => {
+  const hasIndependentStep = normalizeVisibleCompletedSteps(result?.completedSteps).some((step) => {
     const normalized = step.normalize("NFKC")
       .replace(/\s+/g, "")
       .replace(/^(?:最终答案|答案|结果)(?:是|为)?[：:=]?/, "");
     return normalized && normalized !== answer &&
       !isOnlyDirectAnswerWriting(normalized);
   });
+  const keySteps = answerKey?.trusted && Array.isArray(answerKey.keySteps)
+    ? answerKey.keySteps
+    : [];
+  const requiredKeyStepIds = keySteps.length
+    ? keySteps.map((_, index) => `key_step_${index + 1}`)
+    : Array.isArray(result?.requiredKeyStepIds)
+      ? result.requiredKeyStepIds
+      : [];
+  const completedKeyStepIds = new Set(Array.isArray(result?.completedKeyStepIds)
+    ? result.completedKeyStepIds.map((id) => String(id || ""))
+    : []);
+  const hasKeyStep = requiredKeyStepIds.length
+    ? requiredKeyStepIds.every((id) => completedKeyStepIds.has(id))
+    : hasIndependentStep;
+  if (requiredKeyStepIds.length && !hasKeyStep) {
+    const missingIndex = requiredKeyStepIds.findIndex((id) => !completedKeyStepIds.has(id));
+    const missingStep = String(keySteps[missingIndex] || "").trim();
+    const hasFinalAnswer = Boolean(String(result?.finalAnswer || "").trim());
+    return {
+      ...result,
+      boardComplete: false,
+      missingBoardContent: missingStep ? `还缺少关键步骤：${missingStep}` : "还缺少题目的必要关键步骤。",
+      ...(hasFinalAnswer && result?.answerVerificationStatus === "correct"
+        ? {
+            nextAction: "ask_for_board",
+            guidance: missingStep
+              ? `答案正确，还差这条关键依据：${missingStep}`
+              : "答案正确，请补上 Question Memory 中尚未完成的关键依据。"
+          }
+        : {})
+    };
+  }
   if (
     !answer || !hasKeyStep ||
     result?.isRelevant === false ||
-    result?.calculationStatus !== "correct" ||
+    !["correct", "incomplete"].includes(result?.calculationStatus) ||
     result?.answerVerificationStatus !== "correct" ||
     result?.hasPossibleIssue === true ||
     Number(result?.confidence) < 0.5
@@ -11897,6 +12006,7 @@ function promoteVerifiedHandwritingCompletion(result) {
 
   return {
     ...result,
+    calculationStatus: "correct",
     writingState: "complete",
     boardComplete: true,
     nextAction: "verify_answer",
@@ -11916,6 +12026,7 @@ function answerKeyTextForSafety(answerKey) {
     ...(Array.isArray(answerKey?.givenConditions) ? answerKey.givenConditions : []),
     ...(Array.isArray(answerKey?.acceptedAnswers) ? answerKey.acceptedAnswers : []),
     ...(Array.isArray(answerKey?.solutionOutline) ? answerKey.solutionOutline : []),
+    ...(Array.isArray(answerKey?.keySteps) ? answerKey.keySteps : []),
     ...(Array.isArray(answerKey?.verificationChecks) ? answerKey.verificationChecks : [])
   ];
   return parts.filter(Boolean).join(" ").normalize("NFKC");

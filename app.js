@@ -2890,6 +2890,7 @@ function normalizeQuestionMemory(question, payload = {}) {
     knowledge: String(source.knowledge || "").trim(),
     givenConditions: Array.isArray(source.givenConditions) ? source.givenConditions : [],
     solutionOutline: Array.isArray(source.solutionOutline) ? source.solutionOutline : [],
+    keySteps: Array.isArray(source.keySteps) ? source.keySteps : [],
     verificationChecks: Array.isArray(source.verificationChecks) ? source.verificationChecks : [],
     independentVerification: source.independentVerification || null,
     studentTrace: source.studentTrace || null,
@@ -4204,6 +4205,12 @@ function normalizeHandwritingResult(result) {
     completedSteps: Array.isArray(result.completedSteps)
       ? result.completedSteps.map((step) => String(step || "").trim()).filter(Boolean).slice(0, 8)
       : [],
+    completedKeyStepIds: Array.isArray(result.completedKeyStepIds)
+      ? result.completedKeyStepIds.filter((id) => /^key_step_[1-8]$/.test(String(id))).slice(0, 8)
+      : [],
+    requiredKeyStepIds: Array.isArray(result.requiredKeyStepIds)
+      ? result.requiredKeyStepIds.filter((id) => /^key_step_[1-8]$/.test(String(id))).slice(0, 8)
+      : undefined,
     recognizedKeyStepIds: Array.isArray(result.recognizedKeyStepIds)
       ? result.recognizedKeyStepIds.filter((id) => /^step_[1-8]$/.test(String(id))).slice(0, 8)
       : [],
@@ -4321,12 +4328,24 @@ function hasIndependentHandwritingKeyStep(result) {
   });
 }
 
-// A verified key step and a correct final answer are enough for the save gate.
-// Missing optional outline rows and old guidance text do not undo that proof.
+function hasAllRequiredHandwritingKeySteps(result) {
+  if (!Array.isArray(result?.requiredKeyStepIds)) {
+    return hasIndependentHandwritingKeyStep(result);
+  }
+  const requiredIds = [...new Set(result.requiredKeyStepIds
+    .map((id) => String(id || "").trim())
+    .filter((id) => /^key_step_[1-8]$/.test(id)))];
+  const completedIds = new Set((Array.isArray(result?.completedKeyStepIds) ? result.completedKeyStepIds : [])
+    .map((id) => String(id || "").trim()));
+  return requiredIds.length > 0 && requiredIds.every((id) => completedIds.has(id));
+}
+
+// Every model-selected required key step and a correct final answer are enough
+// for the save gate. Ordinary outline rows remain optional.
 function isModelBoardReadyForFinalCheck(result) {
   return Boolean(
     result?.isRelevant !== false &&
-    hasIndependentHandwritingKeyStep(result) &&
+    hasAllRequiredHandwritingKeySteps(result) &&
     isHandwritingCalculationCorrect(result)
   );
 }
@@ -4455,7 +4474,7 @@ async function handleHandwritingAnswerVerification(result) {
   const question = currentPageQuestion();
   const status = String(result?.answerVerificationStatus || "").trim();
   const answer = extractHandwritingFinalAnswerCandidate(result);
-  const hasCompletedKeyStep = hasIndependentHandwritingKeyStep(result);
+  const hasCompletedKeyStep = hasAllRequiredHandwritingKeySteps(result);
   const hasVisibleAnswerAndKeyStep = Boolean(
     answer &&
     (hasCompletedKeyStep || result?.boardComplete === true) &&
@@ -6930,6 +6949,7 @@ async function requestAIGuide(eventType, latestStudentSpeech, options = {}) {
         knowledge: memory.knowledge,
         givenConditions,
         solutionOutline: trustedSteps,
+        keySteps: memory.keySteps || [],
         verificationChecks: memory.verificationChecks || [],
         studentTrace: memory.studentTrace || null,
         reason: memory.reason || "",
